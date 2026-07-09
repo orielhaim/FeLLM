@@ -1,0 +1,17 @@
+# Standalone package (excluded from FeLLM workspace).
+# Default path: cuda-oxide under WSL (`cargo oxide build --release`).
+[workspace]
+
+[package]
+name = "cuda_kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "FeLLM CUDA kernel plugin (cuda-oxide)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fellm-plugin-abi = { path = "../../crates/fellm-plugin-abi" }
+fellm-core = { path = "../../crates/fellm-core" }

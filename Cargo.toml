@@ -6,12 +6,19 @@ members = [
   "crates/fellm-tokenizer",
   "crates/fellm-graph",
   "crates/fellm-plugin-abi",
+  "crates/fellm-plugin-host",
   "crates/fellm-model",
   "crates/fellm-runtime",
   "crates/backend-cpu",
+  "crates/backend-cuda",
   "crates/fellm-cli",
   "crates/fellm-server",
+  "plugins/example_cpu_op",
 ]
+
+# cuda_kernels: build under WSL2 (see scripts/wsl-build-cuda.sh). Excluded so
+# Windows/stable CI never pulls oxide; package has its own [workspace] table.
+exclude = ["plugins/cuda_kernels"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,9 +35,12 @@ fellm-gguf = { path = "crates/fellm-gguf", version = "0.1.0" }
 fellm-tokenizer = { path = "crates/fellm-tokenizer", version = "0.1.0" }
 fellm-graph = { path = "crates/fellm-graph", version = "0.1.0" }
 fellm-plugin-abi = { path = "crates/fellm-plugin-abi", version = "0.1.0" }
+fellm-plugin-host = { path = "crates/fellm-plugin-host", version = "0.1.0" }
 fellm-model = { path = "crates/fellm-model", version = "0.1.0" }
 fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
+backend-cuda = { path = "crates/backend-cuda", version = "0.1.0" }
+libloading = "0.8"
 
 # External
 thiserror = "2"
@@ -52,12 +62,20 @@ rand = "0.9"
 rand_chacha = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "net",
+  "signal",
+] }
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
-async-openai = { version = "0.41", default-features = false, features = ["chat-completion-types"] }
+async-openai = { version = "0.41", default-features = false, features = [
+  "chat-completion-types",
+] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "forbid"

@@ -301,7 +301,7 @@ impl Scheduler {
         };
         let logits = logits_tensor.as_slice::<f32>()?;
         let mut work = logits.to_vec();
-        let tok = backend_cpu::kernels::sampling::sample(
+        let tok = crate::sampling::sample(
             &mut work,
             seq.params.temperature,
             seq.params.top_k,

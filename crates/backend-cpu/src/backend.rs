@@ -8,9 +8,9 @@ use crate::kernels::{
     softmax::softmax_rows_inplace,
     swiglu::silu_gate,
 };
-use crate::paged_ctx;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
+use fellm_plugin_abi as paged_ctx;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::traits::{Backend, BackendCaps, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};

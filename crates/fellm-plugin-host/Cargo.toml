@@ -1,0 +1,16 @@
+[package]
+name = "fellm-plugin-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fellm-core.workspace = true
+fellm-plugin-abi.workspace = true
+libloading.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

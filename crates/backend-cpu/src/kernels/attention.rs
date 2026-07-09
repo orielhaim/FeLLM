@@ -1,5 +1,5 @@
 use crate::cpu_profile::CpuHardwareProfile;
-use crate::paged_ctx;
+use fellm_plugin_abi as paged_ctx;
 use rayon::prelude::*;
 
 #[allow(clippy::too_many_arguments)]

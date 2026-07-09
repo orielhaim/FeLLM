@@ -6,43 +6,68 @@ use fellm_core::dtype::DType;
 ///
 /// The core dispatches by matching `(OpKind, input dtypes)` in the backend's
 /// kernel registry.
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
     /// Element-wise add.
-    Add,
+    Add = 0,
     /// Element-wise multiply.
-    Mul,
+    Mul = 1,
     /// Matmul: `C = A @ B^T` (weights row-major).
-    MatMul,
+    MatMul = 2,
     /// RMSNorm with a learned weight vector.
-    RmsNorm,
+    RmsNorm = 3,
     /// Rotary position embedding applied in-place to Q or K.
-    Rope,
+    Rope = 4,
     /// SiLU/Swish gate: `out = silu(gate) * up`.
-    SiluGate,
+    SiluGate = 5,
     /// Softmax (last dim), numerically stable, with optional causal mask.
-    Softmax,
+    Softmax = 6,
     /// Full-attention over cached KV: takes Q, K-cache-view, V-cache-view.
-    Attention,
+    Attention = 7,
     /// Embedding lookup: gather rows from an embedding matrix by token id.
-    Embedding,
+    Embedding = 8,
     /// Concatenate along the last dim (mostly for KV cache append).
-    Concat,
+    Concat = 9,
     /// Reshape (no-op if strides permit).
-    Reshape,
+    Reshape = 10,
     /// Convert dtype.
-    Cast,
+    Cast = 11,
     /// Sample the next token from a logit vector.
-    Sample,
+    Sample = 12,
     /// Write a K/V row into the cache at `position`, in-place on the cache buffer.
-    KvWrite,
+    KvWrite = 13,
     /// Short convolution block used by LFM2-style decode.
-    ShortConv,
+    ShortConv = 14,
     /// Mixture-of-Experts feed-forward block.
-    MoE,
+    MoE = 15,
 }
 
 impl OpKind {
+    /// Reconstruct from the C-ABI `u32` discriminant.
+    #[must_use]
+    pub fn from_u32(v: u32) -> Option<Self> {
+        Some(match v {
+            0 => Self::Add,
+            1 => Self::Mul,
+            2 => Self::MatMul,
+            3 => Self::RmsNorm,
+            4 => Self::Rope,
+            5 => Self::SiluGate,
+            6 => Self::Softmax,
+            7 => Self::Attention,
+            8 => Self::Embedding,
+            9 => Self::Concat,
+            10 => Self::Reshape,
+            11 => Self::Cast,
+            12 => Self::Sample,
+            13 => Self::KvWrite,
+            14 => Self::ShortConv,
+            15 => Self::MoE,
+            _ => return None,
+        })
+    }
+
     /// A stable string name.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -68,6 +93,9 @@ impl OpKind {
 }
 
 /// Attributes attached to an op node (small, `Copy`-friendly).
+///
+/// `#[repr(C)]` so the layout is stable across the dynamic plugin boundary.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpAttrs {
     /// RMSNorm epsilon.

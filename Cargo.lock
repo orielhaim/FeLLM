@@ -14,7 +14,7 @@ dependencies = [
  "core_extensions",
  "crossbeam-channel",
  "generational-arena",
- "libloading",
+ "libloading 0.7.4",
  "lock_api",
  "parking_lot",
  "paste",
@@ -260,6 +260,19 @@ dependencies = [
  "rayon",
  "tracing",
  "wide",
+]
+
+[[package]]
+name = "backend-cuda"
+version = "0.1.0"
+dependencies = [
+ "backend-cpu",
+ "cudarc",
+ "fellm-core",
+ "fellm-plugin-abi",
+ "fellm-plugin-host",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -516,6 +529,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "cudarc"
+version = "0.19.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+dependencies = [
+ "libloading 0.9.0",
+]
+
+[[package]]
 name = "daachorse"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -723,6 +745,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "example_cpu_op"
+version = "0.1.0"
+dependencies = [
+ "fellm-core",
+ "fellm-plugin-abi",
+]
+
+[[package]]
 name = "faer"
 version = "0.24.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -833,10 +863,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fellm-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "fellm-core",
+ "fellm-plugin-abi",
+ "libloading 0.8.9",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "fellm-runtime"
 version = "0.1.0"
 dependencies = [
  "backend-cpu",
+ "backend-cuda",
  "bytemuck",
  "fellm-core",
  "fellm-gguf",
@@ -844,6 +886,8 @@ dependencies = [
  "fellm-model",
  "fellm-plugin-abi",
  "fellm-tokenizer",
+ "rand 0.9.4",
+ "rand_chacha",
  "rayon",
  "tracing",
 ]
@@ -1363,6 +1407,26 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]

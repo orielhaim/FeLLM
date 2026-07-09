@@ -1,18 +1,22 @@
 //! Stable FFI contract between core, backends, and architecture plugins.
 //!
-//! Phase 1 does not `dlopen` anything — everything is statically linked —
-//! but the traits and data types are the ones that a future dynamic loader
-//! would consume. The core is coded strictly against these traits so that
-//! Phase 2 can lift architectures/backends out of the binary without churning
-//! the core.
+//! Phase 1 statically links backends. Dynamic kernel plugins use the hard C
+//! ABI in [`c_abi`] and are loaded by `fellm-plugin-host`.
 
 #![deny(missing_docs)]
 
+pub mod c_abi;
 pub mod op;
+pub mod paged_ctx;
 pub mod tensor_ref;
 pub mod traits;
 
+pub use c_abi::{
+    DeviceHandle, HostContext, KernelRegistryVtable, PLUGIN_MAX_INPUT_DTYPES, PLUGIN_MAX_OPS,
+    PLUGIN_NAME_MAX, PluginLaunchFn, PluginManifest, PluginOpRegistration, abi_hash,
+};
 pub use op::{OpAttrs, OpKind};
+pub use paged_ctx::{PagedKvContext, has_paged_context, set_paged_context, with_paged_context};
 pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{Architecture, Backend, BackendCaps, KernelHandle};
 

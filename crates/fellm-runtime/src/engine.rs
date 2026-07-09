@@ -1,10 +1,11 @@
 //! The Engine: the top-level user-facing API.
 
+use crate::backend_select::{BackendPreference, BackendSelect};
 use crate::executor::GraphExecutor;
 use crate::hybrid_state::HybridConvState;
 use crate::kv_cache::KvCache;
 use crate::paged::{CacheManager, SequenceCache};
-use backend_cpu::{CpuBackend, PagedKvContext, set_paged_context};
+use crate::sampling;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_core::shape::{Layout, Shape};
@@ -16,6 +17,7 @@ use fellm_graph::plan::ExecutionPlan;
 use fellm_model::{
     ModelSpec, StepBindings, build_step_graph, collect_step_bindings, parse_assistant_output,
 };
+use fellm_plugin_abi::{Backend, PagedKvContext, set_paged_context};
 use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
 use std::path::Path;
 use std::sync::Arc;
@@ -44,6 +46,8 @@ pub struct EngineSettings {
     /// Physical batch size (`n_ubatch`): max prompt tokens per compute chunk.
     /// Must be `<= n_batch`.
     pub n_ubatch: usize,
+    /// Backend selection (`auto` / `cpu` / `cuda`) + CPU fallback policy.
+    pub backend: BackendSelect,
 }
 
 impl Default for EngineSettings {
@@ -53,6 +57,7 @@ impl Default for EngineSettings {
             n_ctx_from_model: false,
             n_batch: DEFAULT_BATCH_SIZE,
             n_ubatch: DEFAULT_UBATCH_SIZE,
+            backend: BackendSelect::from_env(),
         }
     }
 }
@@ -85,6 +90,27 @@ impl EngineSettings {
     #[must_use]
     pub fn ubatch_size(mut self, n: usize) -> Self {
         self.n_ubatch = n.max(1);
+        self
+    }
+
+    /// Backend preference + fallback policy.
+    #[must_use]
+    pub fn backend_select(mut self, select: BackendSelect) -> Self {
+        self.backend = select;
+        self
+    }
+
+    /// Shorthand: force CPU / CUDA / auto.
+    #[must_use]
+    pub fn backend_preference(mut self, preference: BackendPreference) -> Self {
+        self.backend.preference = preference;
+        self
+    }
+
+    /// Allow (default) or deny falling back to CPU when CUDA fails.
+    #[must_use]
+    pub fn allow_cpu_fallback(mut self, allow: bool) -> Self {
+        self.backend.allow_cpu_fallback = allow;
         self
     }
 
@@ -251,7 +277,7 @@ pub struct Engine {
     #[allow(dead_code)]
     gguf: Arc<GgufFile>,
     tokenizer: Box<dyn Tokenizer>,
-    backend: CpuBackend,
+    backend: Box<dyn Backend>,
     model: LoadedModel,
     /// Evaluation / physical batch settings.
     settings: EngineSettings,
@@ -316,18 +342,39 @@ impl Engine {
 
         let model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx)?;
 
+        let backend = settings.backend.resolve()?;
+        tracing::info!(backend = backend.id(), "compute backend ready");
+
         Ok(Self {
             gguf,
             tokenizer,
-            backend: CpuBackend::new(),
+            backend,
             model,
             settings: EngineSettings {
                 n_ctx: Some(max_seq),
                 n_ctx_from_model: settings.n_ctx_from_model,
                 n_batch,
                 n_ubatch,
+                backend: settings.backend,
             },
         })
+    }
+
+    /// Open with an explicit backend (tests / callers that already resolved one).
+    pub fn open_with_backend(
+        path: &Path,
+        settings: EngineSettings,
+        backend: Box<dyn Backend>,
+    ) -> Result<Self> {
+        let mut eng = Self::open_with(path, settings.backend_preference(BackendPreference::Cpu))?;
+        eng.backend = backend;
+        Ok(eng)
+    }
+
+    /// Active backend id (`"cpu"` / `"cuda"`).
+    #[must_use]
+    pub fn backend_id(&self) -> &'static str {
+        self.backend.id()
     }
 
     /// Tokenizer reference.
@@ -515,7 +562,7 @@ impl Engine {
 
     /// One forward step for token id `tok` at position `pos`.
     fn step(&mut self, tok: u32, pos: usize) -> Result<Tensor> {
-        self.model.step(&self.backend, tok, pos)
+        self.model.step(self.backend.as_ref(), tok, pos)
     }
 
     /// Free blocks remaining in the physical pool.
@@ -608,7 +655,7 @@ impl Engine {
     ) -> Result<Tensor> {
         // Temporarily swap active seq.
         std::mem::swap(&mut self.model.seq, seq_cache);
-        let result = self.model.step(&self.backend, tok, pos);
+        let result = self.model.step(self.backend.as_ref(), tok, pos);
         std::mem::swap(&mut self.model.seq, seq_cache);
         result
     }
@@ -678,7 +725,7 @@ impl LoadedModel {
         }
     }
 
-    fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
+    fn step(&mut self, backend: &dyn Backend, tok: u32, pos: usize) -> Result<Tensor> {
         self.cache.ensure_writable(&mut self.seq, pos)?;
         self.cache.tick();
 
@@ -701,7 +748,7 @@ impl LoadedModel {
         result
     }
 
-    fn step_inner(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
+    fn step_inner(&mut self, backend: &dyn Backend, tok: u32, pos: usize) -> Result<Tensor> {
         let pos_u32 = pos as u32;
         let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
 
@@ -842,7 +889,7 @@ impl<'a> Iterator for TokenStream<'a> {
             }
         };
         let mut work = logits.to_vec();
-        let tok = backend_cpu::kernels::sampling::sample(
+        let tok = sampling::sample(
             &mut work,
             self.params.temperature,
             self.params.top_k,

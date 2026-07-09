@@ -1,0 +1,31 @@
+[package]
+name = "backend-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CUDA backend (opt-in). Build under WSL: cargo build -p backend-cuda --features cuda"
+
+[dependencies]
+fellm-core.workspace = true
+fellm-plugin-abi.workspace = true
+fellm-plugin-host.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+  "driver",
+  "std",
+  "cuda-12040",
+  "dynamic-loading",
+] }
+backend-cpu.workspace = true
+
+[features]
+# Empty by default so `cargo check --workspace` on Windows does not need a CUDA toolkit.
+# Enable via: cargo build -p backend-cuda --features cuda
+# or:         cargo build -p fellm-cli --features backend-cuda
+default = []
+cuda = ["dep:cudarc"]
+
+[lints]
+workspace = true

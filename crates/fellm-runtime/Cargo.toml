@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# CPU is always linked (fallback). CUDA is opt-in:
+#   cargo build -p fellm-cli --features fellm-runtime/backend-cuda
+default = []
+# Pulls in backend-cuda with its `cuda` (cudarc) feature. Build under WSL.
+backend-cuda = ["dep:backend-cuda", "backend-cuda/cuda"]
+
 [dependencies]
 fellm-core.workspace = true
 fellm-gguf.workspace = true
@@ -13,9 +20,12 @@ fellm-plugin-abi.workspace = true
 fellm-tokenizer.workspace = true
 fellm-model.workspace = true
 backend-cpu.workspace = true
+backend-cuda = { workspace = true, optional = true }
 tracing.workspace = true
 rayon.workspace = true
 bytemuck.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 
 [lints]
 workspace = true

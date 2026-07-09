@@ -1,6 +1,6 @@
-//! Process-wide paged KV context for CPU kernels during a forward step.
+//! Process-wide paged KV context for kernels during a forward step.
 //!
-//! Uses a mutex (not thread-local) so Rayon attention workers can read the
+//! Uses a mutex (not thread-local) so parallel attention workers can read the
 //! same arena/block-table installed by the runtime on the executor thread.
 
 use std::sync::Mutex;

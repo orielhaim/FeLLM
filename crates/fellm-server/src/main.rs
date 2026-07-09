@@ -4,7 +4,7 @@ mod state;
 mod worker;
 
 use clap::Parser;
-use fellm_runtime::{EngineSettings, GenParams};
+use fellm_runtime::{BackendPreference, BackendSelect, EngineSettings, GenParams};
 use state::AppState;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -70,6 +70,16 @@ struct Args {
     /// Log filter (e.g. `info`, `debug`).
     #[arg(long, default_value = "info")]
     log: String,
+
+    /// Compute backend: `auto` (default), `cpu`, or `cuda`.
+    /// Also set via `FELLM_BACKEND`. CUDA requires `--features backend-cuda`.
+    #[arg(long, default_value = "auto")]
+    backend: String,
+
+    /// Disable CPU fallback when CUDA is unavailable.
+    /// Also set via `FELLM_CPU_FALLBACK=0`.
+    #[arg(long, default_value_t = false)]
+    no_cpu_fallback: bool,
 }
 
 #[tokio::main]
@@ -84,9 +94,15 @@ async fn main() {
             .unwrap_or_else(|| "fellm".into())
     });
 
+    let preference = BackendPreference::parse(&args.backend).unwrap_or_else(|e| {
+        eprintln!("fatal: {e}");
+        std::process::exit(1);
+    });
+    let select = BackendSelect::new(preference, !args.no_cpu_fallback);
     let mut settings = EngineSettings::default()
         .batch_size(args.batch_size)
-        .ubatch_size(args.ubatch_size);
+        .ubatch_size(args.ubatch_size)
+        .backend_select(select);
     settings = if args.ctx_size == 0 {
         settings.ctx_from_model()
     } else {

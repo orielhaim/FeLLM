@@ -9,6 +9,10 @@ license.workspace = true
 name = "fellm"
 path = "src/main.rs"
 
+[features]
+default = []
+backend-cuda = ["fellm-runtime/backend-cuda"]
+
 [dependencies]
 fellm-core.workspace = true
 fellm-gguf.workspace = true

@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use fellm_gguf::GgufFile;
-use fellm_runtime::{Engine, EngineSettings, GenParams};
+use fellm_runtime::{BackendPreference, BackendSelect, Engine, EngineSettings, GenParams};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -66,6 +66,15 @@ struct RunArgs {
     /// Optional max sequence length override (alias of `--ctx-size`).
     #[arg(long, hide = true)]
     max_seq: Option<usize>,
+    /// Compute backend: `auto` (default), `cpu`, or `cuda`.
+    /// Also set via `FELLM_BACKEND`. CUDA requires a binary built with
+    /// `--features backend-cuda` (WSL).
+    #[arg(long, default_value = "auto")]
+    backend: String,
+    /// Disable CPU fallback when CUDA is requested/auto but unavailable.
+    /// Also set via `FELLM_CPU_FALLBACK=0`.
+    #[arg(long, default_value_t = false)]
+    no_cpu_fallback: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -96,9 +105,12 @@ fn init_tracing(filter: &str) {
 }
 
 fn run(args: RunArgs) -> fellm_core::error::Result<()> {
+    let preference = BackendPreference::parse(&args.backend)?;
+    let select = BackendSelect::new(preference, !args.no_cpu_fallback);
     let mut settings = EngineSettings::default()
         .batch_size(args.batch_size)
-        .ubatch_size(args.ubatch_size);
+        .ubatch_size(args.ubatch_size)
+        .backend_select(select);
 
     let ctx = args.max_seq.unwrap_or(args.ctx_size);
     settings = if ctx == 0 {
@@ -108,6 +120,7 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     };
 
     let mut engine = Engine::open_with(&args.model, settings)?;
+    tracing::info!(backend = engine.backend_id(), "engine opened");
     let params = GenParams {
         max_tokens: args.max_tokens,
         temperature: args.temperature,

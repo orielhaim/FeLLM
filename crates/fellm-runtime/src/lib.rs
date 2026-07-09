@@ -9,13 +9,16 @@
 
 #![deny(missing_docs)]
 
+pub mod backend_select;
 pub mod engine;
 pub mod executor;
 pub mod hybrid_state;
 pub mod kv_cache;
 pub mod paged;
+pub mod sampling;
 pub mod scheduler;
 
+pub use backend_select::{BackendPreference, BackendSelect};
 pub use engine::{
     DEFAULT_BATCH_SIZE, DEFAULT_CTX_SIZE, DEFAULT_UBATCH_SIZE, Engine, EngineBuilder,
     EngineSettings, GenParams, GenStats, TokenStream,

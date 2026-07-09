@@ -1,11 +1,11 @@
-//! Sampling from a logit vector (CPU kernel path; shared logic lives in
-//! `fellm_runtime::sampling` for the engine/scheduler).
+//! Host-side sampling from a logit vector (backend-agnostic).
 
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 /// Sample one token id from `logits`. `logits` is modified in place.
+#[must_use]
 pub fn sample(logits: &mut [f32], temperature: f32, top_k: u32, top_p: f32, seed: u64) -> u32 {
     if temperature <= 0.0 || top_k == 1 {
         return argmax(logits) as u32;
@@ -91,16 +91,4 @@ fn argmax(logits: &[f32]) -> usize {
         }
     }
     best
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn greedy_picks_argmax() {
-        let mut l = vec![0.1, 0.9, 0.5, 0.2];
-        let id = sample(&mut l, 0.0, 0, 1.0, 42);
-        assert_eq!(id, 1);
-    }
 }

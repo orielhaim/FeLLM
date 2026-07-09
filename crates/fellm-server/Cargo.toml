@@ -10,6 +10,12 @@ description = "OpenAI-compatible HTTP server for FeLLM"
 name = "fellm-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Opt-in CUDA (build under WSL with a CUDA toolkit):
+#   cargo build -p fellm-server --features backend-cuda
+backend-cuda = ["fellm-runtime/backend-cuda"]
+
 [dependencies]
 fellm-core.workspace = true
 fellm-runtime.workspace = true
