@@ -19,6 +19,5 @@ tracing.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 raw-cpuid = "11.6.0"
-core_affinity = "0.8.3"
 
 [dev-dependencies]

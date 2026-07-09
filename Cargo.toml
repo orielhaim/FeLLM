@@ -44,13 +44,11 @@ matrixmultiply = { version = "0.3", features = ["threading"] }
 wide = "0.7"
 petgraph = "0.8"
 abi_stable = "0.11"
-libloading = "0.9"
 clap = { version = "4.6", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.9"
 rand_chacha = "0.9"
-criterion = "0.5"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "forbid"

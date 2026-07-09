@@ -4,7 +4,7 @@
 //! Quantized weights are fused: each block is unpacked in-register and
 //! immediately FMAd into the accumulator — no f32 row scratch in RAM.
 
-use crate::dequant::{get_scale_min_k4, QK4_0, QK8_0, QK_K};
+use crate::dequant::{QK_K, QK4_0, QK8_0, get_scale_min_k4};
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use half::f16;
@@ -85,14 +85,25 @@ fn matvec_q4_0(
             let qs = &row[base + 2..base + 2 + 16];
             let x0 = &x[b * QK4_0..b * QK4_0 + 16];
             let x1 = &x[b * QK4_0 + 16..b * QK4_0 + 32];
-            let mut sum_lo = 0.0f32;
-            let mut sum_hi = 0.0f32;
-            for j in 0..16 {
-                let byte = qs[j];
-                sum_lo += ((byte & 0x0F) as i32 - 8) as f32 * x0[j];
-                sum_hi += ((byte >> 4) as i32 - 8) as f32 * x1[j];
+            let mut sum = 0.0f32;
+            let mut j = 0;
+            while j + 8 <= 16 {
+                let mut lo = [0.0f32; 8];
+                let mut hi = [0.0f32; 8];
+                for k in 0..8 {
+                    let byte = qs[j + k];
+                    lo[k] = ((byte & 0x0F) as i32 - 8) as f32;
+                    hi[k] = ((byte >> 4) as i32 - 8) as f32;
+                }
+                sum += (f32x8::from(lo)
+                    * f32x8::from(*<&[f32; 8]>::try_from(&x0[j..j + 8]).unwrap()))
+                .reduce_add();
+                sum += (f32x8::from(hi)
+                    * f32x8::from(*<&[f32; 8]>::try_from(&x1[j..j + 8]).unwrap()))
+                .reduce_add();
+                j += 8;
             }
-            acc += d * (sum_lo + sum_hi);
+            acc += d * sum;
         }
         *yi = acc;
     });
@@ -123,8 +134,9 @@ fn matvec_q8_0(
                 for k in 0..8 {
                     wv[k] = (qs[j + k] as i8) as f32;
                 }
-                sum += (f32x8::from(wv) * f32x8::from(*<&[f32; 8]>::try_from(&xb[j..j + 8]).unwrap()))
-                    .reduce_add();
+                sum += (f32x8::from(wv)
+                    * f32x8::from(*<&[f32; 8]>::try_from(&xb[j..j + 8]).unwrap()))
+                .reduce_add();
                 j += 8;
             }
             while j < 32 {
@@ -172,18 +184,8 @@ fn matvec_q4_k(
                 let x_lo = &x_block[y_off..y_off + 32];
                 let x_hi = &x_block[y_off + 32..y_off + 64];
 
-                let mut sum_q_lo = 0.0f32;
-                let mut sum_x_lo = 0.0f32;
-                let mut sum_q_hi = 0.0f32;
-                let mut sum_x_hi = 0.0f32;
-                for l in 0..32 {
-                    let lo = (q[l] & 0x0F) as f32;
-                    let hi = (q[l] >> 4) as f32;
-                    sum_q_lo += lo * x_lo[l];
-                    sum_x_lo += x_lo[l];
-                    sum_q_hi += hi * x_hi[l];
-                    sum_x_hi += x_hi[l];
-                }
+                let (sum_q_lo, sum_x_lo) = q4_nibble_dot_lo(q, x_lo);
+                let (sum_q_hi, sum_x_hi) = q4_nibble_dot_hi(q, x_hi);
                 // w = d*sc*nibble - dmin*m  →  contrib = d*sc*(n·x) - dmin*m*(Σx)
                 acc += d1 * sum_q_lo - m1f * sum_x_lo;
                 acc += d2 * sum_q_hi - m2f * sum_x_hi;
@@ -217,6 +219,46 @@ fn matvec_q6_k(
         }
         *yi = acc;
     });
+}
+
+/// Dot low nibbles of 32 packed bytes against `x[0..32]`; also returns Σx.
+#[inline]
+fn q4_nibble_dot_lo(q: &[u8], x: &[f32]) -> (f32, f32) {
+    debug_assert!(q.len() >= 32 && x.len() >= 32);
+    let mut sum_q = f32x8::ZERO;
+    let mut sum_x = f32x8::ZERO;
+    let mut l = 0;
+    while l + 8 <= 32 {
+        let mut nib = [0.0f32; 8];
+        for k in 0..8 {
+            nib[k] = (q[l + k] & 0x0F) as f32;
+        }
+        let xv = f32x8::from(*<&[f32; 8]>::try_from(&x[l..l + 8]).unwrap());
+        sum_q += f32x8::from(nib) * xv;
+        sum_x += xv;
+        l += 8;
+    }
+    (sum_q.reduce_add(), sum_x.reduce_add())
+}
+
+/// Dot high nibbles of 32 packed bytes against `x[0..32]`; also returns Σx.
+#[inline]
+fn q4_nibble_dot_hi(q: &[u8], x: &[f32]) -> (f32, f32) {
+    debug_assert!(q.len() >= 32 && x.len() >= 32);
+    let mut sum_q = f32x8::ZERO;
+    let mut sum_x = f32x8::ZERO;
+    let mut l = 0;
+    while l + 8 <= 32 {
+        let mut nib = [0.0f32; 8];
+        for k in 0..8 {
+            nib[k] = (q[l + k] >> 4) as f32;
+        }
+        let xv = f32x8::from(*<&[f32; 8]>::try_from(&x[l..l + 8]).unwrap());
+        sum_q += f32x8::from(nib) * xv;
+        sum_x += xv;
+        l += 8;
+    }
+    (sum_q.reduce_add(), sum_x.reduce_add())
 }
 
 /// Fused Q6_K block · x (matches ggml `dequantize_row_q6_K` layout).
@@ -418,10 +460,7 @@ mod tests {
         matvec_quant(w, dtype, x, &mut y_fused, out_dim, in_dim).unwrap();
         matvec_ref(w, dtype, x, &mut y_ref, out_dim, in_dim);
         let err = max_abs_diff(&y_fused, &y_ref);
-        let scale = y_ref
-            .iter()
-            .map(|v| v.abs())
-            .fold(1.0f32, f32::max);
+        let scale = y_ref.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
         // Accumulation order can differ slightly from dequant-then-dot.
         let tol = (1e-4_f32).max(1e-5 * scale);
         assert!(
@@ -449,9 +488,7 @@ mod tests {
         let weights = fill_rng(1, out_dim * in_dim);
         let mut packed = Vec::new();
         for r in 0..out_dim {
-            packed.extend(pack_q4_0_from_f32(
-                &weights[r * in_dim..(r + 1) * in_dim],
-            ));
+            packed.extend(pack_q4_0_from_f32(&weights[r * in_dim..(r + 1) * in_dim]));
         }
         let x = fill_rng(2, in_dim);
         check_fused(DType::Q4_0, &packed, &x, out_dim, in_dim);
@@ -464,9 +501,7 @@ mod tests {
         let weights = fill_rng(3, out_dim * in_dim);
         let mut packed = Vec::new();
         for r in 0..out_dim {
-            packed.extend(pack_q8_0_from_f32(
-                &weights[r * in_dim..(r + 1) * in_dim],
-            ));
+            packed.extend(pack_q8_0_from_f32(&weights[r * in_dim..(r + 1) * in_dim]));
         }
         let x = fill_rng(4, in_dim);
         check_fused(DType::Q8_0, &packed, &x, out_dim, in_dim);

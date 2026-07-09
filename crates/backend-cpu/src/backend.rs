@@ -24,14 +24,18 @@ pub struct CpuBackend {
 }
 
 impl CpuBackend {
-    /// Detect capabilities and construct.
     #[must_use]
     pub fn new() -> Self {
         let profile = *CpuHardwareProfile::get();
         let physical = profile.physical_cores.max(1);
+        let logical = profile.logical_threads.max(physical);
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(logical)
+            .thread_name(|i| format!("fellm-matmul-{i}"))
+            .build_global();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(physical)
-            .thread_name(|i| format!("fellm-cpu-{i}"))
+            .thread_name(|i| format!("fellm-attn-{i}"))
             .build()
             .unwrap_or_else(|_| {
                 rayon::ThreadPoolBuilder::new()
