@@ -1,0 +1,13 @@
+[package]
+name = "fellm-gguf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fellm-core.workspace = true
+memmap2.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

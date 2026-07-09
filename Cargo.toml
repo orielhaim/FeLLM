@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/fellm-core",
+  "crates/fellm-gguf",
+  "crates/fellm-tokenizer",
+  "crates/fellm-graph",
+  "crates/fellm-plugin-abi",
+  "crates/fellm-runtime",
+  "crates/backend-cpu",
+  "crates/arch-llama",
+  "crates/fellm-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+authors = ["oriel"]
+repository = "https://github.com/orielhaim/fellm"
+
+[workspace.dependencies]
+# Internal crates
+fellm-core = { path = "crates/fellm-core", version = "0.1.0" }
+fellm-gguf = { path = "crates/fellm-gguf", version = "0.1.0" }
+fellm-tokenizer = { path = "crates/fellm-tokenizer", version = "0.1.0" }
+fellm-graph = { path = "crates/fellm-graph", version = "0.1.0" }
+fellm-plugin-abi = { path = "crates/fellm-plugin-abi", version = "0.1.0" }
+fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
+backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
+arch-llama = { path = "crates/arch-llama", version = "0.1.0" }
+
+# External
+thiserror = "2"
+bytemuck = { version = "1.25", features = ["derive", "extern_crate_alloc"] }
+memmap2 = "0.9"
+half = { version = "2.7", features = ["bytemuck", "num-traits"] }
+smallvec = { version = "1.13", features = ["const_generics", "union"] }
+rayon = "1.12"
+faer = "0.24"
+pulp = "0.21"
+matrixmultiply = { version = "0.3", features = ["threading"] }
+wide = "0.7"
+petgraph = "0.8"
+abi_stable = "0.11"
+libloading = "0.9"
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rand = "0.9"
+rand_chacha = "0.9"
+criterion = "0.5"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[profile.release-native]
+inherits = "release"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = true

@@ -1,0 +1,22 @@
+[package]
+name = "fellm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fellm"
+path = "src/main.rs"
+
+[dependencies]
+fellm-core.workspace = true
+fellm-gguf.workspace = true
+fellm-tokenizer.workspace = true
+fellm-runtime.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

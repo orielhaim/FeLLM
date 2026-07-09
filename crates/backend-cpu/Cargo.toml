@@ -1,0 +1,22 @@
+[package]
+name = "backend-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fellm-core.workspace = true
+fellm-plugin-abi.workspace = true
+faer.workspace = true
+pulp.workspace = true
+matrixmultiply.workspace = true
+rayon.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+wide.workspace = true
+tracing.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+[dev-dependencies]
