@@ -39,6 +39,7 @@ impl GraphBuilder {
                 shape,
             },
             label: format!("input:{name}"),
+            in_place_output_from: None,
         };
         let id = self.inner.add_node(node);
         self.inputs.push(id);
@@ -53,41 +54,80 @@ impl GraphBuilder {
             attrs: OpAttrs::default(),
             value: OpValue::Constant(t),
             label: format!("const:{label}"),
+            in_place_output_from: None,
         };
         self.inner.add_node(node)
     }
 
-    /// Add an operation node.
-    pub fn op(
-        &mut self,
-        op: OpKind,
-        attrs: OpAttrs,
-        out_dtype: DType,
-        out_shape: Shape,
-        inputs: &[NodeId],
-        label: impl Into<String>,
-    ) -> NodeId {
-        let node = OpNode {
-            op: Some(op),
-            attrs,
-            value: OpValue::Runtime {
-                dtype: out_dtype,
-                shape: out_shape,
-            },
-            label: label.into(),
-        };
-        let id = self.inner.add_node(node);
-        for (slot, &inp) in inputs.iter().enumerate() {
-            self.inner.add_edge(
-                inp,
-                id,
-                EdgeInfo {
-                    input_slot: slot as u32,
-                },
-            );
-        }
-        id
-    }
+        /// Add an operation node.
+        pub fn op(
+          &mut self,
+          op: OpKind,
+          attrs: OpAttrs,
+          out_dtype: DType,
+          out_shape: Shape,
+          inputs: &[NodeId],
+          label: impl Into<String>,
+      ) -> NodeId {
+          let node = OpNode {
+              op: Some(op),
+              attrs,
+              value: OpValue::Runtime {
+                  dtype: out_dtype,
+                  shape: out_shape,
+              },
+              label: label.into(),
+              in_place_output_from: None,
+          };
+          let id = self.inner.add_node(node);
+          for (slot, &inp) in inputs.iter().enumerate() {
+              self.inner.add_edge(
+                  inp,
+                  id,
+                  EdgeInfo {
+                      input_slot: slot as u32,
+                  },
+              );
+          }
+          id
+      }
+  
+      /// Add an operation that writes in place into one of its inputs.
+      ///
+      /// The `alias_input` argument is the slot index (0-based) of the input
+      /// whose storage will be used as the op's output.
+      pub fn op_in_place(
+          &mut self,
+          op: OpKind,
+          attrs: OpAttrs,
+          out_dtype: DType,
+          out_shape: Shape,
+          inputs: &[NodeId],
+          alias_input: u32,
+          label: impl Into<String>,
+      ) -> NodeId {
+          let node = OpNode {
+              op: Some(op),
+              attrs,
+              value: OpValue::Runtime {
+                  dtype: out_dtype,
+                  shape: out_shape,
+              },
+              label: label.into(),
+              in_place_output_from: Some(alias_input),
+          };
+          let id = self.inner.add_node(node);
+          for (slot, &inp) in inputs.iter().enumerate() {
+              self.inner.add_edge(
+                  inp,
+                  id,
+                  EdgeInfo {
+                      input_slot: slot as u32,
+                  },
+              );
+          }
+          id
+      }  
 
     /// Mark a node as a graph output.
     pub fn mark_output(&mut self, name: impl Into<String>, node: NodeId) {
@@ -96,6 +136,7 @@ impl GraphBuilder {
             attrs: OpAttrs::default(),
             value: OpValue::Output { name: name.into() },
             label: "output".into(),
+            in_place_output_from: None,
         };
         let id = self.inner.add_node(out_node);
         self.inner

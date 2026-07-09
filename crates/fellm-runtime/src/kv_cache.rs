@@ -1,23 +1,26 @@
 //! Contiguous per-layer KV cache. Phase 1 shape:
-//! `k[layer]: [max_seq, n_kv_heads, head_dim]`, same for v.
+//! `k[layer]: [max_seq, n_kv_heads * head_dim]`, same for v.
 
 use fellm_core::error::Result;
 use fellm_core::storage::AlignedBuffer;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// One layer of the KV cache.
 pub struct CacheLayer {
     /// K buffer, `max_seq * n_kv_heads * head_dim` f32.
-    pub k: AlignedBuffer,
+    pub k: Rc<RefCell<AlignedBuffer>>,
     /// V buffer, same shape.
-    pub v: AlignedBuffer,
+    pub v: Rc<RefCell<AlignedBuffer>>,
 }
 
 /// Contiguous KV cache across all layers.
 pub struct KvCache {
-    layers: Vec<CacheLayer>,
+    /// Per-layer buffers.
+    pub layers: Vec<CacheLayer>,
     /// Current filled length in tokens.
     pub len: usize,
-    /// Per-token stride in f32 elements per layer (i.e. `n_kv_heads * head_dim`).
+    /// Per-token stride in f32 elements per layer.
     pub tokens_stride: usize,
     /// Maximum sequence length.
     pub max_seq: usize,
@@ -38,8 +41,8 @@ impl KvCache {
         let mut layers = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
             layers.push(CacheLayer {
-                k: AlignedBuffer::new_zeroed(bytes_per_layer, 64),
-                v: AlignedBuffer::new_zeroed(bytes_per_layer, 64),
+                k: Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes_per_layer, 64))),
+                v: Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes_per_layer, 64))),
             });
         }
         Ok(Self {
@@ -51,50 +54,22 @@ impl KvCache {
         })
     }
 
-    /// Get read/write access to a layer's K.
-    pub fn k_mut(&mut self, layer: usize) -> &mut [f32] {
-        let bytes = self.layers[layer].k.as_mut_slice();
-        bytemuck::cast_slice_mut(bytes)
+    /// Shared K buffer for a layer.
+    pub fn k_buffer(&self, layer: usize) -> Rc<RefCell<AlignedBuffer>> {
+        self.layers[layer].k.clone()
     }
 
-    /// Get read/write access to a layer's V.
-    pub fn v_mut(&mut self, layer: usize) -> &mut [f32] {
-        let bytes = self.layers[layer].v.as_mut_slice();
-        bytemuck::cast_slice_mut(bytes)
+    /// Shared V buffer for a layer.
+    pub fn v_buffer(&self, layer: usize) -> Rc<RefCell<AlignedBuffer>> {
+        self.layers[layer].v.clone()
     }
 
-    /// Read-only K.
-    pub fn k(&self, layer: usize) -> &[f32] {
-        let bytes = self.layers[layer].k.as_slice();
-        bytemuck::cast_slice(bytes)
-    }
-
-    /// Read-only V.
-    pub fn v(&self, layer: usize) -> &[f32] {
-        let bytes = self.layers[layer].v.as_slice();
-        bytemuck::cast_slice(bytes)
-    }
-
-    /// Append `k_row` and `v_row` (each of length `tokens_stride`) to layer.
-    ///
-    /// # Panics
-    /// If the cache is already at `max_seq` capacity.
-    pub fn append(&mut self, layer: usize, k_row: &[f32], v_row: &[f32], position: usize) {
-        assert!(position < self.max_seq, "kv cache overflow");
-        assert_eq!(k_row.len(), self.tokens_stride);
-        assert_eq!(v_row.len(), self.tokens_stride);
-        let off = position * self.tokens_stride;
-        let end = off + self.tokens_stride;
-        self.k_mut(layer)[off..end].copy_from_slice(k_row);
-        self.v_mut(layer)[off..end].copy_from_slice(v_row);
-    }
-
-    /// Bump the logical length after all layers have been appended for the token.
+    /// Bump the logical length after a step.
     pub fn advance(&mut self) {
         self.len += 1;
     }
 
-    /// Reset the cache.
+    /// Reset.
     pub fn reset(&mut self) {
         self.len = 0;
     }

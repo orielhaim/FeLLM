@@ -1,14 +1,14 @@
 //! Extremely minimal Jinja2-subset chat template engine.
 //!
-//! Supports:
-//!   - `{{ variable }}` (with optional `| trim` filter)
-//!   - `{% for m in messages %} ... {% endfor %}`
-//!   - `{% if cond %} ... {% elif cond %} ... {% else %} ... {% endif %}`
+//! Supports enough of Jinja to render Llama / Mistral / Qwen GGUF chat
+//! templates:
+//!   - `{{ expr }}` with `| trim` / `| upper` / `| lower`
+//!   - String concatenation via `+`
+//!   - Member access: `m.role`, `m['content']`
+//!   - `{% for m in messages %} ... {% endfor %}` with `loop.index0` / `loop.first`
+//!   - `{% if cond %} ... {% elif %} ... {% else %} ... {% endif %}`
 //!   - `{% set name = expr %}`
-//!   - Simple boolean expressions: `a == "x"`, `a != "x"`, `not a`, `a and b`, `a or b`
-//!   - Member access: `m.role`, `m.content`
-//!
-//! This is deliberately small — enough for Llama/Mistral/Qwen chat templates.
+//!   - Simple boolean expressions: `==`, `!=`, `not`, `and`, `or`
 
 use fellm_core::error::{FellmError, Result};
 use std::collections::BTreeMap;
@@ -28,8 +28,11 @@ pub struct TemplateContext {
     /// Messages.
     pub messages: Vec<Message>,
     /// Whether to add the generation prompt (assistant header).
+    ///
+    /// Some GGUF templates ignore this and always append the assistant header;
+    /// others gate on `add_generation_prompt`.
     pub add_generation_prompt: bool,
-    /// Extra scalar variables.
+    /// Extra scalar variables (e.g. `bos_token`, `eos_token`).
     pub vars: BTreeMap<String, Value>,
 }
 
@@ -40,10 +43,14 @@ pub enum Value {
     String(String),
     /// A bool.
     Bool(bool),
+    /// An integer (used for `loop.index0`).
+    Int(i64),
     /// A list of messages (only `messages` is expected).
     Messages(Vec<Message>),
     /// A message (loop variable inside a for).
     Message(Message),
+    /// A map of named values (used for `loop`).
+    Map(BTreeMap<String, Value>),
     /// Nothing.
     None,
 }
@@ -53,8 +60,9 @@ impl Value {
         match self {
             Self::String(s) => !s.is_empty(),
             Self::Bool(b) => *b,
+            Self::Int(i) => *i != 0,
             Self::Messages(v) => !v.is_empty(),
-            Self::Message(_) => true,
+            Self::Message(_) | Self::Map(_) => true,
             Self::None => false,
         }
     }
@@ -63,6 +71,7 @@ impl Value {
         match self {
             Self::String(s) => s.clone(),
             Self::Bool(b) => b.to_string(),
+            Self::Int(i) => i.to_string(),
             _ => String::new(),
         }
     }
@@ -74,6 +83,7 @@ impl Value {
                 "content" => Value::String(m.content.clone()),
                 _ => Value::None,
             },
+            Self::Map(m) => m.get(name).cloned().unwrap_or(Value::None),
             _ => Value::None,
         }
     }
@@ -129,15 +139,12 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                     let body = &src[start..end];
                     i = end + 3;
                     if lstrip {
-                        // Trim trailing whitespace of previous text.
                         if let Some(Tok::Text(t)) = out.last_mut() {
                             *t = t.trim_end().to_string();
                         }
                     }
-                    // Trim leading whitespace of next text.
                     let body_trim = body.trim().to_string();
                     push_stmt_or_expr(&mut out, is_expr, body_trim);
-                    // Consume leading whitespace after tag.
                     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
                         i += 1;
                     }
@@ -206,7 +213,6 @@ impl<'a> Env<'a> {
                 return v.clone();
             }
         }
-        // Also check ctx.vars.
         if let Some(v) = self.ctx.vars.get(name) {
             return v.clone();
         }
@@ -248,15 +254,12 @@ fn render_tokens(
                 let bt = body.trim();
                 if let Some(_rest) = bt.strip_prefix("if ") {
                     let end = find_end(tokens, i, &["endif"])?;
-                    // Find else/elif branches.
                     let branches = split_if(tokens, i, end);
                     let mut chosen: Option<(usize, usize)> = None;
                     for (cond, from, to) in branches {
                         let cond_val = if cond == "__else__" {
                             true
                         } else {
-                            // `cond` is like "if <expr>" or "elif <expr>" —
-                            // strip either prefix and evaluate the rest.
                             let expr = cond
                                 .strip_prefix("if ")
                                 .or_else(|| cond.strip_prefix("elif "))
@@ -274,7 +277,6 @@ fn render_tokens(
                     }
                     i = end + 1;
                 } else if let Some(rest) = bt.strip_prefix("for ") {
-                    // for X in Y
                     let (var, list_expr) = parse_for(rest)?;
                     let end = find_end(tokens, i, &["endfor"])?;
                     let val = eval_expr(&list_expr, env)?;
@@ -282,12 +284,7 @@ fn render_tokens(
                         Value::Messages(v) => v.into_iter().map(Value::Message).collect(),
                         _ => vec![],
                     };
-                    for item in items {
-                        env.push();
-                        env.set(&var, item);
-                        render_tokens(&tokens[..end], env, out, i + 1)?;
-                        env.pop();
-                    }
+                    render_for_loop(tokens, env, out, i + 1, end, &var, items)?;
                     i = end + 1;
                 } else if let Some(rest) = bt.strip_prefix("set ") {
                     let eq = rest
@@ -303,7 +300,6 @@ fn render_tokens(
                     || bt.starts_with("else")
                     || bt.starts_with("elif ")
                 {
-                    // Handled by parent — return to allow caller to see the closer.
                     return Ok(i);
                 } else {
                     return Err(FellmError::Tokenization(format!("unknown stmt: {bt}")));
@@ -321,10 +317,15 @@ fn find_end(tokens: &[Tok], from: usize, closers: &[&str]) -> Result<usize> {
             let s = s.trim();
             if s.starts_with("if ") || s.starts_with("for ") {
                 depth += 1;
-            } else if closers.iter().any(|c| s == *c) {
+            } else if s == "endif" || s == "endfor" {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok(j);
+                    if closers.iter().any(|c| *c == s) {
+                        return Ok(j);
+                    }
+                    return Err(FellmError::Tokenization(format!(
+                        "unexpected closer {s}, expected one of {closers:?}"
+                    )));
                 }
             }
         }
@@ -333,7 +334,6 @@ fn find_end(tokens: &[Tok], from: usize, closers: &[&str]) -> Result<usize> {
 }
 
 fn split_if(tokens: &[Tok], start: usize, end: usize) -> Vec<(String, usize, usize)> {
-    // Returns list of (cond_string, body_start, body_end_exclusive)
     let mut branches = Vec::new();
     let mut current_cond = match &tokens[start] {
         Tok::Stmt(s) => s.trim().to_string(),
@@ -364,7 +364,6 @@ fn split_if(tokens: &[Tok], start: usize, end: usize) -> Vec<(String, usize, usi
 }
 
 fn parse_for(rest: &str) -> Result<(String, String)> {
-    // "X in Y"
     let idx = rest
         .find(" in ")
         .ok_or_else(|| FellmError::Tokenization("bad for".into()))?;
@@ -373,75 +372,327 @@ fn parse_for(rest: &str) -> Result<(String, String)> {
     Ok((var, expr))
 }
 
+// ---------- Expression evaluator ----------
+//
+// Precedence (low → high):
+//   or / and / not / comparisons / + concat / filters / atoms
+
 fn eval_expr(src: &str, env: &Env<'_>) -> Result<Value> {
+    eval_or(src.trim(), env)
+}
+
+fn eval_or(src: &str, env: &Env<'_>) -> Result<Value> {
+    if let Some((l, r)) = split_top(src, " or ") {
+        return Ok(Value::Bool(eval_bool_val(&eval_or(&l, env)?)? || eval_bool_val(
+            &eval_or(&r, env)?,
+        )?));
+    }
+    eval_and(src, env)
+}
+
+fn eval_and(src: &str, env: &Env<'_>) -> Result<Value> {
+    if let Some((l, r)) = split_top(src, " and ") {
+        return Ok(Value::Bool(eval_bool_val(&eval_and(&l, env)?)? && eval_bool_val(
+            &eval_and(&r, env)?,
+        )?));
+    }
+    eval_not(src, env)
+}
+
+fn eval_not(src: &str, env: &Env<'_>) -> Result<Value> {
     let s = src.trim();
-    // Filter: X | trim
-    if let Some((base, filter)) = s.rsplit_once('|') {
-        let base_v = eval_expr(base.trim(), env)?;
+    if let Some(rest) = s.strip_prefix("not ") {
+        return Ok(Value::Bool(!eval_bool_val(&eval_not(rest, env)?)?));
+    }
+    eval_compare(s, env)
+}
+
+fn eval_compare(src: &str, env: &Env<'_>) -> Result<Value> {
+    if let Some((l, r)) = split_top(src, "==") {
+        let lv = eval_concat(l.trim(), env)?;
+        let rv = eval_concat(r.trim(), env)?;
+        return Ok(Value::Bool(lv.as_string() == rv.as_string()));
+    }
+    if let Some((l, r)) = split_top(src, "!=") {
+        let lv = eval_concat(l.trim(), env)?;
+        let rv = eval_concat(r.trim(), env)?;
+        return Ok(Value::Bool(lv.as_string() != rv.as_string()));
+    }
+    eval_concat(src, env)
+}
+
+fn eval_concat(src: &str, env: &Env<'_>) -> Result<Value> {
+    // Split on top-level `+` and concatenate string forms.
+    let parts = split_all_top(src, "+");
+    if parts.len() == 1 {
+        return eval_filter(parts[0].trim(), env);
+    }
+    let mut acc = String::new();
+    for p in parts {
+        let v = eval_filter(p.trim(), env)?;
+        acc.push_str(&v.as_string());
+    }
+    Ok(Value::String(acc))
+}
+
+fn eval_filter(src: &str, env: &Env<'_>) -> Result<Value> {
+    // Filters bind to the immediate left atom: `x | trim`
+    // For `a + b | trim + c`, concat already split on `+`, so each part
+    // may still contain a filter.
+    if let Some((base, filter)) = split_top(src, "|") {
+        let base_v = eval_atom(base.trim(), env)?;
         let filter = filter.trim();
-        return Ok(match filter {
+        // Filter name may have args; we only support bare names.
+        let name = filter.split_whitespace().next().unwrap_or(filter);
+        return Ok(match name {
             "trim" => Value::String(base_v.as_string().trim().to_string()),
             "upper" => Value::String(base_v.as_string().to_uppercase()),
             "lower" => Value::String(base_v.as_string().to_lowercase()),
             _ => base_v,
         });
     }
+    eval_atom(src, env)
+}
+
+fn eval_atom(src: &str, env: &Env<'_>) -> Result<Value> {
+    let s = src.trim();
+    if s.is_empty() {
+        return Ok(Value::None);
+    }
+    // Parenthesized
+    if s.starts_with('(') && s.ends_with(')') {
+        return eval_expr(&s[1..s.len() - 1], env);
+    }
     // String literal
     if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
         || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
     {
-        return Ok(Value::String(s[1..s.len() - 1].to_string()));
+        return Ok(Value::String(unescape_literal(&s[1..s.len() - 1])));
     }
-    // Member access
-    if let Some((head, tail)) = s.split_once('.') {
-        let hv = env.get(head.trim());
-        return Ok(hv.member(tail.trim()));
+    // Integer literal
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(Value::Int(i));
     }
-    // Plain identifier
-    Ok(env.get(s))
+    // Bool literals
+    if s == "true" {
+        return Ok(Value::Bool(true));
+    }
+    if s == "false" {
+        return Ok(Value::Bool(false));
+    }
+    // Chained member / subscript: a.b['c'].d
+    Ok(eval_path(s, env))
+}
+
+fn eval_path(src: &str, env: &Env<'_>) -> Value {
+    let mut chars = src.chars().peekable();
+    // First identifier
+    let mut ident = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ident.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if ident.is_empty() {
+        return Value::None;
+    }
+    let mut cur = env.get(&ident);
+    loop {
+        // Skip whitespace
+        while matches!(chars.peek(), Some(' ')) {
+            chars.next();
+        }
+        match chars.peek().copied() {
+            Some('.') => {
+                chars.next();
+                while matches!(chars.peek(), Some(' ')) {
+                    chars.next();
+                }
+                let mut mem = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        mem.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                cur = cur.member(&mem);
+            }
+            Some('[') => {
+                chars.next();
+                while matches!(chars.peek(), Some(' ')) {
+                    chars.next();
+                }
+                let quote = match chars.peek().copied() {
+                    Some(q @ ('\'' | '"')) => {
+                        chars.next();
+                        q
+                    }
+                    _ => return Value::None,
+                };
+                let mut key = String::new();
+                for c in chars.by_ref() {
+                    if c == quote {
+                        break;
+                    }
+                    key.push(c);
+                }
+                while matches!(chars.peek(), Some(' ')) {
+                    chars.next();
+                }
+                if chars.next() != Some(']') {
+                    return Value::None;
+                }
+                cur = cur.member(&key);
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn unescape_literal(s: &str) -> String {
+    // GGUF templates rarely escape; keep minimal.
+    s.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\'", "'")
+        .replace("\\\"", "\"")
 }
 
 fn eval_bool(src: &str, env: &Env<'_>) -> Result<bool> {
-    let s = src.trim();
-    if let Some(rest) = s.strip_prefix("not ") {
-        return Ok(!eval_bool(rest, env)?);
-    }
-    if let Some((l, r)) = split_top(s, " or ") {
-        return Ok(eval_bool(&l, env)? || eval_bool(&r, env)?);
-    }
-    if let Some((l, r)) = split_top(s, " and ") {
-        return Ok(eval_bool(&l, env)? && eval_bool(&r, env)?);
-    }
-    if let Some((l, r)) = split_top(s, "==") {
-        let lv = eval_expr(&l, env)?;
-        let rv = eval_expr(&r, env)?;
-        return Ok(lv.as_string() == rv.as_string());
-    }
-    if let Some((l, r)) = split_top(s, "!=") {
-        let lv = eval_expr(&l, env)?;
-        let rv = eval_expr(&r, env)?;
-        return Ok(lv.as_string() != rv.as_string());
-    }
-    Ok(eval_expr(s, env)?.is_truthy())
+    eval_bool_val(&eval_expr(src, env)?)
+}
+
+fn eval_bool_val(v: &Value) -> Result<bool> {
+    Ok(v.is_truthy())
 }
 
 fn split_top(s: &str, sep: &str) -> Option<(String, String)> {
-    // Split at the top-level (ignore inside quotes).
     let bytes = s.as_bytes();
     let sb = sep.as_bytes();
     let mut i = 0;
     let mut in_s = false;
     let mut in_d = false;
+    let mut depth = 0i32;
     while i + sb.len() <= bytes.len() {
         let c = bytes[i];
         if c == b'\'' && !in_d {
             in_s = !in_s;
-        } else if c == b'"' && !in_s {
+            i += 1;
+            continue;
+        }
+        if c == b'"' && !in_s {
             in_d = !in_d;
-        } else if !in_s && !in_d && &bytes[i..i + sb.len()] == sb {
-            return Some((s[..i].to_string(), s[i + sb.len()..].to_string()));
+            i += 1;
+            continue;
+        }
+        if !in_s && !in_d {
+            if c == b'(' || c == b'[' {
+                depth += 1;
+            } else if c == b')' || c == b']' {
+                depth -= 1;
+            } else if depth == 0 && &bytes[i..i + sb.len()] == sb {
+                return Some((s[..i].to_string(), s[i + sb.len()..].to_string()));
+            }
         }
         i += 1;
     }
     None
+}
+
+fn split_all_top(s: &str, sep: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s.to_string();
+    while let Some((l, r)) = split_top(&rest, sep) {
+        out.push(l);
+        rest = r;
+    }
+    out.push(rest);
+    out
+}
+
+// Fix the for-loop `last` bug by replacing the for branch properly.
+// We patch render_tokens' for-handling via a cleaner helper used below.
+
+/// Correct for-loop body used by the patched render path.
+fn render_for_loop(
+    tokens: &[Tok],
+    env: &mut Env<'_>,
+    out: &mut String,
+    body_start: usize,
+    body_end: usize,
+    var: &str,
+    items: Vec<Value>,
+) -> Result<()> {
+    let n = items.len();
+    for (idx, item) in items.into_iter().enumerate() {
+        env.push();
+        env.set(var, item);
+        let mut loop_map = BTreeMap::new();
+        loop_map.insert("index0".into(), Value::Int(idx as i64));
+        loop_map.insert("index".into(), Value::Int((idx + 1) as i64));
+        loop_map.insert("first".into(), Value::Bool(idx == 0));
+        loop_map.insert("last".into(), Value::Bool(idx + 1 == n));
+        env.set("loop", Value::Map(loop_map));
+        render_tokens(&tokens[..body_end], env, out, body_start)?;
+        env.pop();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn llama3_template() -> &'static str {
+        "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' + message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}"
+    }
+
+    #[test]
+    fn renders_llama3_chat_template() {
+        // Use the exact GGUF template shape (space after end_header, no newlines).
+        let tmpl = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|> ' + message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{{ '<|start_header_id|>assistant<|end_header_id|> ' }}";
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "bos_token".into(),
+            Value::String("<|begin_of_text|>".into()),
+        );
+        let ctx = TemplateContext {
+            messages: vec![Message {
+                role: "user".into(),
+                content: "Hello whats up?".into(),
+            }],
+            add_generation_prompt: true,
+            vars,
+        };
+        let out = render(tmpl, &ctx).unwrap();
+        assert_eq!(
+            out,
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|> Hello whats up?<|eot_id|><|start_header_id|>assistant<|end_header_id|> "
+        );
+        let _ = llama3_template; // keep helper referenced for future variants
+    }
+
+    #[test]
+    fn concat_and_filter_precedence() {
+        let env_ctx = TemplateContext::default();
+        let mut scopes = BTreeMap::new();
+        scopes.insert(
+            "message".into(),
+            Value::Message(Message {
+                role: "user".into(),
+                content: "  hi  ".into(),
+            }),
+        );
+        let env = Env {
+            ctx: &env_ctx,
+            scopes: vec![scopes],
+        };
+        let v = eval_expr("'A' + message['content'] | trim + 'B'", &env).unwrap();
+        assert_eq!(v.as_string(), "AhiB");
+    }
 }

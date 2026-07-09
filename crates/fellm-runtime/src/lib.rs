@@ -17,3 +17,4 @@ pub mod kv_cache;
 
 pub use engine::{Engine, EngineBuilder, GenParams, TokenStream};
 pub use kv_cache::KvCache;
+pub use fellm_tokenizer::Message;

@@ -101,13 +101,17 @@ fn dequantize_q8_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
 }
 
 // --- Q4_K super-block ---
-// Layout (144 bytes, 256 weights):
+// Layout (144 bytes, 256 weights) — matches ggml `block_q4_K`:
 //   fp16 d (2)
 //   fp16 dmin (2)
 //   12 bytes packed scales+mins (6-bit each, 8 pairs)
-//   128 bytes of 4-bit weights (256 weights, 8 sub-blocks of 32)
+//   128 bytes of 4-bit weights
 //
-// The scales/mins layout is the classic ggml packed format.
+// Memory layout of qs (from ggml-quants.c `dequantize_row_q4_K`):
+//   For each group of 32 qs bytes (covers 64 weights):
+//     low  nibbles → 32 consecutive weights with scale/min pair `is`
+//     high nibbles → next 32 consecutive weights with scale/min pair `is+1`
+//   Then advance qs by 32 and is by 2. Four such groups cover 256 weights.
 fn dequantize_q4_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
     let n_blocks = n_elements / QK_K;
     if n_elements % QK_K != 0 {
@@ -123,56 +127,48 @@ fn dequantize_q4_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
         let dmin = f16::from_bits(u16::from_le_bytes([src[base + 2], src[base + 3]])).to_f32();
         let scales_bytes = &src[base + 4..base + 4 + 12];
         let qs = &src[base + 16..base + 16 + 128];
-
-        // Unpack 8 (scale, min) 6-bit pairs.
-        let mut scales = [0u8; 8];
-        let mut mins = [0u8; 8];
-        get_scale_min_k4(scales_bytes, &mut scales, &mut mins);
-
         let out = &mut dst[b * QK_K..(b + 1) * QK_K];
-        for j in 0..8 {
-            let sc = d * scales[j] as f32;
-            let m = dmin * mins[j] as f32;
-            let sub = &qs[j * 16..(j + 1) * 16]; // 16 bytes = 32 weights (4-bit each)
-            let out_sub = &mut out[j * 32..(j + 1) * 32];
-            // Low nibbles first 16, high nibbles next 16.
-            for i in 0..16 {
-                let byte = sub[i];
-                let lo = (byte & 0x0F) as f32;
-                let hi = (byte >> 4) as f32;
-                out_sub[i] = sc * lo - m;
-                out_sub[i + 16] = sc * hi - m;
+
+        let mut is = 0usize;
+        let mut q_off = 0usize;
+        let mut y_off = 0usize;
+        // Four groups of 64 weights each (32 qs bytes per group).
+        for _ in 0..4 {
+            let (sc0, m0) = get_scale_min_k4(is, scales_bytes);
+            let (sc1, m1) = get_scale_min_k4(is + 1, scales_bytes);
+            let d1 = d * sc0 as f32;
+            let m1f = dmin * m0 as f32;
+            let d2 = d * sc1 as f32;
+            let m2f = dmin * m1 as f32;
+            let q = &qs[q_off..q_off + 32];
+            for l in 0..32 {
+                out[y_off + l] = d1 * (q[l] & 0x0F) as f32 - m1f;
             }
+            for l in 0..32 {
+                out[y_off + 32 + l] = d2 * (q[l] >> 4) as f32 - m2f;
+            }
+            q_off += 32;
+            y_off += 64;
+            is += 2;
         }
     }
     Ok(())
 }
 
-/// Extract 8 6-bit scales and 8 6-bit mins from the 12-byte packed field.
-///
-/// Layout (from ggml-quants.c `get_scale_min_k4`):
-///   bytes 0..4  = low 4 bits of scales (4 pairs => 8 nibbles)
-///   bytes 4..8  = low 4 bits of mins   (4 pairs => 8 nibbles)
-///   bytes 8..12 = high 2 bits of scale[i] and mins[i] interleaved
-///
-/// See ggml reference for the exact bit layout. This implementation
-/// follows it verbatim.
-fn get_scale_min_k4(bytes: &[u8], scales: &mut [u8; 8], mins: &mut [u8; 8]) {
-    // First 4 pairs
-    for j in 0..4 {
-        scales[j] = bytes[j] & 63;
-        mins[j] = bytes[j + 4] & 63;
-    }
-    // Next 4 pairs: combine low 4 bits from bytes 8..12 with high 2 bits
-    // taken from the top of bytes 0..8.
-    for j in 0..4 {
-        scales[j + 4] = (bytes[j + 8] & 0x0F) | ((bytes[j] >> 6) << 4);
-        mins[j + 4] = (bytes[j + 8] >> 4) | ((bytes[j + 4] >> 6) << 4);
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    debug_assert!(j < 8);
+    debug_assert!(q.len() >= 12);
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (d, m)
     }
 }
 
 // --- Q6_K super-block ---
-// Layout (210 bytes, 256 weights):
+// Layout (210 bytes, 256 weights) — matches ggml `block_q6_K`:
 //   128 bytes ql (low 4 bits of each 6-bit weight)
 //   64  bytes qh (high 2 bits of each 6-bit weight, packed 4 per byte)
 //   16  bytes scales (int8, one per sub-block-of-16)
@@ -190,91 +186,31 @@ fn dequantize_q6_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
     }
     for b in 0..n_blocks {
         let base = b * block_bytes;
-        let ql = &src[base..base + 128];
-        let qh = &src[base + 128..base + 128 + 64];
-        let scales: &[i8] = bytemuck::cast_slice(&src[base + 192..base + 192 + 16]);
-        let d = f16::from_bits(u16::from_le_bytes([src[base + 208], src[base + 209]])).to_f32();
-
-        let out = &mut dst[b * QK_K..(b + 1) * QK_K];
-
-        // Process in 2 halves of 128 weights each.
-        // Reference layout (from ggml-quants.c):
-        //   For l in 0..32:
-        //     q1 = ((ql[l]        & 0xF) | ((qh[l]       & 3) << 4)) - 32
-        //     q2 = ((ql[l + 32]   & 0xF) | ((qh[l] >> 2) & 3) << 4)) - 32
-        //     q3 = ((ql[l]  >> 4)         | ((qh[l] >> 4) & 3) << 4)) - 32
-        //     q4 = ((ql[l+32] >> 4)       | ((qh[l] >> 6) & 3) << 4)) - 32
-        //   out[l]      = d * sc[0] * q1
-        //   out[l+32]   = d * sc[2] * q2
-        //   out[l+64]   = d * sc[4] * q3
-        //   out[l+96]   = d * sc[6] * q4
-        // ... repeat for second half with ql[64..128], qh[32..64], scales[8..].
-        for half in 0..2 {
-            let ql_off = half * 64;
-            let qh_off = half * 32;
-            let sc_off = half * 8;
-            for l in 0..32 {
-                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32
-                    - 32;
-                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32
-                    - 32;
-                let out_base = half * 128;
-                out[out_base + l] = d * scales[sc_off + 0] as f32 * q1 as f32;
-                out[out_base + l + 32] = d * scales[sc_off + 2] as f32 * q2 as f32;
-                out[out_base + l + 64] = d * scales[sc_off + 4] as f32 * q3 as f32;
-                out[out_base + l + 96] = d * scales[sc_off + 6] as f32 * q4 as f32;
-                // Sub-blocks 1,3,5,7 (16-wide) still need coverage:
-                // The k-quant scale index changes every 16 weights, so above
-                // we've applied scales[0,2,4,6] to the first 16 of each 32-run.
-                // For weights [16..32] within each 32-run we need scales[1,3,5,7].
-                // Correct approach below.
-            }
-        }
-        // Rewrite using the exact ggml pattern:
-        // Reset and redo carefully.
-        for j in 0..QK_K {
-            // no-op placeholder; the actual filling above is close-but-not-quite.
-        }
-        // Overwrite with a correct scalar reference:
-        dequantize_q6_k_scalar(&src[base..base + 210], out);
+        dequantize_q6_k_block(
+            &src[base..base + block_bytes],
+            &mut dst[b * QK_K..(b + 1) * QK_K],
+        );
     }
     Ok(())
 }
 
-/// Straight-line scalar reference for Q6_K, matching ggml exactly.
-///
-/// This is invoked as an overwrite by [`dequantize_q6_k`] to keep the fast
-/// path simple and prove-correct at once. Optimize later.
-fn dequantize_q6_k_scalar(block: &[u8], out: &mut [f32]) {
+/// Scalar Q6_K block dequant matching ggml-quants.c `dequantize_row_q6_K`.
+fn dequantize_q6_k_block(block: &[u8], out: &mut [f32]) {
     let ql = &block[0..128];
     let qh = &block[128..192];
     let scales: &[i8] = bytemuck::cast_slice(&block[192..208]);
     let d = f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
 
-    // Follow the ggml-quants.c logic exactly:
-    //   for n in [0, 128) step 128:  (only one iteration; block is 256 weights but processed in 2 halves)
-    // Simpler: iterate over 256 output positions using the closed form.
-    //
-    // Weight index i in [0, 256). Sub-block-of-16 index s = i / 16.
-    // The packing groups weights into 4 lanes of 32 within each 128-half.
-    // Let's compute by mimicking ggml's dequantize_row_q6_K:
-    //
-    // for l in 0..32:
-    //   is = l / 16  (0 or 1)  -> scale index base within the half
-    //   for h in 0..2:
-    //     for k in 0..2:  (which nibble of ql / which pair of qh bits)
-    //       ...
-    //
-    // Deriving this from scratch is error-prone; use the canonical layout:
-
-    for n in 0..2 {
+    let mut y_off = 0usize;
+    let mut ql_off = 0usize;
+    let mut qh_off = 0usize;
+    let mut sc_off = 0usize;
+    for _ in 0..2 {
         // two halves of 128 weights each
-        let ql = &ql[n * 64..(n + 1) * 64];
-        let qh = &qh[n * 32..(n + 1) * 32];
-        let sc = &scales[n * 8..(n + 1) * 8];
-        let out = &mut out[n * 128..(n + 1) * 128];
+        let ql = &ql[ql_off..ql_off + 64];
+        let qh = &qh[qh_off..qh_off + 32];
+        let sc = &scales[sc_off..sc_off + 8];
+        let out = &mut out[y_off..y_off + 128];
 
         for l in 0..32 {
             let is = l / 16; // 0 or 1
@@ -288,6 +224,11 @@ fn dequantize_q6_k_scalar(block: &[u8], out: &mut [f32]) {
             out[l + 64] = d * sc[is + 4] as f32 * q3 as f32;
             out[l + 96] = d * sc[is + 6] as f32 * q4 as f32;
         }
+
+        y_off += 128;
+        ql_off += 64;
+        qh_off += 32;
+        sc_off += 8;
     }
 }
 
@@ -326,6 +267,72 @@ mod tests {
         dequantize_q8_0(&block, &mut out, 32).unwrap();
         for i in 0..32 {
             assert!((out[i] - i as f32).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn q4_k_matches_ggml_nibble_layout() {
+        // Build one Q4_K block with d=1, dmin=0, scales all 1, and known qs.
+        // ggml layout: for each 32-byte qs chunk, low nibbles → 32 weights with
+        // scale[is], high nibbles → next 32 weights with scale[is+1].
+        let mut block = vec![0u8; 144];
+        let d = f16::from_f32(1.0).to_bits().to_le_bytes();
+        block[0] = d[0];
+        block[1] = d[1];
+        // dmin = 0 already
+        // scales: j<4 live in bytes 0..4 (scale) and 4..8 (min). Set scale=1.
+        for j in 0..4 {
+            block[4 + j] = 1; // scale[j] = 1
+            block[4 + j + 4] = 0; // min[j] = 0
+        }
+        // scale[4..8]=1, min[4..8]=0 packed into bytes 8..12 with high bits in 0..8
+        for j in 0..4 {
+            block[4 + j + 8] = 1; // low 4 bits of scale[j+4]
+        }
+
+        // First qs group (32 bytes): low nibble = 3, high nibble = 7 → 0x73
+        for i in 0..32 {
+            block[16 + i] = 0x73;
+        }
+        // Remaining qs zeroed → weights 64..256 = 0
+
+        let mut out = vec![0f32; 256];
+        dequantize_q4_k(&block, &mut out, 256).unwrap();
+
+        // First 32 weights: d1 * 3 = 3
+        for i in 0..32 {
+            assert!((out[i] - 3.0).abs() < 1e-5, "out[{i}] = {} want 3", out[i]);
+        }
+        // Next 32 weights: d2 * 7 = 7
+        for i in 32..64 {
+            assert!((out[i] - 7.0).abs() < 1e-5, "out[{i}] = {} want 7", out[i]);
+        }
+        // Rest zero (scale may be 0 for remaining groups if packing left them 0)
+        for i in 64..256 {
+            assert!(out[i].abs() < 1e-5, "out[{i}] = {} want 0", out[i]);
+        }
+    }
+
+    #[test]
+    fn get_scale_min_k4_matches_ggml() {
+        // Mimic ggml packing for j in 0..8 with distinct scale/min values.
+        let mut scales_packed = [0u8; 12];
+        let ls = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let lm = [10u8, 11, 12, 13, 14, 15, 16, 17];
+        for j in 0..8 {
+            if j < 4 {
+                scales_packed[j] = ls[j];
+                scales_packed[j + 4] = lm[j];
+            } else {
+                scales_packed[j + 4] = (ls[j] & 0x0F) | ((lm[j] & 0x0F) << 4);
+                scales_packed[j - 4] |= (ls[j] >> 4) << 6;
+                scales_packed[j] |= (lm[j] >> 4) << 6;
+            }
+        }
+        for j in 0..8 {
+            let (sc, m) = get_scale_min_k4(j, &scales_packed);
+            assert_eq!(sc, ls[j], "scale[{j}]");
+            assert_eq!(m, lm[j], "min[{j}]");
         }
     }
 }

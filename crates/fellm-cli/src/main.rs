@@ -30,9 +30,15 @@ struct RunArgs {
     /// Path to a GGUF file.
     #[arg(long)]
     model: PathBuf,
-    /// Prompt string.
+    /// Prompt / user message string.
     #[arg(long)]
     prompt: String,
+    /// Optional system message (chat mode only).
+    #[arg(long)]
+    system: Option<String>,
+    /// Force raw completion (skip chat template even if the model has one).
+    #[arg(long, default_value_t = false)]
+    completion: bool,
     /// Max tokens to generate.
     #[arg(long, default_value_t = 128)]
     max_tokens: u32,
@@ -90,31 +96,57 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
         seed: args.seed,
     };
 
-    // Echo the prompt first.
+    let use_chat = !args.completion && engine.tokenizer().chat_template().is_some();
+
+    // Echo the user-visible prompt (not the templated internals).
     print!("{}", args.prompt);
     std::io::stdout().flush().ok();
 
     let mut stdout = std::io::stdout().lock();
-    let tokenizer_bos = engine.tokenizer().bos();
-    let mut stream = engine.generate(&args.prompt, params)?;
+    let stop_ids = {
+        let mut s = Vec::new();
+        if let Some(eos) = engine.tokenizer().eos() {
+            s.push(eos);
+        }
+        s
+    };
+    let mut stream = if use_chat {
+        let mut messages = Vec::new();
+        if let Some(sys) = &args.system {
+            messages.push(fellm_runtime::Message {
+                role: "system".into(),
+                content: sys.clone(),
+            });
+        }
+        messages.push(fellm_runtime::Message {
+            role: "user".into(),
+            content: args.prompt.clone(),
+        });
+        engine.chat(&messages, params)?
+    } else {
+        engine.generate(&args.prompt, params)?
+    };
+
     let mut byte_buf: Vec<u8> = Vec::new();
     while let Some(tok_result) = stream.next() {
         let tok = tok_result?;
-        // Skip BOS on echo.
-        if Some(tok) == tokenizer_bos {
+        // Stop tokens decode to empty; skip echoing them.
+        if stop_ids.contains(&tok) {
             continue;
         }
         let bytes = stream.decode_token(tok)?;
+        if bytes.is_empty() {
+            continue;
+        }
         byte_buf.extend_from_slice(&bytes);
-        // Only emit bytes up to the last valid UTF-8 boundary to avoid split
-        // multi-byte characters.
         let s = flush_valid_utf8_prefix(&mut byte_buf);
         stdout.write_all(s.as_bytes()).ok();
         stdout.flush().ok();
     }
     if !byte_buf.is_empty() {
-        // Drop invalid trailing bytes.
-        stdout.write_all(String::from_utf8_lossy(&byte_buf).as_bytes()).ok();
+        stdout
+            .write_all(String::from_utf8_lossy(&byte_buf).as_bytes())
+            .ok();
     }
     println!();
     Ok(())

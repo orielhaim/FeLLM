@@ -1,17 +1,3 @@
-//! Build a per-step Llama forward graph.
-//!
-//! Signature:
-//!   inputs:
-//!     token_id: [1] u32
-//!     position: [1] u32
-//!     past_len: [1] u32
-//!     k_in_{layer}: [max_seq, n_kv_heads * head_dim] f32
-//!     v_in_{layer}: [max_seq, n_kv_heads * head_dim] f32
-//!   outputs:
-//!     logits: [vocab] f32
-//!     k_out_{layer}: [n_kv_heads * head_dim] f32   (row to append at `position`)
-//!     v_out_{layer}: [n_kv_heads * head_dim] f32
-
 use crate::config::LlamaConfig;
 use fellm_core::dtype::DType;
 use fellm_core::error::Result;
@@ -34,10 +20,7 @@ pub fn build(gguf: &GgufFile, cfg: &LlamaConfig, position: usize) -> Result<Grap
     let q_stride = n_heads * head_dim;
 
     // Constants
-    let tok_embd = gb.constant(
-        "token_embd",
-        gguf.tensor("token_embd.weight")?,
-    );
+    let tok_embd = gb.constant("token_embd", gguf.tensor("token_embd.weight")?);
 
     let output_w_name = if cfg.tied_embeddings {
         "token_embd.weight"
@@ -46,6 +29,11 @@ pub fn build(gguf: &GgufFile, cfg: &LlamaConfig, position: usize) -> Result<Grap
     };
     let output_w = gb.constant("output_w", gguf.tensor(output_w_name)?);
     let output_norm_w = gb.constant("output_norm_w", gguf.tensor("output_norm.weight")?);
+
+    // RoPE inverse frequencies (scaled per Llama 3 recipe if applicable).
+    let inv_freqs_data = cfg.compute_rope_inv_freqs();
+    let inv_freqs_tensor = make_f32_tensor(&inv_freqs_data);
+    let inv_freqs_node = gb.constant("rope_inv_freqs", inv_freqs_tensor);
 
     // Inputs
     let token_id = gb.input("token_id", DType::U32, Shape::new(&[1])?);
@@ -64,7 +52,17 @@ pub fn build(gguf: &GgufFile, cfg: &LlamaConfig, position: usize) -> Result<Grap
 
     // Per-layer.
     for layer in 0..cfg.n_layers {
-        x = build_layer(&mut gb, gguf, cfg, layer, position, x, kv_stride, q_stride)?;
+        x = build_layer(
+            &mut gb,
+            gguf,
+            cfg,
+            layer,
+            position,
+            x,
+            kv_stride,
+            q_stride,
+            inv_freqs_node,
+        )?;
     }
 
     // Final norm.
@@ -105,6 +103,7 @@ fn build_layer(
     x_in: NodeId,
     kv_stride: usize,
     q_stride: usize,
+    inv_freqs: NodeId,
 ) -> Result<NodeId> {
     let d_model = cfg.d_model;
     let head_dim = cfg.head_dim();
@@ -211,7 +210,7 @@ fn build_layer(
         rope_attrs_q,
         DType::F32,
         Shape::new(&[q_stride as u64])?,
-        &[q],
+        &[q, inv_freqs],
         format!("blk.{layer}.q_rope"),
     );
     let k_rot = gb.op(
@@ -219,19 +218,10 @@ fn build_layer(
         rope_attrs_k,
         DType::F32,
         Shape::new(&[kv_stride as u64])?,
-        &[k],
+        &[k, inv_freqs],
         format!("blk.{layer}.k_rope"),
     );
 
-    // Expose k_out_{layer} / v_out_{layer} as graph outputs.
-    gb.mark_output(format!("k_out_{layer}"), k_rot);
-    gb.mark_output(format!("v_out_{layer}"), v);
-
-    // Attention. We take the KV-cache inputs (with the current row already
-    // conceptually included by the runtime writing before executing the graph
-    // at this position — but for correctness we take the KV cache view and
-    // let the CPU kernel process past_len+1 tokens after the runtime has
-    // written the row. Phase 1 wires this via a pre-step write.
     let k_in = gb.input(
         format!("k_in_{layer}"),
         DType::F32,
@@ -241,6 +231,29 @@ fn build_layer(
         format!("v_in_{layer}"),
         DType::F32,
         Shape::new(&[cfg.context_length as u64, kv_stride as u64])?,
+    );
+
+    let kv_write_attrs = OpAttrs {
+        position: position as u32,
+        ..Default::default()
+    };
+    let k_cache_updated = gb.op_in_place(
+        OpKind::KvWrite,
+        kv_write_attrs,
+        DType::F32,
+        Shape::new(&[cfg.context_length as u64, kv_stride as u64])?,
+        &[k_rot, k_in],
+        1, // alias slot 1 (k_in) as the output buffer
+        format!("blk.{layer}.k_write"),
+    );
+    let v_cache_updated = gb.op_in_place(
+        OpKind::KvWrite,
+        kv_write_attrs,
+        DType::F32,
+        Shape::new(&[cfg.context_length as u64, kv_stride as u64])?,
+        &[v, v_in],
+        1,
+        format!("blk.{layer}.v_write"),
     );
 
     let attn_attrs = OpAttrs {
@@ -256,7 +269,7 @@ fn build_layer(
         attn_attrs,
         DType::F32,
         Shape::new(&[q_stride as u64])?,
-        &[q_rot, k_in, v_in],
+        &[q_rot, k_cache_updated, v_cache_updated],
         format!("blk.{layer}.attn"),
     );
 
@@ -337,4 +350,20 @@ fn build_layer(
     );
 
     Ok(x_out)
+}
+
+fn make_f32_tensor(data: &[f32]) -> fellm_core::tensor::Tensor {
+    use fellm_core::dtype::DType;
+    use fellm_core::shape::{Layout, Shape as FShape};
+    use fellm_core::storage::{AlignedBuffer, Storage};
+    use std::sync::Arc;
+
+    let bytes_len = data.len() * 4;
+    let mut buf = AlignedBuffer::new_zeroed(bytes_len, 64);
+    let dst: &mut [f32] = bytemuck::cast_slice_mut(buf.as_mut_slice());
+    dst.copy_from_slice(data);
+    let shape = FShape::new(&[data.len() as u64]).expect("valid shape");
+    let layout = Layout::contiguous(DType::F32, shape);
+    let storage = Arc::new(Storage::Owned(Arc::new(buf)));
+    fellm_core::tensor::Tensor::from_storage(layout, storage)
 }

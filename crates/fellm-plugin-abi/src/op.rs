@@ -13,9 +13,6 @@ pub enum OpKind {
     /// Element-wise multiply.
     Mul,
     /// Matmul: `C = A @ B^T` (weights row-major).
-    ///
-    /// Following llama.cpp convention, the weight matrix is `[out_dim, in_dim]`
-    /// and we compute `y[i] = sum_j w[i,j] * x[j]` — i.e. `y = x @ w^T`.
     MatMul,
     /// RMSNorm with a learned weight vector.
     RmsNorm,
@@ -37,6 +34,8 @@ pub enum OpKind {
     Cast,
     /// Sample the next token from a logit vector.
     Sample,
+    /// Write a K/V row into the cache at `position`, in-place on the cache buffer.
+    KvWrite,
 }
 
 impl OpKind {
@@ -57,6 +56,7 @@ impl OpKind {
             Self::Reshape => "reshape",
             Self::Cast => "cast",
             Self::Sample => "sample",
+            Self::KvWrite => "kv_write",
         }
     }
 }

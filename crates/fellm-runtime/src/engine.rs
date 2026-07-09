@@ -11,8 +11,7 @@ use fellm_core::storage::{AlignedBuffer, Storage};
 use fellm_core::tensor::Tensor;
 use fellm_gguf::GgufFile;
 use fellm_graph::plan::ExecutionPlan;
-use fellm_plugin_abi::op::OpAttrs;
-use fellm_tokenizer::{Tokenizer, load as load_tokenizer};
+use fellm_tokenizer::{Message, Tokenizer, load as load_tokenizer};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -148,18 +147,65 @@ impl Engine {
         &self.config
     }
 
-    /// Generate tokens.
+    /// Generate tokens from a raw prompt string (completion mode).
+    ///
+    /// Does **not** apply a chat template. Prefer [`Engine::chat`] for
+    /// instruction-tuned models.
     pub fn generate(&mut self, prompt: &str, params: GenParams) -> Result<TokenStream> {
+        self.kv.reset();
         let ids = self.tokenizer.encode(prompt, true)?;
         tracing::info!(n_tokens = ids.len(), "prompt tokenized");
+        self.generate_from_ids(&ids, params)
+    }
 
-        // Prefill: run each prompt token through the graph, appending to KV.
+    /// Generate a reply to a chat conversation.
+    ///
+    /// Applies the model's GGUF `tokenizer.chat_template` when present
+    /// (Llama 3 / Mistral / Qwen style). Falls back to joining message
+    /// contents if the model has no template (base / completion models).
+    pub fn chat(&mut self, messages: &[Message], params: GenParams) -> Result<TokenStream> {
+        self.kv.reset();
+        let prompt = match self.tokenizer.apply_chat_template(messages, true)? {
+            Some(formatted) => {
+                tracing::debug!(prompt = %formatted, "chat template applied");
+                formatted
+            }
+            None => {
+                // No template: concatenate contents (base model / raw completion).
+                messages
+                    .iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+        // Template already includes BOS when the model defines one — do not
+        // double-prepend. `encode` still dedupes if BOS is present.
+        let ids = self.tokenizer.encode(&prompt, true)?;
+        tracing::info!(n_tokens = ids.len(), "chat prompt tokenized");
+        self.generate_from_ids(&ids, params)
+    }
+
+    /// Convenience: single-turn user chat.
+    pub fn chat_user(&mut self, user: &str, params: GenParams) -> Result<TokenStream> {
+        self.chat(
+            &[Message {
+                role: "user".into(),
+                content: user.into(),
+            }],
+            params,
+        )
+    }
+
+    fn generate_from_ids(&mut self, ids: &[u32], params: GenParams) -> Result<TokenStream> {
+        if ids.is_empty() {
+            return Err(FellmError::other("empty prompt"));
+        }
+        let stop_token_ids = self.stop_token_ids();
         let mut logits: Option<Tensor> = None;
         for (pos, &tok) in ids.iter().enumerate() {
             logits = Some(self.step(tok, pos, false)?);
         }
-
-        // Prepare the stream state.
         let last_logits = logits.ok_or_else(|| FellmError::other("empty prompt"))?;
         let start_pos = ids.len();
         Ok(TokenStream {
@@ -169,55 +215,73 @@ impl Engine {
             emitted: 0,
             position: start_pos,
             finished: false,
+            stop_token_ids,
         })
     }
 
-    /// One forward step for token id `tok` at position `pos`.
-    ///
-    /// Returns the logits tensor for the next token.
-    fn step(&mut self, tok: u32, pos: usize, _final_token: bool) -> Result<Tensor> {
-        // Build a single-token graph specialized to this position.
-        let graph = self
-            .arch
-            .build_step_graph(&self.gguf, &self.config, pos)?;
-        let plan = ExecutionPlan::from_graph(&graph)?;
-        let executor = GraphExecutor::new(&graph, &plan, &self.backend);
-
-        // Wire the token id input.
-        let tok_tensor = scalar_u32_tensor(tok);
-        let mut exec = executor;
-        exec.bind_input("token_id", tok_tensor);
-
-        // Bind KV-cache tensors (K and V per layer as inputs; the graph writes
-        // updated versions to outputs "k_layer_i" and "v_layer_i").
-        for layer in 0..self.config.n_layers {
-            let k_bytes = self.kv.layers_k_bytes(layer);
-            let v_bytes = self.kv.layers_v_bytes(layer);
-            let dim = self.kv.tokens_stride;
-            let shape = Shape::new(&[self.kv.max_seq as u64, dim as u64])?;
-            exec.bind_input(format!("k_in_{layer}"), tensor_from_bytes(k_bytes, DType::F32, shape.clone()));
-            exec.bind_input(format!("v_in_{layer}"), tensor_from_bytes(v_bytes, DType::F32, shape));
+    /// Tokens that should end generation (EOS / EOT and friends).
+    fn stop_token_ids(&self) -> Vec<u32> {
+        let mut stops = Vec::new();
+        if let Some(eos) = self.tokenizer.eos() {
+            stops.push(eos);
         }
-        // Also bind current position and past_len.
-        exec.bind_input(
-            "position",
-            scalar_u32_tensor(pos as u32),
-        );
-        exec.bind_input("past_len", scalar_u32_tensor(pos as u32));
-
-        let outs = exec.run()?;
-
-        // Copy new K/V rows for this layer back into the cache.
-        for layer in 0..self.config.n_layers {
-            if let (Some(k_new), Some(v_new)) = (
-                outs.get(&format!("k_out_{layer}")),
-                outs.get(&format!("v_out_{layer}")),
-            ) {
-                let k_slice: &[f32] = k_new.as_slice()?;
-                let v_slice: &[f32] = v_new.as_slice()?;
-                self.kv.append(layer, k_slice, v_slice, pos);
+        // Llama 3 Instruct often uses <|eot_id|> as eos already; also stop on
+        // <|end_of_text|> if distinct and present in the rendered vocabulary
+        // via a second encode of the surface form.
+        if let Ok(ids) = self.tokenizer.encode("<|end_of_text|>", false)
+            && ids.len() == 1
+        {
+            let id = ids[0];
+            if !stops.contains(&id) {
+                stops.push(id);
             }
         }
+        if let Ok(ids) = self.tokenizer.encode("<|eot_id|>", false)
+            && ids.len() == 1
+        {
+            let id = ids[0];
+            if !stops.contains(&id) {
+                stops.push(id);
+            }
+        }
+        stops
+    }
+
+    /// One forward step for token id `tok` at position `pos`.
+    fn step(&mut self, tok: u32, pos: usize, _final_token: bool) -> Result<Tensor> {
+        let graph = self.arch.build_step_graph(&self.gguf, &self.config, pos)?;
+        let plan = ExecutionPlan::from_graph(&graph)?;
+        let mut exec = GraphExecutor::new(&graph, &plan, &self.backend);
+
+        // Read-only inputs.
+        exec.bind_input("token_id", scalar_u32_tensor(tok));
+        exec.bind_input("position", scalar_u32_tensor(pos as u32));
+        exec.bind_input("past_len", scalar_u32_tensor(pos as u32));
+
+        // Mutable KV cache bindings. The graph's `KvWrite` op mutates these
+        // in place at position `pos`, and Attention reads them afterward.
+        let dim = self.kv.tokens_stride;
+        let shape = Shape::new(&[self.kv.max_seq as u64, dim as u64])?;
+        for layer in 0..self.config.n_layers {
+            exec.bind_mutable(
+                format!("k_in_{layer}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.kv.k_buffer(layer),
+                },
+            );
+            exec.bind_mutable(
+                format!("v_in_{layer}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.kv.v_buffer(layer),
+                },
+            );
+        }
+
+        let outs = exec.run()?;
         self.kv.advance();
 
         outs.get("logits")
@@ -234,6 +298,7 @@ pub struct TokenStream<'a> {
     emitted: u32,
     position: usize,
     finished: bool,
+    stop_token_ids: Vec<u32>,
 }
 
 impl<'a> TokenStream<'a> {
@@ -269,10 +334,8 @@ impl<'a> Iterator for TokenStream<'a> {
         );
         self.emitted += 1;
 
-        // Check EOS.
-        if let Some(eos) = self.engine.tokenizer.eos()
-            && tok == eos
-        {
+        // Check stop tokens (EOS / EOT).
+        if self.stop_token_ids.contains(&tok) {
             self.finished = true;
             return Some(Ok(tok));
         }
@@ -304,31 +367,4 @@ fn scalar_u32_tensor(v: u32) -> Tensor {
     let layout = Layout::contiguous(DType::U32, Shape::new(&[1]).expect("valid"));
     let storage = Arc::new(Storage::Owned(Arc::new(buf)));
     Tensor::from_storage(layout, storage)
-}
-
-fn tensor_from_bytes(bytes: &[u8], dtype: DType, shape: Shape) -> Tensor {
-    let mut buf = AlignedBuffer::new_zeroed(bytes.len(), 64);
-    buf.as_mut_slice().copy_from_slice(bytes);
-    let layout = Layout::contiguous(dtype, shape);
-    let storage = Arc::new(Storage::Owned(Arc::new(buf)));
-    Tensor::from_storage(layout, storage)
-}
-
-// Small extension trait so we can grab raw KV layer bytes.
-trait KvBytes {
-    fn layers_k_bytes(&self, layer: usize) -> &[u8];
-    fn layers_v_bytes(&self, layer: usize) -> &[u8];
-}
-
-impl KvBytes for KvCache {
-    fn layers_k_bytes(&self, layer: usize) -> &[u8] {
-        // SAFETY: layer < n_layers; buffer alive for &self.
-        // We reinterpret the &[f32] as &[u8] via bytemuck.
-        let f32s: &[f32] = self.k(layer);
-        bytemuck::cast_slice(f32s)
-    }
-    fn layers_v_bytes(&self, layer: usize) -> &[u8] {
-        let f32s: &[f32] = self.v(layer);
-        bytemuck::cast_slice(f32s)
-    }
 }

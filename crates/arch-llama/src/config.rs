@@ -1,7 +1,15 @@
-//! Llama config extracted from GGUF metadata.
-
 use fellm_core::error::Result;
 use fellm_gguf::GgufFile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeScalingType {
+    /// No scaling.
+    None,
+    /// Linear scaling (Llama 2 style).
+    Linear,
+    /// Llama 3 style scaling (piecewise interpolation).
+    Llama3,
+}
 
 /// Config values needed to build a Llama forward graph.
 #[derive(Debug, Clone)]
@@ -12,7 +20,7 @@ pub struct LlamaConfig {
     pub d_model: usize,
     /// Number of attention heads.
     pub n_heads: usize,
-    /// Number of KV heads (== n_heads for pre-GQA models).
+    /// Number of KV heads.
     pub n_kv_heads: usize,
     /// Feed-forward hidden dim.
     pub d_ff: usize,
@@ -20,7 +28,7 @@ pub struct LlamaConfig {
     pub norm_eps: f32,
     /// RoPE base frequency.
     pub rope_base: f32,
-    /// RoPE rotation dimension (equal to head_dim in most llama configs).
+    /// RoPE rotation dimension.
     pub rope_dim: usize,
     /// Trained context length.
     pub context_length: usize,
@@ -28,10 +36,20 @@ pub struct LlamaConfig {
     pub vocab_size: usize,
     /// True if `output.weight` is tied to `token_embd.weight`.
     pub tied_embeddings: bool,
+    /// RoPE scaling type.
+    pub rope_scaling_type: RopeScalingType,
+    /// RoPE scaling factor (32.0 for Llama 3.2 1B).
+    pub rope_scaling_factor: f32,
+    /// Original context length before scaling (8192 for Llama 3.2).
+    pub rope_original_ctx: u32,
+    /// Low-freq factor for llama3 scaling.
+    pub rope_low_freq_factor: f32,
+    /// High-freq factor for llama3 scaling.
+    pub rope_high_freq_factor: f32,
 }
 
 impl LlamaConfig {
-    /// Head dimension.
+    /// Per-head dimension (`d_model / n_heads`).
     #[must_use]
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
@@ -62,8 +80,39 @@ impl LlamaConfig {
             .map(<[String]>::len)
             .unwrap_or(0);
 
-        // Detect tied embeddings by checking whether `output.weight` exists.
         let tied_embeddings = !gguf.has_tensor("output.weight");
+
+        let scaling_type_str = m
+            .get_string("llama.rope.scaling.type")
+            .ok()
+            .map(str::to_string);
+        let rope_scaling_factor = m
+            .get_f32("llama.rope.scaling.factor")
+            .or_else(|_| m.get_f32("llama.rope.scale_linear"))
+            .unwrap_or(1.0);
+        let rope_original_ctx = m
+            .get_u32("llama.rope.scaling.original_context_length")
+            .unwrap_or(0);
+        let rope_low_freq_factor = m
+            .get_f32("llama.rope.scaling.low_freq_factor")
+            .unwrap_or(1.0);
+        let rope_high_freq_factor = m
+            .get_f32("llama.rope.scaling.high_freq_factor")
+            .unwrap_or(4.0);
+
+        let rope_scaling_type = match scaling_type_str.as_deref() {
+            Some("llama3") => RopeScalingType::Llama3,
+            Some("linear") => RopeScalingType::Linear,
+            Some("none") | None => {
+                if rope_original_ctx > 0 && rope_scaling_factor > 1.0 {
+                    // Heuristic: Llama 3.x GGUFs sometimes omit the type string.
+                    RopeScalingType::Llama3
+                } else {
+                    RopeScalingType::None
+                }
+            }
+            _ => RopeScalingType::None,
+        };
 
         Ok(Self {
             n_layers,
@@ -77,6 +126,59 @@ impl LlamaConfig {
             context_length,
             vocab_size,
             tied_embeddings,
+            rope_scaling_type,
+            rope_scaling_factor,
+            rope_original_ctx,
+            rope_low_freq_factor,
+            rope_high_freq_factor,
         })
+    }
+
+    #[must_use]
+    pub fn compute_rope_inv_freqs(&self) -> Vec<f32> {
+        let half = self.rope_dim / 2;
+        let mut out = Vec::with_capacity(half);
+        for i in 0..half {
+            let exp = -((2 * i) as f32) / self.rope_dim as f32;
+            let base_freq = self.rope_base.powf(exp);
+            let scaled = match self.rope_scaling_type {
+                RopeScalingType::None => base_freq,
+                RopeScalingType::Linear => base_freq / self.rope_scaling_factor,
+                RopeScalingType::Llama3 => llama3_scale_freq(
+                    base_freq,
+                    self.rope_scaling_factor,
+                    self.rope_low_freq_factor,
+                    self.rope_high_freq_factor,
+                    self.rope_original_ctx.max(1) as f32,
+                ),
+            };
+            out.push(scaled);
+        }
+        out
+    }
+}
+
+fn llama3_scale_freq(
+    freq: f32,
+    factor: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+    old_context_len: f32,
+) -> f32 {
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let wavelen = two_pi / freq;
+    let low_wavelen = old_context_len / low_freq_factor;
+    let high_wavelen = old_context_len / high_freq_factor;
+    if wavelen < high_wavelen {
+        // High frequency: no change.
+        freq
+    } else if wavelen > low_wavelen {
+        // Low frequency: divide by factor.
+        freq / factor
+    } else {
+        // Smooth interpolation.
+        let smooth =
+            (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+        (1.0 - smooth) * (freq / factor) + smooth * freq
     }
 }

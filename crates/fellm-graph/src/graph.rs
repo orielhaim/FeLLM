@@ -50,6 +50,8 @@ pub struct OpNode {
     pub value: OpValue,
     /// Human-readable label.
     pub label: String,
+    /// If set, the runtime output reuses the storage of this input slot.
+    pub in_place_output_from: Option<u32>,
 }
 
 /// Edge metadata.
