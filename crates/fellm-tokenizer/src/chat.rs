@@ -113,9 +113,8 @@ struct ToolForTemplate {
 
 static GENERATION_OPEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{%-?\s*generation\s*-?%\}").expect("generation open regex"));
-static GENERATION_CLOSE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\{%-?\s*endgeneration\s*-?%\}").expect("generation close regex")
-});
+static GENERATION_CLOSE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{%-?\s*endgeneration\s*-?%\}").expect("generation close regex"));
 
 fn raise_exception(err_text: String) -> std::result::Result<String, minijinja::Error> {
     Err(minijinja::Error::new(ErrorKind::SyntaxError, err_text))
@@ -171,9 +170,8 @@ fn tools_for_template(tools: &[ToolDef]) -> Result<Vec<ToolForTemplate>> {
             let parameters: JsonValue = if t.parameters_json.trim().is_empty() {
                 JsonValue::Object(serde_json::Map::new())
             } else {
-                serde_json::from_str(&t.parameters_json).map_err(|e| {
-                    FellmError::Tokenization(format!("tool parameters JSON: {e}"))
-                })?
+                serde_json::from_str(&t.parameters_json)
+                    .map_err(|e| FellmError::Tokenization(format!("tool parameters JSON: {e}")))?
             };
             Ok(ToolForTemplate {
                 name: t.name.clone(),

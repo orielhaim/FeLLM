@@ -16,11 +16,11 @@ pub mod executor;
 pub mod hybrid_state;
 pub mod kv_cache;
 
-pub use arch_llama::parse_assistant_output;
 pub use engine::{
     DEFAULT_BATCH_SIZE, DEFAULT_CTX_SIZE, DEFAULT_UBATCH_SIZE, Engine, EngineBuilder,
     EngineSettings, GenParams, GenStats, TokenStream,
 };
+pub use fellm_model::{ModelSpec, parse_assistant_output};
 pub use fellm_tokenizer::{AssistantOutput, Message, ToolCall, ToolDef};
 pub use hybrid_state::HybridState;
 pub use kv_cache::KvCache;

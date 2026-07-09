@@ -73,10 +73,9 @@ pub trait Backend: Send + Sync + 'static {
 
 /// A model architecture.
 ///
-/// Phase 1 has exactly one implementor (`arch_llama::LlamaArch`) and it is
-/// used directly, not through this trait — but the trait is present so that
-/// the plugin ABI surface is stable when Phase 2 introduces dynamic
-/// architecture loading.
+/// Phase 1 builds graphs via `fellm-model::ModelSpec` (GGUF probe + tensor
+/// presence). This trait remains as the future plugin ABI surface for
+/// architectures that cannot be inferred automatically.
 ///
 /// Implementors are responsible for reading a GGUF file, extracting their
 /// hyperparameters, and constructing a `fellm_graph::Graph` that can be
@@ -98,9 +97,9 @@ pub trait Architecture: Send + Sync + 'static {
     /// Extract a config from raw GGUF metadata (as key-value pairs).
     ///
     /// The concrete GGUF file type isn't referenced here to keep this crate
-    /// free of a `fellm-gguf` dependency. Implementors take a `&GgufFile`
-    /// directly on their own inherent methods, as `LlamaArch` does; this
-    /// trait method exists as a placeholder for the Phase 2 dynamic path.
+    /// free of a `fellm-gguf` dependency. Day-to-day loading uses
+    /// `fellm_model::ModelSpec::from_gguf`; this trait method is a
+    /// placeholder for Phase 2 dynamic architecture plugins.
     fn config_from_metadata(&self, metadata_json: &str) -> Result<Self::Config>;
 
     /// Build a per-step forward graph.

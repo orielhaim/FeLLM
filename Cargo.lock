@@ -133,31 +133,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arch-lfm2moe"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "fellm-core",
- "fellm-gguf",
- "fellm-graph",
- "fellm-plugin-abi",
- "tracing",
-]
-
-[[package]]
-name = "arch-llama"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "fellm-core",
- "fellm-gguf",
- "fellm-graph",
- "fellm-plugin-abi",
- "fellm-tokenizer",
- "tracing",
-]
-
-[[package]]
 name = "as_derive_utils"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,6 +711,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fellm-model"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fellm-core",
+ "fellm-gguf",
+ "fellm-graph",
+ "fellm-plugin-abi",
+ "fellm-tokenizer",
+ "tracing",
+]
+
+[[package]]
 name = "fellm-plugin-abi"
 version = "0.1.0"
 dependencies = [
@@ -748,13 +736,12 @@ dependencies = [
 name = "fellm-runtime"
 version = "0.1.0"
 dependencies = [
- "arch-lfm2moe",
- "arch-llama",
  "backend-cpu",
  "bytemuck",
  "fellm-core",
  "fellm-gguf",
  "fellm-graph",
+ "fellm-model",
  "fellm-plugin-abi",
  "fellm-tokenizer",
  "rayon",

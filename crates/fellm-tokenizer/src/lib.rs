@@ -154,9 +154,7 @@ impl Tokenizer for GgufTokenizer {
             .map_err(|e| FellmError::Tokenization(format!("encode: {e}")))?;
         let mut ids: Vec<TokenId> = encoding.get_ids().to_vec();
 
-        if add_special
-            && let Some(b) = self.bos
-        {
+        if add_special && let Some(b) = self.bos {
             let already = self
                 .bos_str
                 .as_ref()

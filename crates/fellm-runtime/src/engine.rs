@@ -3,9 +3,6 @@
 use crate::executor::GraphExecutor;
 use crate::hybrid_state::HybridState;
 use crate::kv_cache::KvCache;
-use arch_lfm2moe::{Lfm2MoeArch, Lfm2MoeConfig, StepNodes};
-use arch_llama::parse_assistant_output;
-use arch_llama::{LlamaArch, LlamaConfig, PositionNodes};
 use backend_cpu::CpuBackend;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
@@ -15,6 +12,10 @@ use fellm_core::tensor::Tensor;
 use fellm_gguf::GgufFile;
 use fellm_graph::Graph;
 use fellm_graph::plan::ExecutionPlan;
+use fellm_model::{
+    MixKind, ModelSpec, StepBindings, build_step_graph, collect_step_bindings,
+    parse_assistant_output,
+};
 use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
 use std::path::Path;
 use std::sync::Arc;
@@ -251,39 +252,27 @@ pub struct Engine {
     gguf: Arc<GgufFile>,
     tokenizer: Box<dyn Tokenizer>,
     backend: CpuBackend,
-    model: Box<dyn ModelArch>,
+    model: LoadedModel,
     /// Evaluation / physical batch settings.
     settings: EngineSettings,
 }
 
-trait ModelArch {
-    fn model_max_ctx(&self) -> usize;
-    fn n_ctx(&self) -> usize;
-    fn reset(&mut self);
-    fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor>;
-    fn llama_config(&self) -> Option<&LlamaConfig> {
-        None
-    }
-}
-
-struct LlamaModel {
-    config: LlamaConfig,
-    kv: KvCache,
+/// Runtime state + compiled step graph for one GGUF model.
+struct LoadedModel {
+    spec: ModelSpec,
+    state: ModelState,
     max_seq: usize,
     model_max_ctx: usize,
     step_graph: Graph,
     step_plan: ExecutionPlan,
-    position_nodes: PositionNodes,
+    bindings: StepBindings,
 }
 
-struct Lfm2MoeModel {
-    config: Lfm2MoeConfig,
-    state: HybridState,
-    max_seq: usize,
-    model_max_ctx: usize,
-    step_graph: Graph,
-    step_plan: ExecutionPlan,
-    step_nodes: StepNodes,
+enum ModelState {
+    /// Pure attention: one KV slot per layer (ordinal == layer index).
+    Kv(KvCache),
+    /// Hybrid attention + ShortConv.
+    Hybrid(HybridState),
 }
 
 impl Engine {
@@ -302,19 +291,16 @@ impl Engine {
         let gguf = Arc::new(GgufFile::open(path)?);
         let tokenizer = load_tokenizer(&gguf)?;
 
-        let arch_id = gguf.metadata.arch()?;
-        tracing::info!(arch = arch_id, "detected architecture");
-        let model_max_ctx = match arch_id {
-            "llama" => {
-                let arch = LlamaArch::new();
-                arch.config_from_gguf(&gguf)?.context_length.max(1)
-            }
-            "lfm2moe" => {
-                let arch = Lfm2MoeArch::new();
-                arch.config_from_gguf(&gguf)?.context_length.max(1)
-            }
-            other => return Err(FellmError::UnsupportedArchitecture(other.into())),
-        };
+        let spec = ModelSpec::from_gguf(&gguf)?;
+        tracing::info!(
+            arch = %spec.arch_id,
+            n_layers = spec.n_layers,
+            attn = spec.n_attn_layers(),
+            conv = spec.n_conv_layers(),
+            "probed model recipe from GGUF"
+        );
+
+        let model_max_ctx = spec.context_length.max(1);
         let max_seq = settings.resolve_n_ctx(model_max_ctx);
         let n_ubatch = settings.resolve_ubatch();
         let n_batch = settings.n_batch.max(1);
@@ -327,11 +313,7 @@ impl Engine {
             "context / batch settings"
         );
 
-        let model: Box<dyn ModelArch> = match arch_id {
-            "llama" => Box::new(LlamaModel::new(&gguf, max_seq, model_max_ctx)?),
-            "lfm2moe" => Box::new(Lfm2MoeModel::new(&gguf, max_seq, model_max_ctx)?),
-            other => return Err(FellmError::UnsupportedArchitecture(other.into())),
-        };
+        let model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx)?;
 
         Ok(Self {
             gguf,
@@ -353,22 +335,22 @@ impl Engine {
         self.tokenizer.as_ref()
     }
 
-    /// Config reference.
+    /// Probed model recipe.
     #[must_use]
-    pub fn config(&self) -> Option<&LlamaConfig> {
-        self.model.llama_config()
+    pub fn spec(&self) -> &ModelSpec {
+        &self.model.spec
     }
 
     /// Resolved context length (`n_ctx`).
     #[must_use]
     pub fn n_ctx(&self) -> usize {
-        self.model.n_ctx()
+        self.model.max_seq
     }
 
     /// Model GGUF maximum context length.
     #[must_use]
     pub fn model_max_ctx(&self) -> usize {
-        self.model.model_max_ctx()
+        self.model.model_max_ctx
     }
 
     /// Active engine settings (resolved `n_ctx`).
@@ -450,11 +432,11 @@ impl Engine {
         if ids.is_empty() {
             return Err(FellmError::other("empty prompt"));
         }
-        if ids.len() >= self.model.n_ctx() {
+        if ids.len() >= self.model.max_seq {
             return Err(FellmError::other(format!(
                 "prompt length {} exceeds context size n_ctx={}",
                 ids.len(),
-                self.model.n_ctx()
+                self.model.max_seq
             )));
         }
 
@@ -530,177 +512,73 @@ impl Engine {
     }
 }
 
-impl LlamaModel {
-    fn new(gguf: &GgufFile, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
-        let arch = LlamaArch::new();
-        let config = arch.config_from_gguf(gguf)?;
-        let kv = KvCache::new(
-            config.n_layers,
-            max_seq,
-            config.n_kv_heads,
-            config.head_dim(),
-        )?;
+impl LoadedModel {
+    fn new(gguf: &GgufFile, spec: ModelSpec, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
+        let state = if spec.is_hybrid() {
+            ModelState::Hybrid(HybridState::new(
+                &spec.layer_kv_heads_for_state(),
+                max_seq,
+                spec.n_heads,
+                spec.head_dim,
+                spec.d_model,
+                spec.shortconv_l_cache,
+            )?)
+        } else {
+            ModelState::Kv(KvCache::new(
+                spec.n_attn_layers(),
+                max_seq,
+                spec.n_kv_heads,
+                spec.head_dim,
+            )?)
+        };
 
-        tracing::info!("building llama step graph (once)");
-        let step_graph = arch.build_graph(gguf, &config)?;
+        tracing::info!("building step graph (once)");
+        let step_graph = build_step_graph(gguf, &spec)?;
         let step_plan = ExecutionPlan::from_graph(&step_graph)?;
-        let position_nodes = LlamaArch::collect_position_nodes(&step_graph);
+        let bindings = collect_step_bindings(&step_graph);
         tracing::info!(
             nodes = step_graph.node_count(),
-            rope = position_nodes.rope.len(),
-            kv_write = position_nodes.kv_write.len(),
-            attention = position_nodes.attention.len(),
-            "llama step graph ready"
+            rope = bindings.rope.len(),
+            kv_write = bindings.kv_write.len(),
+            attention = bindings.attention.len(),
+            attn_layers = spec.n_attn_layers(),
+            conv_layers = spec.n_conv_layers(),
+            "step graph ready"
         );
 
         Ok(Self {
-            config,
-            kv,
-            max_seq,
-            model_max_ctx,
-            step_graph,
-            step_plan,
-            position_nodes,
-        })
-    }
-}
-
-impl ModelArch for LlamaModel {
-    fn model_max_ctx(&self) -> usize {
-        self.model_max_ctx
-    }
-
-    fn n_ctx(&self) -> usize {
-        self.max_seq
-    }
-
-    fn reset(&mut self) {
-        self.kv.reset();
-    }
-
-    fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
-        let pos_u32 = pos as u32;
-        let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
-
-        for &id in &self.position_nodes.rope {
-            let mut a = self.step_graph.node(id).attrs;
-            a.position = pos_u32;
-            exec.set_attrs(id, a);
-        }
-        for &id in &self.position_nodes.kv_write {
-            let mut a = self.step_graph.node(id).attrs;
-            a.position = pos_u32;
-            exec.set_attrs(id, a);
-        }
-        for &id in &self.position_nodes.attention {
-            let mut a = self.step_graph.node(id).attrs;
-            a.past_len = pos_u32;
-            exec.set_attrs(id, a);
-        }
-
-        exec.bind_input("token_id", scalar_u32_tensor(tok));
-
-        let dim = self.kv.tokens_stride;
-        let shape = Shape::new(&[self.kv.max_seq as u64, dim as u64])?;
-        for layer in 0..self.config.n_layers {
-            exec.bind_mutable(
-                format!("k_in_{layer}"),
-                crate::executor::MutableBinding {
-                    dtype: DType::F32,
-                    shape: shape.clone(),
-                    buffer: self.kv.k_buffer(layer),
-                },
-            );
-            exec.bind_mutable(
-                format!("v_in_{layer}"),
-                crate::executor::MutableBinding {
-                    dtype: DType::F32,
-                    shape: shape.clone(),
-                    buffer: self.kv.v_buffer(layer),
-                },
-            );
-        }
-
-        let outs = exec.run()?;
-        self.kv.advance();
-
-        outs.get("logits")
-            .cloned()
-            .ok_or_else(|| FellmError::other("no logits output"))
-    }
-
-    fn llama_config(&self) -> Option<&LlamaConfig> {
-        Some(&self.config)
-    }
-}
-
-impl Lfm2MoeModel {
-    fn new(gguf: &GgufFile, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
-        let arch = Lfm2MoeArch::new();
-        let config = arch.config_from_gguf(gguf)?;
-        let state = HybridState::new(
-            &config.layer_kv_heads,
-            max_seq,
-            config.n_heads,
-            config.head_dim,
-            config.d_model,
-            config.shortconv_l_cache,
-        )?;
-
-        tracing::info!("building lfm2moe step graph (once)");
-        let step_graph = arch.build_graph(gguf, &config)?;
-        let step_plan = ExecutionPlan::from_graph(&step_graph)?;
-        let step_nodes = Lfm2MoeArch::collect_step_nodes(&step_graph);
-        tracing::info!(
-            nodes = step_graph.node_count(),
-            rope = step_nodes.rope.len(),
-            kv_write = step_nodes.kv_write.len(),
-            attention = step_nodes.attention.len(),
-            attn_layers = config.n_attn_layers(),
-            conv_layers = config.n_conv_layers(),
-            "lfm2moe step graph ready"
-        );
-
-        Ok(Self {
-            config,
+            spec,
             state,
             max_seq,
             model_max_ctx,
             step_graph,
             step_plan,
-            step_nodes,
+            bindings,
         })
-    }
-}
-
-impl ModelArch for Lfm2MoeModel {
-    fn model_max_ctx(&self) -> usize {
-        self.model_max_ctx
-    }
-
-    fn n_ctx(&self) -> usize {
-        self.max_seq
     }
 
     fn reset(&mut self) {
-        self.state.reset();
+        match &mut self.state {
+            ModelState::Kv(kv) => kv.reset(),
+            ModelState::Hybrid(h) => h.reset(),
+        }
     }
 
     fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
         let pos_u32 = pos as u32;
         let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
 
-        for &id in &self.step_nodes.rope {
+        for &id in &self.bindings.rope {
             let mut a = self.step_graph.node(id).attrs;
             a.position = pos_u32;
             exec.set_attrs(id, a);
         }
-        for &id in &self.step_nodes.kv_write {
+        for &id in &self.bindings.kv_write {
             let mut a = self.step_graph.node(id).attrs;
             a.position = pos_u32;
             exec.set_attrs(id, a);
         }
-        for &id in &self.step_nodes.attention {
+        for &id in &self.bindings.attention {
             let mut a = self.step_graph.node(id).attrs;
             a.past_len = pos_u32;
             exec.set_attrs(id, a);
@@ -708,41 +586,75 @@ impl ModelArch for Lfm2MoeModel {
 
         exec.bind_input("token_id", scalar_u32_tensor(tok));
 
-        for (attn_ord, &layer) in self.state.attn_layer_ids.iter().enumerate() {
-            let kv_stride = self.config.layer_kv_heads[layer] * self.config.head_dim;
-            let shape = Shape::new(&[self.state.max_seq as u64, kv_stride as u64])?;
-            exec.bind_mutable(
-                format!("k_in_{attn_ord}"),
-                crate::executor::MutableBinding {
-                    dtype: DType::F32,
-                    shape: shape.clone(),
-                    buffer: self.state.k_buffer(attn_ord),
-                },
-            );
-            exec.bind_mutable(
-                format!("v_in_{attn_ord}"),
-                crate::executor::MutableBinding {
-                    dtype: DType::F32,
-                    shape,
-                    buffer: self.state.v_buffer(attn_ord),
-                },
-            );
-        }
-
-        let conv_shape = Shape::new(&[self.state.conv_elements() as u64])?;
-        for conv_ord in 0..self.state.conv_layer_ids.len() {
-            exec.bind_mutable(
-                format!("conv_in_{conv_ord}"),
-                crate::executor::MutableBinding {
-                    dtype: DType::F32,
-                    shape: conv_shape.clone(),
-                    buffer: self.state.conv_buffer(conv_ord),
-                },
-            );
+        match &self.state {
+            ModelState::Kv(kv) => {
+                let dim = kv.tokens_stride;
+                let shape = Shape::new(&[kv.max_seq as u64, dim as u64])?;
+                for layer in 0..self.spec.n_attn_layers() {
+                    exec.bind_mutable(
+                        format!("k_in_{layer}"),
+                        crate::executor::MutableBinding {
+                            dtype: DType::F32,
+                            shape: shape.clone(),
+                            buffer: kv.k_buffer(layer),
+                        },
+                    );
+                    exec.bind_mutable(
+                        format!("v_in_{layer}"),
+                        crate::executor::MutableBinding {
+                            dtype: DType::F32,
+                            shape: shape.clone(),
+                            buffer: kv.v_buffer(layer),
+                        },
+                    );
+                }
+            }
+            ModelState::Hybrid(state) => {
+                for (attn_ord, &layer) in state.attn_layer_ids.iter().enumerate() {
+                    let n_kv = match self.spec.layers[layer].mix {
+                        MixKind::Attention { n_kv_heads, .. } => n_kv_heads,
+                        MixKind::ShortConv => {
+                            return Err(FellmError::other("attn ordinal maps to ShortConv"));
+                        }
+                    };
+                    let kv_stride = n_kv * self.spec.head_dim;
+                    let shape = Shape::new(&[state.max_seq as u64, kv_stride as u64])?;
+                    exec.bind_mutable(
+                        format!("k_in_{attn_ord}"),
+                        crate::executor::MutableBinding {
+                            dtype: DType::F32,
+                            shape: shape.clone(),
+                            buffer: state.k_buffer(attn_ord),
+                        },
+                    );
+                    exec.bind_mutable(
+                        format!("v_in_{attn_ord}"),
+                        crate::executor::MutableBinding {
+                            dtype: DType::F32,
+                            shape,
+                            buffer: state.v_buffer(attn_ord),
+                        },
+                    );
+                }
+                let conv_shape = Shape::new(&[state.conv_elements() as u64])?;
+                for conv_ord in 0..state.conv_layer_ids.len() {
+                    exec.bind_mutable(
+                        format!("conv_in_{conv_ord}"),
+                        crate::executor::MutableBinding {
+                            dtype: DType::F32,
+                            shape: conv_shape.clone(),
+                            buffer: state.conv_buffer(conv_ord),
+                        },
+                    );
+                }
+            }
         }
 
         let outs = exec.run()?;
-        self.state.kv.advance();
+        match &mut self.state {
+            ModelState::Kv(kv) => kv.advance(),
+            ModelState::Hybrid(h) => h.kv.advance(),
+        }
 
         outs.get("logits")
             .cloned()
@@ -841,7 +753,7 @@ impl<'a> Iterator for TokenStream<'a> {
             return Some(Ok(tok));
         }
 
-        if self.emitted < self.params.max_tokens && self.position + 1 < self.engine.model.n_ctx() {
+        if self.emitted < self.params.max_tokens && self.position + 1 < self.engine.model.max_seq {
             match self.engine.step(tok, self.position) {
                 Ok(next) => {
                     self.pending_logits = Some(next);

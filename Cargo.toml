@@ -6,10 +6,9 @@ members = [
   "crates/fellm-tokenizer",
   "crates/fellm-graph",
   "crates/fellm-plugin-abi",
+  "crates/fellm-model",
   "crates/fellm-runtime",
   "crates/backend-cpu",
-  "crates/arch-llama",
-  "crates/arch-lfm2moe",
   "crates/fellm-cli",
 ]
 
@@ -28,10 +27,9 @@ fellm-gguf = { path = "crates/fellm-gguf", version = "0.1.0" }
 fellm-tokenizer = { path = "crates/fellm-tokenizer", version = "0.1.0" }
 fellm-graph = { path = "crates/fellm-graph", version = "0.1.0" }
 fellm-plugin-abi = { path = "crates/fellm-plugin-abi", version = "0.1.0" }
+fellm-model = { path = "crates/fellm-model", version = "0.1.0" }
 fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
-arch-llama = { path = "crates/arch-llama", version = "0.1.0" }
-arch-lfm2moe = { path = "crates/arch-lfm2moe", version = "0.1.0" }
 
 # External
 thiserror = "2"

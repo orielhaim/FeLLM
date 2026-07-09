@@ -10,7 +10,6 @@
 
 use crate::kernels::softmax::softmax_rows_inplace;
 
-/// Compute attention for one query token.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_step(
     q: &[f32],

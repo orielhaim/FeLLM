@@ -3,12 +3,12 @@
 use ahash::AHashMap;
 use fellm_core::error::{FellmError, Result};
 use fellm_gguf::GgufFile;
+use tokenizers::Tokenizer as HfTokenizer;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::tokenizer::{AddedToken, SplitDelimiterBehavior};
-use tokenizers::Tokenizer as HfTokenizer;
 
 /// GGML token_type values.
 const TOKEN_TYPE_UNKNOWN: i32 = 2;

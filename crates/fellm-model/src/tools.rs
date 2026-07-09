@@ -1,8 +1,7 @@
-//! Assistant output parsing for Llama-family tool calling.
+//! Assistant output parsing for common tool-call response formats.
 //!
-//! Chat *prompt* formatting comes from the GGUF Jinja template (generic
-//! tokenizer engine). This module only interprets the model's *response*
-//! formats that are specific to Llama 3.1 / 3.2 Instruct:
+//! Chat *prompt* formatting comes from the GGUF Jinja template (MiniJinja).
+//! This module only interprets model *responses*:
 //! - JSON: `{"name": "...", "parameters": {...}}`
 //! - Pythonic: `[fn(a=1, b='x'), ...]`
 //! - Optional `<|python_tag|>` prefix
