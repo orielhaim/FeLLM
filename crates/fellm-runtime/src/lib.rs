@@ -1,11 +1,9 @@
-//! Runtime: engine glue that ties tokenizer + graph + backend + KV cache
-//! into a single-request generation loop.
+//! Runtime: engine glue that ties tokenizer + graph + backend + paged KV cache
+//! into a generation loop with optional multi-sequence scheduling.
 //!
-//! Phase 1 keeps this deliberately simple:
-//!   * one request at a time
-//!   * contiguous KV cache (paged allocator lands in Phase 3)
-//!   * synchronous loop (no tokio)
-//!   * greedy or top-k/top-p sampling
+//! * Paged attention KV (`BLOCK_SIZE = 16`) with prefix sharing and CoW
+//! * Fixed ShortConv state for hybrid models
+//! * Interleaved single-token scheduler for concurrent requests
 //!
 //! The public entry point is [`Engine`].
 
@@ -15,6 +13,8 @@ pub mod engine;
 pub mod executor;
 pub mod hybrid_state;
 pub mod kv_cache;
+pub mod paged;
+pub mod scheduler;
 
 pub use engine::{
     DEFAULT_BATCH_SIZE, DEFAULT_CTX_SIZE, DEFAULT_UBATCH_SIZE, Engine, EngineBuilder,
@@ -22,5 +22,7 @@ pub use engine::{
 };
 pub use fellm_model::{ModelSpec, parse_assistant_output};
 pub use fellm_tokenizer::{AssistantOutput, Message, ToolCall, ToolDef};
-pub use hybrid_state::HybridState;
+pub use hybrid_state::HybridConvState;
 pub use kv_cache::KvCache;
+pub use paged::{BLOCK_SIZE, CacheManager, PhysicalPool, PrefixTree, SequenceCache};
+pub use scheduler::{Scheduler, SequenceEvent, SequenceHandle, SequenceStatus};

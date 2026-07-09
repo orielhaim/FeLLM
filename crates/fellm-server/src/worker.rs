@@ -1,15 +1,13 @@
-//! Dedicated OS thread that owns [`Engine`] and drains the task queue.
+//! Dedicated OS thread that owns [`Engine`] and drains the task queue via
+//! the interleaved [`Scheduler`].
 
 use crate::state::{InferenceTask, WorkerEvent};
-use fellm_runtime::{
-    AssistantOutput, Engine, EngineSettings, GenParams, Message, ToolDef, parse_assistant_output,
-};
+use fellm_runtime::{Engine, EngineSettings, Scheduler, SequenceEvent};
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::mpsc;
 
-/// Spawn the blocking inference worker.
-///
-/// Loads the model once, then processes tasks serially until the queue closes.
+/// Spawn the blocking inference worker with multi-sequence scheduling.
 pub fn spawn_worker(
     model_path: &Path,
     settings: EngineSettings,
@@ -23,7 +21,6 @@ pub fn spawn_worker(
                 Ok(e) => e,
                 Err(err) => {
                     tracing::error!(error = %err, "failed to open model");
-                    // Drain remaining senders so HTTP handlers fail cleanly.
                     while let Some(task) = task_rx.blocking_recv() {
                         let _ = task
                             .reply
@@ -32,10 +29,66 @@ pub fn spawn_worker(
                     return;
                 }
             };
-            tracing::info!("inference worker ready");
+            tracing::info!("inference worker ready (paged scheduler)");
 
-            while let Some(task) = task_rx.blocking_recv() {
-                run_task(&mut engine, task);
+            let mut scheduler = Scheduler::new();
+            // seq_id → reply channel
+            let mut replies: HashMap<u64, mpsc::UnboundedSender<WorkerEvent>> = HashMap::new();
+
+            loop {
+                // Non-blocking admit of new tasks when possible.
+                while let Ok(task) = task_rx.try_recv() {
+                    admit_task(&mut engine, &mut scheduler, &mut replies, task);
+                }
+
+                // If idle, block for the next task.
+                if scheduler.inflight() == 0 {
+                    match task_rx.blocking_recv() {
+                        Some(task) => {
+                            admit_task(&mut engine, &mut scheduler, &mut replies, task);
+                        }
+                        None => break,
+                    }
+                    continue;
+                }
+
+                // Also drain any pending without blocking.
+                while let Ok(task) = task_rx.try_recv() {
+                    admit_task(&mut engine, &mut scheduler, &mut replies, task);
+                }
+
+                match scheduler.poll_event(&mut engine) {
+                    Some(SequenceEvent::Token { id, text }) => {
+                        if let Some(tx) = replies.get(&id) {
+                            let _ = tx.send(WorkerEvent::Token { text });
+                        }
+                    }
+                    Some(SequenceEvent::Done {
+                        id,
+                        finish_reason,
+                        full_text,
+                        tool_calls,
+                        usage,
+                    }) => {
+                        if let Some(tx) = replies.remove(&id) {
+                            let _ = tx.send(WorkerEvent::Done {
+                                finish_reason,
+                                full_text,
+                                tool_calls,
+                                usage,
+                            });
+                        }
+                    }
+                    Some(SequenceEvent::Error { id, message }) => {
+                        if let Some(tx) = replies.remove(&id) {
+                            let _ = tx.send(WorkerEvent::Error(message));
+                        }
+                    }
+                    None => {
+                        // No progress — wait for a new task or spin briefly.
+                        std::thread::yield_now();
+                    }
+                }
             }
             tracing::info!("inference worker shutting down");
         })
@@ -43,7 +96,12 @@ pub fn spawn_worker(
     Ok(handle)
 }
 
-fn run_task(engine: &mut Engine, task: InferenceTask) {
+fn admit_task(
+    engine: &mut Engine,
+    scheduler: &mut Scheduler,
+    replies: &mut HashMap<u64, mpsc::UnboundedSender<WorkerEvent>>,
+    task: InferenceTask,
+) {
     let InferenceTask {
         messages,
         tools,
@@ -51,142 +109,12 @@ fn run_task(engine: &mut Engine, task: InferenceTask) {
         stream,
         reply,
     } = task;
-
-    let want_stream = stream;
-    let has_tools = !tools.is_empty();
-    // When tools are present, buffer tokens so we can emit a clean final
-    // tool_calls payload instead of broken partial JSON over SSE.
-    let emit_live = want_stream && !has_tools;
-
-    if let Err(err) = generate(
-        engine,
-        &messages,
-        &tools,
-        params,
-        emit_live,
-        want_stream,
-        has_tools,
-        &reply,
-    ) {
-        let _ = reply.send(WorkerEvent::Error(err));
-    }
-}
-
-fn generate(
-    engine: &mut Engine,
-    messages: &[Message],
-    tools: &[ToolDef],
-    params: GenParams,
-    emit_live: bool,
-    want_stream: bool,
-    has_tools: bool,
-    reply: &mpsc::UnboundedSender<WorkerEvent>,
-) -> Result<(), String> {
-    let stop_ids = {
-        let mut s = Vec::new();
-        if let Some(eos) = engine.tokenizer().eos() {
-            s.push(eos);
+    match scheduler.enqueue_chat(engine, &messages, &tools, params, stream) {
+        Ok(handle) => {
+            replies.insert(handle.id, reply);
         }
-        s
-    };
-
-    let mut token_stream = engine
-        .chat_with_tools(messages, tools, params)
-        .map_err(|e| e.to_string())?;
-
-    let mut byte_buf: Vec<u8> = Vec::new();
-    let mut full_bytes: Vec<u8> = Vec::new();
-    let mut hit_stop = false;
-    let mut emitted = 0u32;
-
-    while let Some(tok_result) = token_stream.next() {
-        let tok = tok_result.map_err(|e| e.to_string())?;
-        emitted = emitted.saturating_add(1);
-
-        if stop_ids.contains(&tok) {
-            hit_stop = true;
-            continue;
-        }
-
-        let bytes = token_stream.decode_token(tok).map_err(|e| e.to_string())?;
-        if bytes.is_empty() {
-            continue;
-        }
-        full_bytes.extend_from_slice(&bytes);
-        byte_buf.extend_from_slice(&bytes);
-
-        if emit_live {
-            let chunk = flush_valid_utf8_prefix(&mut byte_buf);
-            if !chunk.is_empty() {
-                let _ = reply.send(WorkerEvent::Token { text: chunk });
-            }
+        Err(err) => {
+            let _ = reply.send(WorkerEvent::Error(err.to_string()));
         }
     }
-
-    if emit_live && !byte_buf.is_empty() {
-        let rest = String::from_utf8_lossy(&byte_buf).to_string();
-        if !rest.is_empty() {
-            let _ = reply.send(WorkerEvent::Token { text: rest });
-        }
-    }
-
-    let full_text = String::from_utf8_lossy(&full_bytes).to_string();
-    let usage = token_stream.finish_stats();
-
-    let (finish_reason, tool_calls) = if has_tools {
-        match parse_assistant_output(&full_text) {
-            AssistantOutput::ToolCalls(calls) => ("tool_calls".to_string(), Some(calls)),
-            AssistantOutput::Text(_) => {
-                let reason = if hit_stop || emitted < params.max_tokens {
-                    "stop"
-                } else {
-                    "length"
-                };
-                (reason.to_string(), None)
-            }
-        }
-    } else {
-        let reason = if hit_stop || emitted < params.max_tokens {
-            "stop"
-        } else {
-            "length"
-        };
-        (reason.to_string(), None)
-    };
-
-    // Tools + stream: emit content (if any) then Done with tool_calls.
-    if want_stream && has_tools {
-        match &tool_calls {
-            Some(_) => {
-                // Tool-call-only: do not stream raw JSON as content.
-            }
-            None if !full_text.is_empty() => {
-                let _ = reply.send(WorkerEvent::Token {
-                    text: full_text.clone(),
-                });
-            }
-            None => {}
-        }
-    }
-
-    let _ = reply.send(WorkerEvent::Done {
-        finish_reason,
-        full_text,
-        tool_calls,
-        usage,
-    });
-    Ok(())
-}
-
-fn flush_valid_utf8_prefix(buf: &mut Vec<u8>) -> String {
-    let mut cut = buf.len();
-    while cut > 0 {
-        if std::str::from_utf8(&buf[..cut]).is_ok() {
-            break;
-        }
-        cut -= 1;
-    }
-    let s = String::from_utf8_lossy(&buf[..cut]).to_string();
-    buf.drain(..cut);
-    s
 }

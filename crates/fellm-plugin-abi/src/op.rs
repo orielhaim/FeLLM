@@ -112,6 +112,12 @@ pub struct OpAttrs {
     pub shortconv_l_cache: u32,
     /// Shared model embedding dimension.
     pub n_embd: u32,
+    /// Paged KV: block size in tokens (`0` = contiguous legacy layout).
+    pub block_size: u32,
+    /// Paged KvWrite: `0` = K row, `1` = V row.
+    pub kv_slot: u32,
+    /// Attention / KvWrite layer ordinal (paged path).
+    pub layer_ord: u32,
 }
 
 impl OpAttrs {

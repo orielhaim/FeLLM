@@ -1,9 +1,10 @@
 //! The Engine: the top-level user-facing API.
 
 use crate::executor::GraphExecutor;
-use crate::hybrid_state::HybridState;
+use crate::hybrid_state::HybridConvState;
 use crate::kv_cache::KvCache;
-use backend_cpu::CpuBackend;
+use crate::paged::{CacheManager, SequenceCache};
+use backend_cpu::{CpuBackend, PagedKvContext, set_paged_context};
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_core::shape::{Layout, Shape};
@@ -13,8 +14,7 @@ use fellm_gguf::GgufFile;
 use fellm_graph::Graph;
 use fellm_graph::plan::ExecutionPlan;
 use fellm_model::{
-    MixKind, ModelSpec, StepBindings, build_step_graph, collect_step_bindings,
-    parse_assistant_output,
+    ModelSpec, StepBindings, build_step_graph, collect_step_bindings, parse_assistant_output,
 };
 use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
 use std::path::Path;
@@ -260,19 +260,20 @@ pub struct Engine {
 /// Runtime state + compiled step graph for one GGUF model.
 struct LoadedModel {
     spec: ModelSpec,
-    state: ModelState,
+    /// Shared physical KV pool + prefix/swap.
+    cache: CacheManager,
+    /// Active single-request sequence (CLI / default path).
+    seq: SequenceCache,
+    /// Dummy contiguous buffers kept so the graph can bind `k_in_*` / `v_in_*`
+    /// (paged kernels ignore their contents when [`PagedKvContext`] is set).
+    dummy_kv: KvCache,
+    /// Fixed ShortConv state for hybrid models.
+    conv: Option<HybridConvState>,
     max_seq: usize,
     model_max_ctx: usize,
     step_graph: Graph,
     step_plan: ExecutionPlan,
     bindings: StepBindings,
-}
-
-enum ModelState {
-    /// Pure attention: one KV slot per layer (ordinal == layer index).
-    Kv(KvCache),
-    /// Hybrid attention + ShortConv.
-    Hybrid(HybridState),
 }
 
 impl Engine {
@@ -506,30 +507,138 @@ impl Engine {
         stops
     }
 
+    /// Public stop-token set for the scheduler.
+    #[must_use]
+    pub fn stop_token_ids_pub(&self) -> Vec<u32> {
+        self.stop_token_ids()
+    }
+
     /// One forward step for token id `tok` at position `pos`.
     fn step(&mut self, tok: u32, pos: usize) -> Result<Tensor> {
         self.model.step(&self.backend, tok, pos)
+    }
+
+    /// Free blocks remaining in the physical pool.
+    #[must_use]
+    pub fn cache_free_blocks(&self) -> usize {
+        self.model.cache.pool.free_count()
+    }
+
+    /// Attach radix-prefix blocks for `ids` onto `seq_cache`. Returns matched token count.
+    pub fn attach_prefix(&mut self, ids: &[u32], seq_cache: &mut SequenceCache) -> usize {
+        self.model
+            .cache
+            .prefix
+            .attach_match(&mut self.model.cache.pool, seq_cache, ids)
+    }
+
+    /// Insert a completed prompt into the prefix tree.
+    pub fn insert_prefix(&mut self, ids: &[u32], seq_cache: &SequenceCache) {
+        self.model.cache.prefix.insert_prompt(ids, seq_cache);
+    }
+
+    /// Ensure `pos` is writable in `seq_cache` (alloc / CoW).
+    pub fn ensure_seq_writable(&mut self, seq_cache: &mut SequenceCache, pos: usize) -> Result<()> {
+        self.model.cache.ensure_writable(seq_cache, pos)
+    }
+
+    /// Release physical refs held by a sequence cache.
+    pub fn release_seq_cache(&mut self, seq_cache: &mut SequenceCache) {
+        self.model.cache.release_sequence(seq_cache);
+    }
+
+    /// Swap a sequence's blocks to secondary RAM.
+    pub fn swap_out_sequence(&mut self, seq_cache: &mut SequenceCache) -> Result<()> {
+        let mut buf = vec![0u8; self.model.cache.pool.block_bytes()];
+        for layer in 0..seq_cache.n_layers() {
+            for &phys in seq_cache.table(layer).blocks() {
+                self.model.cache.pool.read_block_bytes(phys, &mut buf);
+                self.model.cache.swap.swap_out(phys, &buf)?;
+                // Keep refcount but free physical slot for reuse: copy to swap then
+                // temporarily zero-ref free — for simplicity we leave physical allocated
+                // until dec_ref; here we free by dec_ref after swap.
+                // Actually: we need the physical id to remain in the table for swap_in.
+                // So we only copy to swap and mark swapped; physical can be freed if we
+                // remapped. Simpler approach: keep physical occupied but mark seq swapped
+                // so scheduler doesn't run it — true free requires remapping.
+                // For LRU free: dec_ref and clear table entries stored in swap map by phys id.
+                let _ = phys;
+            }
+        }
+        // Free physical blocks after copying.
+        for layer in 0..seq_cache.n_layers() {
+            for &phys in seq_cache.table(layer).blocks() {
+                // Drop one ref (sequence's); if only this seq held it, returns to free list.
+                self.model.cache.pool.dec_ref(phys);
+            }
+        }
+        seq_cache.swapped = true;
+        Ok(())
+    }
+
+    /// Restore a swapped sequence's blocks.
+    pub fn swap_in_sequence(&mut self, seq_cache: &mut SequenceCache) -> Result<()> {
+        let mut buf = vec![0u8; self.model.cache.pool.block_bytes()];
+        for layer in 0..seq_cache.n_layers() {
+            let n = seq_cache.table(layer).num_blocks();
+            for logical in 0..n {
+                let old_phys = seq_cache.table(layer).block(logical);
+                let new_phys = self
+                    .model
+                    .cache
+                    .pool
+                    .alloc_block()
+                    .ok_or_else(|| FellmError::other("swap_in: out of blocks"))?;
+                self.model.cache.swap.swap_in(old_phys, &mut buf)?;
+                self.model.cache.pool.write_block_bytes(new_phys, &buf);
+                self.model.cache.pool.inc_ref(new_phys);
+                *seq_cache.table_mut(layer).block_mut(logical) = new_phys;
+            }
+        }
+        seq_cache.swapped = false;
+        Ok(())
+    }
+
+    /// Run one forward step against an arbitrary sequence cache (multi-seq).
+    pub fn step_sequence(
+        &mut self,
+        seq_cache: &mut SequenceCache,
+        tok: u32,
+        pos: usize,
+    ) -> Result<Tensor> {
+        // Temporarily swap active seq.
+        std::mem::swap(&mut self.model.seq, seq_cache);
+        let result = self.model.step(&self.backend, tok, pos);
+        std::mem::swap(&mut self.model.seq, seq_cache);
+        result
     }
 }
 
 impl LoadedModel {
     fn new(gguf: &GgufFile, spec: ModelSpec, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
-        let state = if spec.is_hybrid() {
-            ModelState::Hybrid(HybridState::new(
+        let n_attn = spec.n_attn_layers().max(1);
+        let cache = CacheManager::with_capacity(
+            max_seq,
+            n_attn,
+            spec.n_kv_heads.max(1),
+            spec.head_dim.max(1),
+            4,
+        )?;
+        let seq = cache.new_sequence(max_seq);
+        let dummy_kv = KvCache::new(
+            n_attn,
+            max_seq.max(1),
+            spec.n_kv_heads.max(1),
+            spec.head_dim.max(1),
+        )?;
+        let conv = if spec.is_hybrid() {
+            Some(HybridConvState::new(
                 &spec.layer_kv_heads_for_state(),
-                max_seq,
-                spec.n_heads,
-                spec.head_dim,
                 spec.d_model,
                 spec.shortconv_l_cache,
             )?)
         } else {
-            ModelState::Kv(KvCache::new(
-                spec.n_attn_layers(),
-                max_seq,
-                spec.n_kv_heads,
-                spec.head_dim,
-            )?)
+            None
         };
 
         tracing::info!("building step graph (once)");
@@ -543,12 +652,16 @@ impl LoadedModel {
             attention = bindings.attention.len(),
             attn_layers = spec.n_attn_layers(),
             conv_layers = spec.n_conv_layers(),
-            "step graph ready"
+            pool_blocks = cache.pool.n_blocks(),
+            "step graph ready (paged KV)"
         );
 
         Ok(Self {
             spec,
-            state,
+            cache,
+            seq,
+            dummy_kv,
+            conv,
             max_seq,
             model_max_ctx,
             step_graph,
@@ -558,13 +671,37 @@ impl LoadedModel {
     }
 
     fn reset(&mut self) {
-        match &mut self.state {
-            ModelState::Kv(kv) => kv.reset(),
-            ModelState::Hybrid(h) => h.reset(),
+        self.cache.release_sequence(&mut self.seq);
+        self.seq = self.cache.new_sequence(self.max_seq);
+        if let Some(c) = &mut self.conv {
+            c.reset();
         }
     }
 
     fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
+        self.cache.ensure_writable(&mut self.seq, pos)?;
+        self.cache.tick();
+
+        let n_logical = self.seq.table(0).num_blocks().max(1);
+        let block_table = self.seq.flatten_block_tables();
+        let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
+        set_paged_context(Some(PagedKvContext {
+            arena: arena_ptr,
+            arena_len,
+            block_table,
+            n_logical_blocks: n_logical,
+            n_layers: self.cache.pool.n_layers(),
+            tokens_stride: self.cache.pool.tokens_stride(),
+            block_bytes: self.cache.pool.block_bytes(),
+            block_size: crate::paged::BLOCK_SIZE,
+        }));
+
+        let result = self.step_inner(backend, tok, pos);
+        set_paged_context(None);
+        result
+    }
+
+    fn step_inner(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
         let pos_u32 = pos as u32;
         let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
 
@@ -576,89 +713,63 @@ impl LoadedModel {
         for &id in &self.bindings.kv_write {
             let mut a = self.step_graph.node(id).attrs;
             a.position = pos_u32;
+            a.block_size = 16;
             exec.set_attrs(id, a);
         }
         for &id in &self.bindings.attention {
             let mut a = self.step_graph.node(id).attrs;
             a.past_len = pos_u32;
+            a.block_size = 16;
             exec.set_attrs(id, a);
         }
 
         exec.bind_input("token_id", scalar_u32_tensor(tok));
 
-        match &self.state {
-            ModelState::Kv(kv) => {
-                let dim = kv.tokens_stride;
-                let shape = Shape::new(&[kv.max_seq as u64, dim as u64])?;
-                for layer in 0..self.spec.n_attn_layers() {
-                    exec.bind_mutable(
-                        format!("k_in_{layer}"),
-                        crate::executor::MutableBinding {
-                            dtype: DType::F32,
-                            shape: shape.clone(),
-                            buffer: kv.k_buffer(layer),
-                        },
-                    );
-                    exec.bind_mutable(
-                        format!("v_in_{layer}"),
-                        crate::executor::MutableBinding {
-                            dtype: DType::F32,
-                            shape: shape.clone(),
-                            buffer: kv.v_buffer(layer),
-                        },
-                    );
-                }
-            }
-            ModelState::Hybrid(state) => {
-                for (attn_ord, &layer) in state.attn_layer_ids.iter().enumerate() {
-                    let n_kv = match self.spec.layers[layer].mix {
-                        MixKind::Attention { n_kv_heads, .. } => n_kv_heads,
-                        MixKind::ShortConv => {
-                            return Err(FellmError::other("attn ordinal maps to ShortConv"));
-                        }
-                    };
-                    let kv_stride = n_kv * self.spec.head_dim;
-                    let shape = Shape::new(&[state.max_seq as u64, kv_stride as u64])?;
-                    exec.bind_mutable(
-                        format!("k_in_{attn_ord}"),
-                        crate::executor::MutableBinding {
-                            dtype: DType::F32,
-                            shape: shape.clone(),
-                            buffer: state.k_buffer(attn_ord),
-                        },
-                    );
-                    exec.bind_mutable(
-                        format!("v_in_{attn_ord}"),
-                        crate::executor::MutableBinding {
-                            dtype: DType::F32,
-                            shape,
-                            buffer: state.v_buffer(attn_ord),
-                        },
-                    );
-                }
-                let conv_shape = Shape::new(&[state.conv_elements() as u64])?;
-                for conv_ord in 0..state.conv_layer_ids.len() {
-                    exec.bind_mutable(
-                        format!("conv_in_{conv_ord}"),
-                        crate::executor::MutableBinding {
-                            dtype: DType::F32,
-                            shape: conv_shape.clone(),
-                            buffer: state.conv_buffer(conv_ord),
-                        },
-                    );
-                }
+        let dim = self.dummy_kv.tokens_stride;
+        let shape = Shape::new(&[self.dummy_kv.max_seq as u64, dim as u64])?;
+        for layer in 0..self.spec.n_attn_layers() {
+            exec.bind_mutable(
+                format!("k_in_{layer}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.dummy_kv.k_buffer(layer),
+                },
+            );
+            exec.bind_mutable(
+                format!("v_in_{layer}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.dummy_kv.v_buffer(layer),
+                },
+            );
+        }
+
+        if let Some(state) = &self.conv {
+            let conv_shape = Shape::new(&[state.conv_elements() as u64])?;
+            for conv_ord in 0..state.conv_layer_ids.len() {
+                exec.bind_mutable(
+                    format!("conv_in_{conv_ord}"),
+                    crate::executor::MutableBinding {
+                        dtype: DType::F32,
+                        shape: conv_shape.clone(),
+                        buffer: state.conv_buffer(conv_ord),
+                    },
+                );
             }
         }
 
         let outs = exec.run()?;
-        match &mut self.state {
-            ModelState::Kv(kv) => kv.advance(),
-            ModelState::Hybrid(h) => h.kv.advance(),
-        }
-
         outs.get("logits")
             .cloned()
             .ok_or_else(|| FellmError::other("no logits output"))
+    }
+
+    /// Access the shared cache manager (scheduler / multi-seq).
+    #[allow(dead_code)]
+    fn cache_mut(&mut self) -> &mut CacheManager {
+        &mut self.cache
     }
 }
 

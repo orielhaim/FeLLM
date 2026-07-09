@@ -1,6 +1,6 @@
 use crate::cpu_profile::CpuHardwareProfile;
 use crate::kernels::{
-    attention::attention_step,
+    attention::{attention_step, attention_step_paged},
     embedding::embedding_row,
     matmul,
     norm::{rmsnorm_groups, rmsnorm_row},
@@ -8,6 +8,7 @@ use crate::kernels::{
     softmax::softmax_rows_inplace,
     swiglu::silu_gate,
 };
+use crate::paged_ctx;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
@@ -381,14 +382,11 @@ fn launch_attention(
     inputs: &[TensorRef],
     outputs: &mut [TensorMut],
 ) -> Result<()> {
-    // inputs: [q, k_cache, v_cache]
     if inputs.len() < 3 || outputs.is_empty() {
         return Err(FellmError::other("attention: bad arity"));
     }
     let (y_out, _) = outputs.split_first_mut().unwrap();
     let q = as_f32_slice(&inputs[0])?;
-    let k_full = as_f32_slice(&inputs[1])?;
-    let v_full = as_f32_slice(&inputs[2])?;
     let out = as_f32_slice_mut(y_out)?;
     let n_heads = attrs.n_heads as usize;
     let n_kv = attrs.n_kv_heads.max(1) as usize;
@@ -399,6 +397,31 @@ fn launch_attention(
     } else {
         1.0 / (head_dim as f32).sqrt()
     };
+
+    let use_paged = attrs.block_size > 0 && paged_ctx::has_paged_context();
+
+    if use_paged {
+        let layer = attrs.layer_ord as usize;
+        // Gather from paged arena on this thread, then run tiled attention
+        // inside the Rayon pool (contiguous buffers are Send).
+        attention_step_paged(
+            q,
+            out,
+            n_heads,
+            n_kv,
+            head_dim,
+            past,
+            scale,
+            layer,
+            &backend.profile,
+        );
+        // Re-run the contiguous kernel under the pool for parallel heads.
+        // attention_step_paged already calls attention_step which uses the pool.
+        return Ok(());
+    }
+
+    let k_full = as_f32_slice(&inputs[1])?;
+    let v_full = as_f32_slice(&inputs[2])?;
     let seq = past + 1;
     let kv_elems = seq * n_kv * head_dim;
     if k_full.len() < kv_elems || v_full.len() < kv_elems {
@@ -589,10 +612,33 @@ fn launch_sample(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut
 
 fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
     // inputs[0] = row [dim] f32
-    // outputs[0] = kv_buf [max_seq, dim] f32 (aliased mutable storage)
+    // outputs[0] = kv_buf [max_seq, dim] f32 (aliased mutable storage) — unused when paged
     if inputs.is_empty() || outputs.is_empty() {
         return Err(FellmError::other("kv_write: bad arity"));
     }
+    let row = as_f32_slice(&inputs[0])?;
+    let pos = attrs.position as usize;
+    let use_paged = attrs.block_size > 0 && paged_ctx::has_paged_context();
+
+    if use_paged {
+        let layer = attrs.layer_ord as usize;
+        let is_v = attrs.kv_slot != 0;
+        return paged_ctx::with_paged_context(|ctx| {
+            let ctx = ctx.ok_or_else(|| FellmError::other("kv_write: missing paged ctx"))?;
+            if row.len() != ctx.tokens_stride {
+                return Err(FellmError::other(format!(
+                    "kv_write: row len {} != tokens_stride {}",
+                    row.len(),
+                    ctx.tokens_stride
+                )));
+            }
+            // SAFETY: runtime uniquely owns arena for this step.
+            let dst = unsafe { ctx.row_mut(layer, pos, is_v) };
+            dst.copy_from_slice(row);
+            Ok(())
+        });
+    }
+
     let (buf_out, _) = outputs.split_first_mut().unwrap();
     let dims = buf_out.dims_slice();
     if dims.len() != 2 {
@@ -600,14 +646,12 @@ fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorM
     }
     let max_seq = dims[0] as usize;
     let dim = dims[1] as usize;
-    let row = as_f32_slice(&inputs[0])?;
     if row.len() != dim {
         return Err(FellmError::other(format!(
             "kv_write: row len {} != dim {dim}",
             row.len()
         )));
     }
-    let pos = attrs.position as usize;
     if pos >= max_seq {
         return Err(FellmError::other(format!(
             "kv_write: position {pos} >= max_seq {max_seq}"

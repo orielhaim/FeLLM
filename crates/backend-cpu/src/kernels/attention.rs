@@ -1,4 +1,5 @@
 use crate::cpu_profile::CpuHardwareProfile;
+use crate::paged_ctx;
 use rayon::prelude::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -32,6 +33,50 @@ pub fn attention_step(
                 q_head, k_cache, v_cache, out_h, n_kv_heads, head_dim, seq, kv_h, scale, kv_tile,
             );
         });
+}
+
+/// PagedAttention: K/V rows resolved via [`PagedKvContext`] block tables.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_step_paged(
+    q: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    past_len: usize,
+    scale: f32,
+    layer: usize,
+    profile: &CpuHardwareProfile,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert!(n_heads % n_kv_heads == 0);
+    debug_assert_eq!(out.len(), n_heads * head_dim);
+    let seq = past_len + 1;
+    let heads_per_kv = n_heads / n_kv_heads;
+    let kv_tile = profile.kv_tile_for(head_dim, seq);
+
+    // Serial over heads when using thread-local paged ctx (Rayon would need Send ctx).
+    // For multi-head parallelism we gather rows into a contiguous scratch first.
+    let tokens_stride = n_kv_heads * head_dim;
+    let mut k_contig = vec![0.0f32; seq * tokens_stride];
+    let mut v_contig = vec![0.0f32; seq * tokens_stride];
+    paged_ctx::with_paged_context(|ctx| {
+        let ctx = ctx.expect("paged attention requires PagedKvContext");
+        for t in 0..seq {
+            // SAFETY: ctx arena valid for step; rows are tokens_stride.
+            let k_row = unsafe { ctx.k_row(layer, t) };
+            let v_row = unsafe { ctx.v_row(layer, t) };
+            let dst_k = &mut k_contig[t * tokens_stride..(t + 1) * tokens_stride];
+            let dst_v = &mut v_contig[t * tokens_stride..(t + 1) * tokens_stride];
+            dst_k.copy_from_slice(k_row);
+            dst_v.copy_from_slice(v_row);
+        }
+    });
+
+    attention_step(
+        q, &k_contig, &v_contig, out, n_heads, n_kv_heads, head_dim, past_len, scale, profile,
+    );
+    let _ = (heads_per_kv, kv_tile);
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -324,7 +324,12 @@ fn build_attention(
     );
     let k_cache_updated = gb.op_in_place(
         OpKind::KvWrite,
-        OpAttrs::default(),
+        OpAttrs {
+            layer_ord: attn_ord as u32,
+            kv_slot: 0,
+            block_size: 16,
+            ..OpAttrs::default()
+        },
         DType::F32,
         Shape::new(&[spec.context_length as u64, kv_stride as u64])?,
         &[k_rot, k_in],
@@ -333,7 +338,12 @@ fn build_attention(
     );
     let v_cache_updated = gb.op_in_place(
         OpKind::KvWrite,
-        OpAttrs::default(),
+        OpAttrs {
+            layer_ord: attn_ord as u32,
+            kv_slot: 1,
+            block_size: 16,
+            ..OpAttrs::default()
+        },
         DType::F32,
         Shape::new(&[spec.context_length as u64, kv_stride as u64])?,
         &[v, v_in],
@@ -342,7 +352,10 @@ fn build_attention(
     );
     let attn_out = gb.op(
         OpKind::Attention,
-        attention_attrs(spec, n_kv),
+        OpAttrs {
+            layer_ord: attn_ord as u32,
+            ..attention_attrs(spec, n_kv)
+        },
         DType::F32,
         Shape::new(&[q_stride as u64])?,
         &[q_rot, k_cache_updated, v_cache_updated],
@@ -490,6 +503,7 @@ fn attention_attrs(spec: &ModelSpec, n_kv: usize) -> OpAttrs {
         head_dim: spec.head_dim as u32,
         past_len: 0,
         scale: 1.0 / (spec.head_dim as f32).sqrt(),
+        block_size: 16,
         ..Default::default()
     }
 }

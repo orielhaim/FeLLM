@@ -1,5 +1,7 @@
-//! Contiguous per-layer KV cache. Phase 1 shape:
-//! `k[layer]: [max_seq, n_kv_heads * head_dim]`, same for v.
+//! Contiguous per-layer KV cache (legacy Phase 1).
+//!
+//! Prefer [`crate::paged::CacheManager`] for new code. Kept for tests and
+//! as dummy graph-binding buffers.
 
 use fellm_core::error::Result;
 use fellm_core::storage::AlignedBuffer;
@@ -37,7 +39,7 @@ impl KvCache {
         head_dim: usize,
     ) -> Result<Self> {
         let per_token = n_kv_heads * head_dim;
-        let bytes_per_layer = max_seq * per_token * 4;
+        let bytes_per_layer = max_seq.max(1) * per_token.max(1) * 4;
         let mut layers = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
             layers.push(CacheLayer {
