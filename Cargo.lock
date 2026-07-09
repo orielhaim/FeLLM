@@ -173,6 +173,7 @@ dependencies = [
  "pulp 0.21.5",
  "rand 0.9.4",
  "rand_chacha",
+ "raw-cpuid",
  "rayon",
  "tracing",
  "wide",

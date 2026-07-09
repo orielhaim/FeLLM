@@ -4,7 +4,7 @@
 
 *Version 0.1 - Design Document*
 *Prepared for: oriel*
-*Toolchain baseline: Rust 1.96 stable, Bun for build tooling scripts, Cargo workspaces*
+*Toolchain baseline: Rust 1.96 stable, Cargo workspaces*
 
 ---
 
@@ -92,14 +92,6 @@ The top-level `fellm` binary crate declares Cargo features that are **mutually e
 - `backend-cpu` - always available, fallback and edge target.
 - `backend-cuda` - pulls in `backend-cuda` crate, `cuda-oxide`, and enables `#[cfg(feature = "cuda")]` code paths across `fellm-runtime` (e.g., CUDA stream management in the scheduler).
 - `backend-rocm`, `backend-vulkan`, `backend-metal` - analogous.
-
-A build looks like:
-
-```bash
-bun run build:cuda      # → cargo build --release --no-default-features --features backend-cuda,ops-all
-bun run build:edge      # → cargo build --release --no-default-features --features backend-cpu,quant-gguf,minimal
-bun run build:mac       # → cargo build --release --no-default-features --features backend-metal
-```
 
 Because features are additive and the backend crates are `#[cfg]`-gated at the crate level, `rustc` never sees the CUDA code when compiling for CPU-only edge, and the `cuda_oxide` toolchain requirement is completely absent. LTO then flattens the remaining code.
 
@@ -523,4 +515,4 @@ This is the mistral.rs-style embed pattern, cleaned up for the plugin-first worl
 7. **First-class quantization matrix.** GGUF k-quants for edge, NVFP4/FP8 for Blackwell/Hopper serving, AWQ for the sweet spot in between.
 8. **Radix prefix cache + chunked prefill + prefill/decode disagg + spec decoding + MTP as scheduler primitives.** Everything vLLM V1 and SGLang have proven, native in Rust.
 9. **Test-time compute is a scheduler concern, not an app-layer trick.** Compute-budget-aware admission and preemption.
-10. **Cargo-workspace hygiene.** Every backend, every architecture, every quant format is a crate with a feature flag. A `bun run build:edge` and a `bun run build:datacenter` produce dramatically different binaries from the same source tree.
+10. **Cargo-workspace hygiene.** Every backend, every architecture, every quant format is a crate with a feature flag.

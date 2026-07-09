@@ -1,3 +1,4 @@
+use crate::cpu_profile::CpuHardwareProfile;
 use crate::kernels::{
     attention::attention_step,
     embedding::embedding_row,
@@ -12,28 +13,43 @@ use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::traits::{Backend, BackendCaps, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
+use rayon::ThreadPool;
 
 /// The CPU backend.
 pub struct CpuBackend {
     caps: BackendCaps,
+    profile: CpuHardwareProfile,
+    /// Rayon pool sized to physical cores (avoids HT L2 thrash in attention).
+    pool: ThreadPool,
 }
 
 impl CpuBackend {
     /// Detect capabilities and construct.
     #[must_use]
     pub fn new() -> Self {
-        let logical = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1) as u32;
+        let profile = *CpuHardwareProfile::get();
+        let physical = profile.physical_cores.max(1);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(physical)
+            .thread_name(|i| format!("fellm-cpu-{i}"))
+            .build()
+            .unwrap_or_else(|_| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("rayon single-thread pool")
+            });
         Self {
             caps: BackendCaps {
-                simd_f32_lanes: 8,
-                has_avx512: cfg!(target_feature = "avx512f"),
-                has_avx2: cfg!(target_feature = "avx2"),
-                has_neon: cfg!(target_arch = "aarch64"),
-                physical_cores: logical,
-                logical_threads: logical,
+                simd_f32_lanes: profile.simd_f32_lanes,
+                has_avx512: profile.has_avx512,
+                has_avx2: profile.has_avx2,
+                has_neon: profile.has_neon,
+                physical_cores: profile.physical_cores as u32,
+                logical_threads: profile.logical_threads as u32,
             },
+            profile,
+            pool,
         }
     }
 
@@ -172,7 +188,7 @@ impl Backend for CpuBackend {
             OpKind::Rope => launch_rope(attrs, inputs, outputs),
             OpKind::SiluGate => launch_silu_gate(inputs, outputs),
             OpKind::Softmax => launch_softmax(attrs, inputs, outputs),
-            OpKind::Attention => launch_attention(attrs, inputs, outputs),
+            OpKind::Attention => launch_attention(self, attrs, inputs, outputs),
             OpKind::Add => launch_add(inputs, outputs),
             OpKind::Mul => launch_mul(inputs, outputs),
             OpKind::Reshape => launch_reshape(inputs, outputs),
@@ -356,6 +372,7 @@ fn launch_softmax(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMu
 }
 
 fn launch_attention(
+    backend: &CpuBackend,
     attrs: &OpAttrs,
     inputs: &[TensorRef],
     outputs: &mut [TensorMut],
@@ -389,7 +406,20 @@ fn launch_attention(
     }
     let k = &k_full[..kv_elems];
     let v = &v_full[..kv_elems];
-    attention_step(q, k, v, out, n_heads, n_kv, head_dim, past, scale);
+    backend.pool.install(|| {
+        attention_step(
+            q,
+            k,
+            v,
+            out,
+            n_heads,
+            n_kv,
+            head_dim,
+            past,
+            scale,
+            &backend.profile,
+        );
+    });
     Ok(())
 }
 
