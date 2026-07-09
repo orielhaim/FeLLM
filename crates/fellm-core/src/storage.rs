@@ -37,7 +37,11 @@ impl Storage {
         match self {
             Self::Mmap { mmap, offset, len } => &mmap[*offset..*offset + *len],
             Self::Owned(buf) => buf.as_slice(),
-            Self::View { parent, offset, len } => {
+            Self::View {
+                parent,
+                offset,
+                len,
+            } => {
                 let base = parent.as_bytes();
                 &base[*offset..*offset + *len]
             }
@@ -84,8 +88,7 @@ impl AlignedBuffer {
     pub fn new_zeroed(len: usize, align: usize) -> Self {
         assert!(align.is_power_of_two(), "align must be power of two");
         let align = align.max(1);
-        let layout = StdLayout::from_size_align(len.max(1), align)
-            .expect("valid layout");
+        let layout = StdLayout::from_size_align(len.max(1), align).expect("valid layout");
         // SAFETY: layout has non-zero size (we forced it above).
         let raw = unsafe { alloc(layout) };
         let ptr = NonNull::new(raw).expect("allocation failed");
@@ -133,8 +136,8 @@ impl AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // SAFETY: allocated with the same layout in `new_zeroed`.
-        let layout = StdLayout::from_size_align(self.len.max(1), self.align)
-            .expect("valid layout on drop");
+        let layout =
+            StdLayout::from_size_align(self.len.max(1), self.align).expect("valid layout on drop");
         unsafe {
             dealloc(self.ptr.as_ptr(), layout);
         }

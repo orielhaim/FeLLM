@@ -191,7 +191,11 @@ impl<'a> GraphExecutor<'a> {
         for &id in &self.plan.order {
             let node = self.graph.node(id);
             match &node.value {
-                OpValue::Input { name, dtype, shape } => {
+                OpValue::Input {
+                    name,
+                    dtype,
+                    shape: _,
+                } => {
                     // Prefer mutable binding if present, else read-only.
                     if let Some(mb) = self.mutable_inputs.get(name) {
                         if mb.dtype != *dtype {
@@ -247,17 +251,24 @@ impl<'a> GraphExecutor<'a> {
                             (buf, shape.clone(), *dtype)
                         };
 
-                    // Build input TensorRefs.
-                    let mut input_refs: Vec<TensorRef> = Vec::with_capacity(inputs.len());
-                    for iid in &inputs {
+                    let op = node
+                        .op
+                        .ok_or_else(|| FellmError::other("Runtime node without op"))?;
+                    // ShortConv has graph inputs [x, in_proj, conv, out_proj, conv_state],
+                    // but the state is passed only as a mutable output to avoid aliasing
+                    // TensorRef and TensorMut over the same buffer.
+                    let input_ref_count = if op == fellm_plugin_abi::op::OpKind::ShortConv {
+                        inputs.len().saturating_sub(1)
+                    } else {
+                        inputs.len()
+                    };
+                    let mut input_refs: Vec<TensorRef> = Vec::with_capacity(input_ref_count);
+                    for iid in inputs.iter().take(input_ref_count) {
                         let nv = values.get(iid).ok_or_else(|| {
                             FellmError::other("dep not computed (should not happen)")
                         })?;
                         input_refs.push(tensor_ref_from(nv));
                     }
-                    let op = node
-                        .op
-                        .ok_or_else(|| FellmError::other("Runtime node without op"))?;
                     let attrs = self.attr_overrides.get(&id).copied().unwrap_or(node.attrs);
                     let input_dtypes: Vec<DType> = input_refs
                         .iter()
@@ -284,10 +295,23 @@ impl<'a> GraphExecutor<'a> {
                     };
                     values.insert(id, nv);
                     let nv_ref = values.get(&id).unwrap();
-                    let mut out_mut = tensor_mut_from(nv_ref);
-                    let mut outs = [out_mut];
-                    self.backend
-                        .launch(desc.handle, &attrs, &input_refs, &mut outs, 0)?;
+                    let out_mut = tensor_mut_from(nv_ref);
+                    if op == fellm_plugin_abi::op::OpKind::ShortConv {
+                        let state_id = inputs.get(4).copied().ok_or_else(|| {
+                            FellmError::other("shortconv runtime node missing state input")
+                        })?;
+                        let state = values.get(&state_id).ok_or_else(|| {
+                            FellmError::other("shortconv state input not computed")
+                        })?;
+                        let state_mut = tensor_mut_from(state);
+                        let mut outs = [out_mut, state_mut];
+                        self.backend
+                            .launch(desc.handle, &attrs, &input_refs, &mut outs, 0)?;
+                    } else {
+                        let mut outs = [out_mut];
+                        self.backend
+                            .launch(desc.handle, &attrs, &input_refs, &mut outs, 0)?;
+                    }
                 }
             }
         }

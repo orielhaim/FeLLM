@@ -9,6 +9,7 @@ members = [
   "crates/fellm-runtime",
   "crates/backend-cpu",
   "crates/arch-llama",
+  "crates/arch-lfm2moe",
   "crates/fellm-cli",
 ]
 
@@ -30,6 +31,7 @@ fellm-plugin-abi = { path = "crates/fellm-plugin-abi", version = "0.1.0" }
 fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
 arch-llama = { path = "crates/arch-llama", version = "0.1.0" }
+arch-lfm2moe = { path = "crates/arch-lfm2moe", version = "0.1.0" }
 
 # External
 thiserror = "2"

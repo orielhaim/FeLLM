@@ -1,6 +1,11 @@
 use crate::kernels::{
-    attention::attention_step, embedding::embedding_row, matmul, norm::rmsnorm_row,
-    sampling::sample, softmax::softmax_rows_inplace, swiglu::silu_gate,
+    attention::attention_step,
+    embedding::embedding_row,
+    matmul,
+    norm::{rmsnorm_groups, rmsnorm_row},
+    sampling::sample,
+    softmax::softmax_rows_inplace,
+    swiglu::silu_gate,
 };
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
@@ -41,6 +46,13 @@ impl Default for CpuBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn is_supported_matvec_weight_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::F32 | DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K
+    )
 }
 
 impl Backend for CpuBackend {
@@ -89,6 +101,37 @@ impl Backend for CpuBackend {
                     )
                 })
                 .unwrap_or(false),
+            OpKind::ShortConv => matches!(
+                (
+                    input_dtypes.first(),
+                    input_dtypes.get(1),
+                    input_dtypes.get(2),
+                    input_dtypes.get(3)
+                ),
+                (Some(DType::F32), Some(w0), Some(DType::F32), Some(w1))
+                    if is_supported_matvec_weight_dtype(*w0)
+                        && is_supported_matvec_weight_dtype(*w1)
+            ),
+            OpKind::MoE => {
+                let base_ok = matches!(
+                    (
+                        input_dtypes.first(),
+                        input_dtypes.get(1),
+                        input_dtypes.get(2),
+                        input_dtypes.get(3),
+                        input_dtypes.get(4)
+                    ),
+                    (Some(DType::F32), Some(DType::F32), Some(w0), Some(w1), Some(w2))
+                        if is_supported_matvec_weight_dtype(*w0)
+                            && is_supported_matvec_weight_dtype(*w1)
+                            && is_supported_matvec_weight_dtype(*w2)
+                );
+                let bias_ok = input_dtypes
+                    .get(5)
+                    .map(|dtype| *dtype == DType::F32)
+                    .unwrap_or(true);
+                base_ok && bias_ok
+            }
             OpKind::RmsNorm
             | OpKind::Rope
             | OpKind::SiluGate
@@ -137,6 +180,8 @@ impl Backend for CpuBackend {
             OpKind::Concat => launch_concat(inputs, outputs),
             OpKind::Sample => launch_sample(attrs, inputs, outputs),
             OpKind::KvWrite => launch_kv_write(attrs, inputs, outputs),
+            OpKind::ShortConv => launch_shortconv(attrs, inputs, outputs),
+            OpKind::MoE => launch_moe(attrs, inputs, outputs),
         }
     }
 }
@@ -157,6 +202,8 @@ fn decode_handle(h: KernelHandle) -> Result<OpKind> {
         x if x == OpKind::Cast as u64 => Ok(OpKind::Cast),
         x if x == OpKind::Sample as u64 => Ok(OpKind::Sample),
         x if x == OpKind::KvWrite as u64 => Ok(OpKind::KvWrite),
+        x if x == OpKind::ShortConv as u64 => Ok(OpKind::ShortConv),
+        x if x == OpKind::MoE as u64 => Ok(OpKind::MoE),
         _ => Err(FellmError::other(format!("bad kernel handle {h:?}"))),
     }
 }
@@ -245,7 +292,13 @@ fn launch_rmsnorm(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMu
     let x = as_f32_slice(&inputs[0])?;
     let w = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
-    rmsnorm_row(x, w, attrs.eps, y);
+    let head_dim = attrs.head_dim as usize;
+    let n_heads = attrs.n_heads as usize;
+    if head_dim > 0 && n_heads > 0 && x.len() == n_heads * head_dim && w.len() == head_dim {
+        rmsnorm_groups(x, w, attrs.eps, head_dim, y);
+    } else {
+        rmsnorm_row(x, w, attrs.eps, y);
+    }
     Ok(())
 }
 
@@ -529,4 +582,143 @@ fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorM
     let dst = as_f32_slice_mut(buf_out)?;
     dst[pos * dim..(pos + 1) * dim].copy_from_slice(row);
     Ok(())
+}
+
+fn launch_shortconv(
+    attrs: &OpAttrs,
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    // inputs: [x, in_proj, conv, out_proj]
+    // outputs: [y, conv_state]
+    if inputs.len() < 4 || outputs.len() < 2 {
+        return Err(FellmError::other("shortconv: bad arity"));
+    }
+    let (y_out, rest) = outputs.split_first_mut().unwrap();
+    let state_out = rest
+        .first_mut()
+        .ok_or_else(|| FellmError::other("shortconv: missing state output"))?;
+
+    let x = as_f32_slice(&inputs[0])?;
+    let in_proj = &inputs[1];
+    let conv = as_f32_slice(&inputs[2])?;
+    let out_proj = &inputs[3];
+    let y = as_f32_slice_mut(y_out)?;
+    let state = as_f32_slice_mut(state_out)?;
+
+    let n_embd = if attrs.n_embd > 0 {
+        attrs.n_embd as usize
+    } else {
+        x.len()
+    };
+    let conv_dims = inputs[2].dims_slice();
+    let l_cache = if attrs.shortconv_l_cache > 0 {
+        attrs.shortconv_l_cache as usize
+    } else {
+        *conv_dims
+            .get(1)
+            .ok_or_else(|| FellmError::other("shortconv: conv weight must be 2D"))? as usize
+    };
+
+    let in_proj_dtype = in_proj
+        .dtype()
+        .ok_or_else(|| FellmError::other("shortconv: in_proj dtype"))?;
+    let out_proj_dtype = out_proj
+        .dtype()
+        .ok_or_else(|| FellmError::other("shortconv: out_proj dtype"))?;
+
+    crate::kernels::shortconv::shortconv_decode(
+        x,
+        as_bytes_slice(in_proj),
+        in_proj_dtype,
+        conv,
+        as_bytes_slice(out_proj),
+        out_proj_dtype,
+        state,
+        y,
+        n_embd,
+        l_cache,
+    )
+}
+
+fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+    // inputs: [x, gate_inp, gate_exps, up_exps, down_exps, optional bias]
+    // outputs: [y]
+    if inputs.len() < 5 || outputs.is_empty() {
+        return Err(FellmError::other("moe: bad arity"));
+    }
+    let (y_out, _) = outputs.split_first_mut().unwrap();
+    let x = as_f32_slice(&inputs[0])?;
+    let gate_inp = as_f32_slice(&inputs[1])?;
+    let y = as_f32_slice_mut(y_out)?;
+
+    let gate_dims = inputs[1].dims_slice();
+    let expert_dims = inputs[2].dims_slice();
+    let down_dims = inputs[4].dims_slice();
+    if gate_dims.len() != 2 || expert_dims.len() != 3 || down_dims.len() != 3 {
+        return Err(FellmError::other(
+            "moe: expected 2D router and 3D expert weights",
+        ));
+    }
+
+    let n_experts = if attrs.n_experts > 0 {
+        attrs.n_experts as usize
+    } else {
+        gate_dims[0] as usize
+    };
+    let n_embd = if attrs.n_embd > 0 {
+        attrs.n_embd as usize
+    } else {
+        gate_dims[1] as usize
+    };
+    let n_ff = expert_dims[1] as usize;
+    let n_expert_used = if attrs.n_expert_used > 0 {
+        attrs.n_expert_used as usize
+    } else {
+        1
+    };
+
+    if expert_dims[0] as usize != n_experts
+        || expert_dims[2] as usize != n_embd
+        || down_dims[0] as usize != n_experts
+        || down_dims[1] as usize != n_embd
+        || down_dims[2] as usize != n_ff
+    {
+        return Err(FellmError::other("moe: expert dimensions mismatch"));
+    }
+
+    let gate_exps_dtype = inputs[2]
+        .dtype()
+        .ok_or_else(|| FellmError::other("moe: gate expert dtype"))?;
+    let up_exps_dtype = inputs[3]
+        .dtype()
+        .ok_or_else(|| FellmError::other("moe: up expert dtype"))?;
+    let down_exps_dtype = inputs[4]
+        .dtype()
+        .ok_or_else(|| FellmError::other("moe: down expert dtype"))?;
+    let bias = if inputs.len() > 5 {
+        Some(as_f32_slice(&inputs[5])?)
+    } else {
+        None
+    };
+
+    crate::kernels::moe::moe_decode(
+        x,
+        gate_inp,
+        as_bytes_slice(&inputs[2]),
+        gate_exps_dtype,
+        as_bytes_slice(&inputs[3]),
+        up_exps_dtype,
+        as_bytes_slice(&inputs[4]),
+        down_exps_dtype,
+        bias,
+        y,
+        n_experts,
+        n_expert_used,
+        n_ff,
+        n_embd,
+        attrs.expert_gating_func,
+        attrs.routed_scaling_factor,
+        attrs.norm_topk_prob != 0,
+    )
 }

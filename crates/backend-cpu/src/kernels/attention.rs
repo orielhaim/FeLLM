@@ -41,8 +41,8 @@ pub fn attention_step(
             // Compute scores [seq]
             let mut scores = vec![0.0f32; seq];
             for t in 0..seq {
-                let k_row = &k_cache[(t * n_kv_heads + kv_h) * head_dim
-                    ..(t * n_kv_heads + kv_h + 1) * head_dim];
+                let k_row = &k_cache
+                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
                 let mut s = 0.0f32;
                 for i in 0..head_dim {
                     s += q_head[i] * k_row[i];
@@ -54,8 +54,8 @@ pub fn attention_step(
             // Weighted sum over V
             let mut out_h = vec![0.0f32; head_dim];
             for t in 0..seq {
-                let v_row = &v_cache[(t * n_kv_heads + kv_h) * head_dim
-                    ..(t * n_kv_heads + kv_h + 1) * head_dim];
+                let v_row = &v_cache
+                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
                 let w = scores[t];
                 for i in 0..head_dim {
                     out_h[i] += w * v_row[i];

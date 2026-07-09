@@ -85,16 +85,13 @@ impl BpeTokenizer {
 
         let bos_str = bos.and_then(|id| tokens.get(id as usize).cloned());
 
-        // Build special-token cache: control / unknown / user_defined, plus
-        // any token whose surface form looks like `<|...|>` (Llama 3 style).
-        // Sorted longest-first so `<|end_header_id|>` wins over shorter prefixes.
         let mut special_tokens: Vec<(String, TokenId)> = Vec::new();
         for (i, t) in tokens.iter().enumerate() {
             let ttype = *token_types.get(i).unwrap_or(&0);
-            // GGML: 2=unknown, 3=control, 4=user_defined. Also catch Llama-style
-            // `<|...|>` surfaces even if typed inconsistently by converters.
-            let is_special_type =
-                matches!(ttype, TOKEN_TYPE_UNKNOWN | TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED);
+            let is_special_type = matches!(
+                ttype,
+                TOKEN_TYPE_UNKNOWN | TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED
+            );
             let looks_special = t.starts_with("<|") && t.ends_with("|>");
             if (is_special_type || looks_special) && !t.is_empty() {
                 special_tokens.push((t.clone(), i as TokenId));
@@ -117,7 +114,6 @@ impl BpeTokenizer {
         })
     }
 
-    /// Encode a single "word" (pre-tokenized chunk) using BPE greedy merges.
     fn bpe_word(&self, chars: Vec<String>) -> Vec<String> {
         if chars.len() <= 1 {
             return chars;

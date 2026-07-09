@@ -38,6 +38,20 @@ pub fn rmsnorm_row(x: &[f32], weight: &[f32], eps: f32, y: &mut [f32]) {
     }
 }
 
+/// Apply RMSNorm independently to fixed-size groups, reusing one weight vector.
+pub fn rmsnorm_groups(x: &[f32], weight: &[f32], eps: f32, group_size: usize, y: &mut [f32]) {
+    debug_assert!(group_size > 0);
+    debug_assert_eq!(weight.len(), group_size);
+    debug_assert_eq!(x.len(), y.len());
+    debug_assert_eq!(x.len() % group_size, 0);
+    for (xg, yg) in x
+        .chunks_exact(group_size)
+        .zip(y.chunks_exact_mut(group_size))
+    {
+        rmsnorm_row(xg, weight, eps, yg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +64,18 @@ mod tests {
         rmsnorm_row(&x, &w, 1e-6, &mut y);
         let rms = (y.iter().map(|v| v * v).sum::<f32>() / 8.0).sqrt();
         assert!((rms - 1.0).abs() < 1e-4, "rms = {rms}");
+    }
+
+    #[test]
+    fn rmsnorm_groups_normalizes_each_group() {
+        let x = [3.0f32, 4.0, 0.0, 10.0];
+        let w = [1.0f32, 1.0];
+        let mut y = [0.0f32; 4];
+        rmsnorm_groups(&x, &w, 1e-6, 2, &mut y);
+
+        let a = ((y[0] * y[0] + y[1] * y[1]) / 2.0).sqrt();
+        let b = ((y[2] * y[2] + y[3] * y[3]) / 2.0).sqrt();
+        assert!((a - 1.0).abs() < 1e-4);
+        assert!((b - 1.0).abs() < 1e-4);
     }
 }

@@ -13,7 +13,7 @@ pub mod tensor_ref;
 pub mod traits;
 
 pub use op::{OpAttrs, OpKind};
-pub use tensor_ref::{TensorRef, TensorMut};
+pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{Architecture, Backend, BackendCaps, KernelHandle};
 
 /// A stream handle. On CPU this is always 0; on GPU backends this wraps

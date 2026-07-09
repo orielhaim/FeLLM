@@ -36,6 +36,10 @@ pub enum OpKind {
     Sample,
     /// Write a K/V row into the cache at `position`, in-place on the cache buffer.
     KvWrite,
+    /// Short convolution block used by LFM2-style decode.
+    ShortConv,
+    /// Mixture-of-Experts feed-forward block.
+    MoE,
 }
 
 impl OpKind {
@@ -57,6 +61,8 @@ impl OpKind {
             Self::Cast => "cast",
             Self::Sample => "sample",
             Self::KvWrite => "kv_write",
+            Self::ShortConv => "shortconv",
+            Self::MoE => "moe",
         }
     }
 }
@@ -92,6 +98,20 @@ pub struct OpAttrs {
     pub top_p: f32,
     /// Sampling: RNG seed.
     pub seed: u64,
+    /// MoE: number of experts.
+    pub n_experts: u32,
+    /// MoE: number of experts selected per token.
+    pub n_expert_used: u32,
+    /// MoE: gating function (1 = softmax, 2 = sigmoid).
+    pub expert_gating_func: u32,
+    /// MoE: multiplier applied to selected expert weights.
+    pub routed_scaling_factor: f32,
+    /// MoE: whether selected top-k probabilities are renormalized.
+    pub norm_topk_prob: u32,
+    /// ShortConv: convolution window length.
+    pub shortconv_l_cache: u32,
+    /// Shared model embedding dimension.
+    pub n_embd: u32,
 }
 
 impl OpAttrs {

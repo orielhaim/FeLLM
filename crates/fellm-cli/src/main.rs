@@ -177,10 +177,7 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
         (stats.total_ms - stats.prompt_ms).max(0.0),
         stats.generation_tok_per_sec()
     );
-    eprintln!(
-        "TTFT: {:.2}ms",
-        stats.time_to_first_token_ms
-    );
+    eprintln!("TTFT: {:.2}ms", stats.time_to_first_token_ms);
     eprintln!("total: {:.2}ms", stats.total_ms);
 
     Ok(())

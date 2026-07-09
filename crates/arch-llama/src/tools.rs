@@ -85,11 +85,7 @@ fn try_parse_pythonic_tool_calls(t: &str) -> Option<Vec<ToolCall>> {
             arguments,
         });
     }
-    if calls.is_empty() {
-        None
-    } else {
-        Some(calls)
-    }
+    if calls.is_empty() { None } else { Some(calls) }
 }
 
 fn split_top_level_calls(s: &str) -> Vec<String> {
@@ -395,9 +391,8 @@ mod tests {
 
     #[test]
     fn parses_json_tool_call() {
-        let out = parse_assistant_output(
-            r#"{"name": "get_weather", "parameters": {"city": "SF"}}"#,
-        );
+        let out =
+            parse_assistant_output(r#"{"name": "get_weather", "parameters": {"city": "SF"}}"#);
         match out {
             AssistantOutput::ToolCalls(c) => {
                 assert_eq!(c[0].name, "get_weather");
@@ -409,8 +404,7 @@ mod tests {
 
     #[test]
     fn parses_pythonic_tool_calls() {
-        let out =
-            parse_assistant_output("[get_weather(city='San Francisco', metric='celsius')]");
+        let out = parse_assistant_output("[get_weather(city='San Francisco', metric='celsius')]");
         match out {
             AssistantOutput::ToolCalls(c) => {
                 assert_eq!(c[0].name, "get_weather");

@@ -1,7 +1,9 @@
 //! The Engine: the top-level user-facing API.
 
 use crate::executor::GraphExecutor;
+use crate::hybrid_state::HybridState;
 use crate::kv_cache::KvCache;
+use arch_lfm2moe::{Lfm2MoeArch, Lfm2MoeConfig, StepNodes};
 use arch_llama::parse_assistant_output;
 use arch_llama::{LlamaArch, LlamaConfig, PositionNodes};
 use backend_cpu::CpuBackend;
@@ -248,23 +250,40 @@ pub struct Engine {
     #[allow(dead_code)]
     gguf: Arc<GgufFile>,
     tokenizer: Box<dyn Tokenizer>,
-    #[allow(dead_code)]
-    arch: LlamaArch,
     backend: CpuBackend,
-    config: LlamaConfig,
-    kv: KvCache,
-    /// Resolved context length (`n_ctx`).
-    max_seq: usize,
-    /// Model's GGUF-reported maximum context.
-    model_max_ctx: usize,
+    model: Box<dyn ModelArch>,
     /// Evaluation / physical batch settings.
     settings: EngineSettings,
-    /// Cached per-token forward graph (built once at open).
+}
+
+trait ModelArch {
+    fn model_max_ctx(&self) -> usize;
+    fn n_ctx(&self) -> usize;
+    fn reset(&mut self);
+    fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor>;
+    fn llama_config(&self) -> Option<&LlamaConfig> {
+        None
+    }
+}
+
+struct LlamaModel {
+    config: LlamaConfig,
+    kv: KvCache,
+    max_seq: usize,
+    model_max_ctx: usize,
     step_graph: Graph,
-    /// Cached execution plan.
     step_plan: ExecutionPlan,
-    /// Nodes whose attrs are patched each step.
     position_nodes: PositionNodes,
+}
+
+struct Lfm2MoeModel {
+    config: Lfm2MoeConfig,
+    state: HybridState,
+    max_seq: usize,
+    model_max_ctx: usize,
+    step_graph: Graph,
+    step_plan: ExecutionPlan,
+    step_nodes: StepNodes,
 }
 
 impl Engine {
@@ -285,13 +304,17 @@ impl Engine {
 
         let arch_id = gguf.metadata.arch()?;
         tracing::info!(arch = arch_id, "detected architecture");
-        if arch_id != "llama" {
-            return Err(FellmError::UnsupportedArchitecture(arch_id.into()));
-        }
-
-        let arch = LlamaArch::new();
-        let config = arch.config_from_gguf(&gguf)?;
-        let model_max_ctx = config.context_length.max(1);
+        let model_max_ctx = match arch_id {
+            "llama" => {
+                let arch = LlamaArch::new();
+                arch.config_from_gguf(&gguf)?.context_length.max(1)
+            }
+            "lfm2moe" => {
+                let arch = Lfm2MoeArch::new();
+                arch.config_from_gguf(&gguf)?.context_length.max(1)
+            }
+            other => return Err(FellmError::UnsupportedArchitecture(other.into())),
+        };
         let max_seq = settings.resolve_n_ctx(model_max_ctx);
         let n_ubatch = settings.resolve_ubatch();
         let n_batch = settings.n_batch.max(1);
@@ -304,41 +327,23 @@ impl Engine {
             "context / batch settings"
         );
 
-        let kv = KvCache::new(
-            config.n_layers,
-            max_seq,
-            config.n_kv_heads,
-            config.head_dim(),
-        )?;
-
-        tracing::info!("building step graph (once)");
-        let step_graph = arch.build_graph(&gguf, &config)?;
-        let step_plan = ExecutionPlan::from_graph(&step_graph)?;
-        let position_nodes = LlamaArch::collect_position_nodes(&step_graph);
-        tracing::info!(
-            nodes = step_graph.node_count(),
-            rope = position_nodes.rope.len(),
-            "step graph ready"
-        );
+        let model: Box<dyn ModelArch> = match arch_id {
+            "llama" => Box::new(LlamaModel::new(&gguf, max_seq, model_max_ctx)?),
+            "lfm2moe" => Box::new(Lfm2MoeModel::new(&gguf, max_seq, model_max_ctx)?),
+            other => return Err(FellmError::UnsupportedArchitecture(other.into())),
+        };
 
         Ok(Self {
             gguf,
             tokenizer,
-            arch,
             backend: CpuBackend::new(),
-            config,
-            kv,
-            max_seq,
-            model_max_ctx,
+            model,
             settings: EngineSettings {
                 n_ctx: Some(max_seq),
                 n_ctx_from_model: settings.n_ctx_from_model,
                 n_batch,
                 n_ubatch,
             },
-            step_graph,
-            step_plan,
-            position_nodes,
         })
     }
 
@@ -350,20 +355,20 @@ impl Engine {
 
     /// Config reference.
     #[must_use]
-    pub fn config(&self) -> &LlamaConfig {
-        &self.config
+    pub fn config(&self) -> Option<&LlamaConfig> {
+        self.model.llama_config()
     }
 
     /// Resolved context length (`n_ctx`).
     #[must_use]
     pub fn n_ctx(&self) -> usize {
-        self.max_seq
+        self.model.n_ctx()
     }
 
     /// Model GGUF maximum context length.
     #[must_use]
     pub fn model_max_ctx(&self) -> usize {
-        self.model_max_ctx
+        self.model.model_max_ctx()
     }
 
     /// Active engine settings (resolved `n_ctx`).
@@ -377,7 +382,7 @@ impl Engine {
     /// Does **not** apply a chat template. Prefer [`Engine::chat`] for
     /// instruction-tuned models.
     pub fn generate(&mut self, prompt: &str, params: GenParams) -> Result<TokenStream<'_>> {
-        self.kv.reset();
+        self.model.reset();
         let ids = self.tokenizer.encode(prompt, true)?;
         tracing::info!(n_tokens = ids.len(), "prompt tokenized");
         self.generate_from_ids(&ids, params)
@@ -395,7 +400,7 @@ impl Engine {
         tools: &[ToolDef],
         params: GenParams,
     ) -> Result<TokenStream<'_>> {
-        self.kv.reset();
+        self.model.reset();
         let prompt = match self
             .tokenizer
             .apply_chat_template_with_tools(messages, tools, true)?
@@ -445,11 +450,11 @@ impl Engine {
         if ids.is_empty() {
             return Err(FellmError::other("empty prompt"));
         }
-        if ids.len() >= self.max_seq {
+        if ids.len() >= self.model.n_ctx() {
             return Err(FellmError::other(format!(
                 "prompt length {} exceeds context size n_ctx={}",
                 ids.len(),
-                self.max_seq
+                self.model.n_ctx()
             )));
         }
 
@@ -521,8 +526,61 @@ impl Engine {
 
     /// One forward step for token id `tok` at position `pos`.
     fn step(&mut self, tok: u32, pos: usize) -> Result<Tensor> {
+        self.model.step(&self.backend, tok, pos)
+    }
+}
+
+impl LlamaModel {
+    fn new(gguf: &GgufFile, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
+        let arch = LlamaArch::new();
+        let config = arch.config_from_gguf(gguf)?;
+        let kv = KvCache::new(
+            config.n_layers,
+            max_seq,
+            config.n_kv_heads,
+            config.head_dim(),
+        )?;
+
+        tracing::info!("building llama step graph (once)");
+        let step_graph = arch.build_graph(gguf, &config)?;
+        let step_plan = ExecutionPlan::from_graph(&step_graph)?;
+        let position_nodes = LlamaArch::collect_position_nodes(&step_graph);
+        tracing::info!(
+            nodes = step_graph.node_count(),
+            rope = position_nodes.rope.len(),
+            kv_write = position_nodes.kv_write.len(),
+            attention = position_nodes.attention.len(),
+            "llama step graph ready"
+        );
+
+        Ok(Self {
+            config,
+            kv,
+            max_seq,
+            model_max_ctx,
+            step_graph,
+            step_plan,
+            position_nodes,
+        })
+    }
+}
+
+impl ModelArch for LlamaModel {
+    fn model_max_ctx(&self) -> usize {
+        self.model_max_ctx
+    }
+
+    fn n_ctx(&self) -> usize {
+        self.max_seq
+    }
+
+    fn reset(&mut self) {
+        self.kv.reset();
+    }
+
+    fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
         let pos_u32 = pos as u32;
-        let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, &self.backend);
+        let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
 
         for &id in &self.position_nodes.rope {
             let mut a = self.step_graph.node(id).attrs;
@@ -565,6 +623,126 @@ impl Engine {
 
         let outs = exec.run()?;
         self.kv.advance();
+
+        outs.get("logits")
+            .cloned()
+            .ok_or_else(|| FellmError::other("no logits output"))
+    }
+
+    fn llama_config(&self) -> Option<&LlamaConfig> {
+        Some(&self.config)
+    }
+}
+
+impl Lfm2MoeModel {
+    fn new(gguf: &GgufFile, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
+        let arch = Lfm2MoeArch::new();
+        let config = arch.config_from_gguf(gguf)?;
+        let state = HybridState::new(
+            &config.layer_kv_heads,
+            max_seq,
+            config.n_heads,
+            config.head_dim,
+            config.d_model,
+            config.shortconv_l_cache,
+        )?;
+
+        tracing::info!("building lfm2moe step graph (once)");
+        let step_graph = arch.build_graph(gguf, &config)?;
+        let step_plan = ExecutionPlan::from_graph(&step_graph)?;
+        let step_nodes = Lfm2MoeArch::collect_step_nodes(&step_graph);
+        tracing::info!(
+            nodes = step_graph.node_count(),
+            rope = step_nodes.rope.len(),
+            kv_write = step_nodes.kv_write.len(),
+            attention = step_nodes.attention.len(),
+            attn_layers = config.n_attn_layers(),
+            conv_layers = config.n_conv_layers(),
+            "lfm2moe step graph ready"
+        );
+
+        Ok(Self {
+            config,
+            state,
+            max_seq,
+            model_max_ctx,
+            step_graph,
+            step_plan,
+            step_nodes,
+        })
+    }
+}
+
+impl ModelArch for Lfm2MoeModel {
+    fn model_max_ctx(&self) -> usize {
+        self.model_max_ctx
+    }
+
+    fn n_ctx(&self) -> usize {
+        self.max_seq
+    }
+
+    fn reset(&mut self) {
+        self.state.reset();
+    }
+
+    fn step(&mut self, backend: &CpuBackend, tok: u32, pos: usize) -> Result<Tensor> {
+        let pos_u32 = pos as u32;
+        let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
+
+        for &id in &self.step_nodes.rope {
+            let mut a = self.step_graph.node(id).attrs;
+            a.position = pos_u32;
+            exec.set_attrs(id, a);
+        }
+        for &id in &self.step_nodes.kv_write {
+            let mut a = self.step_graph.node(id).attrs;
+            a.position = pos_u32;
+            exec.set_attrs(id, a);
+        }
+        for &id in &self.step_nodes.attention {
+            let mut a = self.step_graph.node(id).attrs;
+            a.past_len = pos_u32;
+            exec.set_attrs(id, a);
+        }
+
+        exec.bind_input("token_id", scalar_u32_tensor(tok));
+
+        for (attn_ord, &layer) in self.state.attn_layer_ids.iter().enumerate() {
+            let kv_stride = self.config.layer_kv_heads[layer] * self.config.head_dim;
+            let shape = Shape::new(&[self.state.max_seq as u64, kv_stride as u64])?;
+            exec.bind_mutable(
+                format!("k_in_{attn_ord}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.state.k_buffer(attn_ord),
+                },
+            );
+            exec.bind_mutable(
+                format!("v_in_{attn_ord}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape,
+                    buffer: self.state.v_buffer(attn_ord),
+                },
+            );
+        }
+
+        let conv_shape = Shape::new(&[self.state.conv_elements() as u64])?;
+        for conv_ord in 0..self.state.conv_layer_ids.len() {
+            exec.bind_mutable(
+                format!("conv_in_{conv_ord}"),
+                crate::executor::MutableBinding {
+                    dtype: DType::F32,
+                    shape: conv_shape.clone(),
+                    buffer: self.state.conv_buffer(conv_ord),
+                },
+            );
+        }
+
+        let outs = exec.run()?;
+        self.state.kv.advance();
 
         outs.get("logits")
             .cloned()
@@ -663,7 +841,7 @@ impl<'a> Iterator for TokenStream<'a> {
             return Some(Ok(tok));
         }
 
-        if self.emitted < self.params.max_tokens && self.position + 1 < self.engine.kv.max_seq {
+        if self.emitted < self.params.max_tokens && self.position + 1 < self.engine.model.n_ctx() {
             match self.engine.step(tok, self.position) {
                 Ok(next) => {
                     self.pending_logits = Some(next);

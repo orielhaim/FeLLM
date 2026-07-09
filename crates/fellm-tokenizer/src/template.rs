@@ -1,9 +1,10 @@
 //! General Jinja2-subset renderer for GGUF `tokenizer.chat_template` strings.
 //!
 //! This intentionally implements only the subset commonly used by chat
-//! templates: variables, conditionals, loops, assignments, comments,
-//! whitespace control, filters, tests, indexing, slicing, simple function
-//! calls, and JSON conversion. It contains no model-specific formatting logic.
+//! templates: variables, conditionals, loops, assignments, macros,
+//! generation blocks, namespace objects, method calls, comments, whitespace
+//! control, filters, tests, indexing, slicing, simple function calls, and
+//! JSON conversion. It contains no model-specific formatting logic.
 
 use fellm_core::error::{FellmError, Result};
 use std::collections::BTreeMap;
@@ -211,8 +212,15 @@ pub fn render(template: &str, ctx: &TemplateContext) -> Result<String> {
 
 // ---------- Environment ----------
 
+#[derive(Debug, Clone)]
+struct MacroDef {
+    params: Vec<String>,
+    body: Vec<Tok>,
+}
+
 struct Env {
     scopes: Vec<BTreeMap<String, Value>>,
+    macros: BTreeMap<String, MacroDef>,
 }
 
 impl Env {
@@ -224,7 +232,10 @@ impl Env {
             Value::Bool(ctx.add_generation_prompt),
         );
         root.insert("tools".to_string(), tools_to_value(&ctx.tools));
-        Self { scopes: vec![root] }
+        Self {
+            scopes: vec![root],
+            macros: BTreeMap::new(),
+        }
     }
 
     fn get(&self, name: &str) -> Value {
@@ -241,7 +252,10 @@ impl Env {
     }
 
     fn is_defined_name(&self, name: &str) -> bool {
-        name == "strftime_now" || self.lookup(name).is_some()
+        name == "strftime_now"
+            || name == "namespace"
+            || self.macros.contains_key(name)
+            || self.lookup(name).is_some()
     }
 
     fn set(&mut self, name: &str, value: Value) {
@@ -260,6 +274,29 @@ impl Env {
             .last_mut()
             .expect("env has at least one scope")
             .insert(name.to_string(), value);
+    }
+
+    fn set_path(&mut self, path: &str, value: Value) -> Result<()> {
+        let path = path.trim();
+        if !path.contains('.') {
+            self.set(path, value);
+            return Ok(());
+        }
+
+        let mut parts = path.split('.').map(str::trim).filter(|p| !p.is_empty());
+        let Some(root) = parts.next() else {
+            return Err(FellmError::Tokenization("bad set path".to_string()));
+        };
+        let fields: Vec<&str> = parts.collect();
+        if fields.is_empty() {
+            self.set(root, value);
+            return Ok(());
+        }
+
+        let mut cur = self.get(root);
+        set_nested_map(&mut cur, &fields, value)?;
+        self.set(root, cur);
+        Ok(())
     }
 
     fn set_local(&mut self, name: &str, value: Value) {
@@ -285,7 +322,7 @@ impl Env {
         if !self.is_defined_name(&first) {
             return false;
         }
-        if first == "strftime_now" {
+        if first == "strftime_now" || first == "namespace" || self.macros.contains_key(&first) {
             return parser.remaining_is_blank();
         }
 
@@ -298,25 +335,55 @@ impl Env {
                     };
                     cur = next;
                 }
-                PathOp::Index(index) => {
-                    let Some(next) = cur.get_index(index) else {
-                        return false;
-                    };
-                    cur = next;
+                PathOp::Bracket(inner) => {
+                    let inner = inner.trim();
+                    if let Some(key) = parse_string_literal(inner) {
+                        let Some(next) = cur.get_member(&key) else {
+                            return false;
+                        };
+                        cur = next;
+                    } else if inner.contains(':') {
+                        if !matches!(cur, Value::List(_) | Value::String(_)) {
+                            return false;
+                        }
+                        cur = cur.slice(None, None);
+                    } else if let Ok(idx) = inner.parse::<i64>() {
+                        let Some(next) = cur.get_index(idx) else {
+                            return false;
+                        };
+                        cur = next;
+                    } else {
+                        return matches!(cur, Value::List(_) | Value::String(_) | Value::Map(_));
+                    }
                 }
-                PathOp::Key(key) => {
-                    let Some(next) = cur.get_member(&key) else {
-                        return false;
-                    };
-                    cur = next;
-                }
-                PathOp::Slice { .. } => {
-                    cur = cur.slice(None, None);
+                PathOp::Call { .. } => {
+                    return parser.remaining_is_blank();
                 }
             }
         }
         parser.remaining_is_blank()
     }
+}
+
+fn set_nested_map(cur: &mut Value, fields: &[&str], value: Value) -> Result<()> {
+    if fields.is_empty() {
+        *cur = value;
+        return Ok(());
+    }
+    let Value::Map(map) = cur else {
+        return Err(FellmError::Tokenization(
+            "cannot assign into non-map value".to_string(),
+        ));
+    };
+    let key = fields[0].to_string();
+    if fields.len() == 1 {
+        map.insert(key, value);
+        return Ok(());
+    }
+    let entry = map
+        .entry(key)
+        .or_insert_with(|| Value::Map(BTreeMap::new()));
+    set_nested_map(entry, &fields[1..], value)
 }
 
 fn messages_to_value(messages: &[Message]) -> Value {
@@ -326,17 +393,14 @@ fn messages_to_value(messages: &[Message]) -> Value {
             .map(|message| {
                 let mut map = BTreeMap::new();
                 map.insert("role".to_string(), Value::String(message.role.clone()));
-                map.insert("content".to_string(), Value::String(message.content.clone()));
+                map.insert(
+                    "content".to_string(),
+                    Value::String(message.content.clone()),
+                );
                 if !message.tool_calls.is_empty() {
                     map.insert(
                         "tool_calls".to_string(),
-                        Value::List(
-                            message
-                                .tool_calls
-                                .iter()
-                                .map(tool_call_to_value)
-                                .collect(),
-                        ),
+                        Value::List(message.tool_calls.iter().map(tool_call_to_value).collect()),
                     );
                 }
                 Value::Map(map)
@@ -484,7 +548,11 @@ fn find_tag_close(src: &str, from: usize, close: &[u8; 2]) -> Result<(usize, usi
             continue;
         }
         if !in_single && !in_double {
-            if b == b'-' && i + 2 < bytes.len() && bytes[i + 1] == close[0] && bytes[i + 2] == close[1] {
+            if b == b'-'
+                && i + 2 < bytes.len()
+                && bytes[i + 1] == close[0]
+                && bytes[i + 2] == close[1]
+            {
                 return Ok((i, i + 3, true));
             }
             if b == close[0] && bytes[i + 1] == close[1] {
@@ -494,7 +562,9 @@ fn find_tag_close(src: &str, from: usize, close: &[u8; 2]) -> Result<(usize, usi
         i += 1;
     }
 
-    Err(FellmError::Tokenization("unterminated template tag".to_string()))
+    Err(FellmError::Tokenization(
+        "unterminated template tag".to_string(),
+    ))
 }
 
 // ---------- Renderer ----------
@@ -530,22 +600,38 @@ fn render_tokens(tokens: &[Tok], env: &mut Env, out: &mut String, start: usize) 
                     }
                     i = end + 1;
                 } else if let Some(rest) = stmt.strip_prefix("for ") {
-                    let (var, expr) = parse_for(rest)?;
+                    let (vars, expr) = parse_for(rest)?;
                     let end = find_end(tokens, i, "for")?;
                     let items = match eval_expr(&expr, env)? {
                         Value::List(items) => items,
                         Value::Map(map) => map.into_values().collect(),
-                        Value::String(s) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+                        Value::String(s) => {
+                            s.chars().map(|c| Value::String(c.to_string())).collect()
+                        }
                         Value::Bool(_) | Value::Int(_) | Value::None => Vec::new(),
                     };
-                    render_for_loop(tokens, env, out, i + 1, end, &var, items)?;
+                    render_for_loop(tokens, env, out, i + 1, end, &vars, items)?;
+                    i = end + 1;
+                } else if let Some(rest) = stmt.strip_prefix("macro ") {
+                    let (name, params) = parse_macro_header(rest)?;
+                    let end = find_end(tokens, i, "macro")?;
+                    let body = tokens[i + 1..end].to_vec();
+                    env.macros.insert(name, MacroDef { params, body });
+                    i = end + 1;
+                } else if stmt == "generation" {
+                    let end = find_end(tokens, i, "generation")?;
+                    render_tokens(&tokens[..end], env, out, i + 1)?;
                     i = end + 1;
                 } else if let Some(rest) = stmt.strip_prefix("set ") {
                     let (name, expr) = parse_set(rest)?;
                     let value = eval_expr(expr, env)?;
-                    env.set(name, value);
+                    env.set_path(name, value)?;
                     i += 1;
-                } else if matches!(stmt, "endif" | "endfor" | "else") || stmt.starts_with("elif ") {
+                } else if matches!(
+                    stmt,
+                    "endif" | "endfor" | "else" | "endmacro" | "endgeneration"
+                ) || stmt.starts_with("elif ")
+                {
                     return Ok(i);
                 } else if stmt.is_empty() {
                     i += 1;
@@ -566,12 +652,22 @@ fn find_end(tokens: &[Tok], from: usize, block: &str) -> Result<usize> {
             continue;
         };
         let stmt = stmt.trim();
-        if stmt.starts_with("if ") || stmt.starts_with("for ") {
+        if stmt.starts_with("if ")
+            || stmt.starts_with("for ")
+            || stmt.starts_with("macro ")
+            || stmt == "generation"
+        {
             depth += 1;
-        } else if stmt == "endif" || stmt == "endfor" {
+        } else if matches!(stmt, "endif" | "endfor" | "endmacro" | "endgeneration") {
             depth -= 1;
             if depth == 0 {
-                let expected = if block == "if" { "endif" } else { "endfor" };
+                let expected = match block {
+                    "if" => "endif",
+                    "for" => "endfor",
+                    "macro" => "endmacro",
+                    "generation" => "endgeneration",
+                    _ => block,
+                };
                 if stmt == expected {
                     return Ok(idx);
                 }
@@ -582,7 +678,9 @@ fn find_end(tokens: &[Tok], from: usize, block: &str) -> Result<usize> {
         }
     }
 
-    Err(FellmError::Tokenization(format!("unterminated {block} block")))
+    Err(FellmError::Tokenization(format!(
+        "unterminated {block} block"
+    )))
 }
 
 fn split_if(tokens: &[Tok], start: usize, end: usize) -> Vec<(&str, usize, usize)> {
@@ -599,9 +697,13 @@ fn split_if(tokens: &[Tok], start: usize, end: usize) -> Vec<(&str, usize, usize
             continue;
         };
         let stmt = stmt.trim();
-        if stmt.starts_with("if ") || stmt.starts_with("for ") {
+        if stmt.starts_with("if ")
+            || stmt.starts_with("for ")
+            || stmt.starts_with("macro ")
+            || stmt == "generation"
+        {
             depth += 1;
-        } else if stmt == "endif" || stmt == "endfor" {
+        } else if matches!(stmt, "endif" | "endfor" | "endmacro" | "endgeneration") {
             depth -= 1;
         } else if depth == 0 && (stmt == "else" || stmt.starts_with("elif ")) {
             branches.push((condition, body_start, idx));
@@ -618,15 +720,22 @@ fn split_if(tokens: &[Tok], start: usize, end: usize) -> Vec<(&str, usize, usize
     branches
 }
 
-fn parse_for(rest: &str) -> Result<(String, String)> {
+fn parse_for(rest: &str) -> Result<(Vec<String>, String)> {
     let Some((var, expr)) = split_top_word(rest, "in") else {
         return Err(FellmError::Tokenization("bad for statement".to_string()));
     };
-    let var = var.trim();
-    if var.is_empty() {
-        return Err(FellmError::Tokenization("missing for-loop variable".to_string()));
+    let vars: Vec<String> = var
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if vars.is_empty() {
+        return Err(FellmError::Tokenization(
+            "missing for-loop variable".to_string(),
+        ));
     }
-    Ok((var.to_string(), expr.trim().to_string()))
+    Ok((vars, expr.trim().to_string()))
 }
 
 fn parse_set(rest: &str) -> Result<(&str, &str)> {
@@ -641,19 +750,46 @@ fn parse_set(rest: &str) -> Result<(&str, &str)> {
     Ok((name, expr))
 }
 
+fn parse_macro_header(rest: &str) -> Result<(String, Vec<String>)> {
+    let rest = rest.trim();
+    let Some((name, args)) = parse_function_call(rest) else {
+        return Err(FellmError::Tokenization("bad macro header".to_string()));
+    };
+    let params = split_args(args)
+        .into_iter()
+        .map(|arg| arg.split('=').next().unwrap_or(arg).trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    Ok((name.to_string(), params))
+}
+
 fn render_for_loop(
     tokens: &[Tok],
     env: &mut Env,
     out: &mut String,
     body_start: usize,
     body_end: usize,
-    var: &str,
+    vars: &[String],
     items: Vec<Value>,
 ) -> Result<()> {
     let len = items.len();
     for (idx, item) in items.into_iter().enumerate() {
         env.push();
-        env.set_local(var, item);
+        if vars.len() == 1 {
+            env.set_local(&vars[0], item);
+        } else if let Value::List(parts) = item {
+            for (vi, var) in vars.iter().enumerate() {
+                env.set_local(var, parts.get(vi).cloned().unwrap_or(Value::None));
+            }
+        } else {
+            for (vi, var) in vars.iter().enumerate() {
+                if vi == 0 {
+                    env.set_local(var, item.clone());
+                } else {
+                    env.set_local(var, Value::None);
+                }
+            }
+        }
 
         let mut loop_map = BTreeMap::new();
         loop_map.insert("index0".to_string(), Value::Int(idx as i64));
@@ -666,6 +802,36 @@ fn render_for_loop(
         env.pop();
     }
     Ok(())
+}
+
+fn call_macro(env: &Env, name: &str, args: &str) -> Result<Value> {
+    let Some(macro_def) = env.macros.get(name).cloned() else {
+        return Ok(Value::None);
+    };
+
+    let arg_values: Vec<Value> = split_args(args)
+        .into_iter()
+        .map(|arg| {
+            let expr = arg
+                .split_once('=')
+                .map(|(_, v)| v.trim())
+                .unwrap_or(arg.trim());
+            eval_expr(expr, env)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut child = Env {
+        scopes: env.scopes.clone(),
+        macros: env.macros.clone(),
+    };
+    child.push();
+    for (idx, param) in macro_def.params.iter().enumerate() {
+        child.set_local(param, arg_values.get(idx).cloned().unwrap_or(Value::None));
+    }
+
+    let mut out = String::new();
+    render_tokens(&macro_def.body, &mut child, &mut out, 0)?;
+    Ok(Value::String(out))
 }
 
 // ---------- Expression evaluator ----------
@@ -705,62 +871,185 @@ fn eval_not(src: &str, env: &Env) -> Result<Value> {
     if let Some(rest) = strip_word_prefix(src, "not") {
         return Ok(Value::Bool(!eval_not(rest.trim(), env)?.is_truthy()));
     }
+    eval_ternary(src, env)
+}
+
+fn eval_ternary(src: &str, env: &Env) -> Result<Value> {
+    // Jinja: `true_val if condition else false_val`
+    if let Some((before_else, false_val)) = split_top_word(src, "else") {
+        if let Some((true_val, condition)) = split_top_word(before_else.trim(), "if") {
+            if eval_bool(condition.trim(), env)? {
+                return eval_compare(true_val.trim(), env);
+            }
+            return eval_compare(false_val.trim(), env);
+        }
+    }
     eval_compare(src, env)
 }
 
 fn eval_compare(src: &str, env: &Env) -> Result<Value> {
     if let Some((expr, test)) = split_top_words(src, &["is", "not", "defined"]) {
         let _ = expr;
-        return Ok(Value::Bool(!env.path_defined(src[..src.len() - test.len()].trim())));
+        return Ok(Value::Bool(
+            !env.path_defined(src[..src.len() - test.len()].trim()),
+        ));
     }
     if let Some((expr, _test)) = split_top_words(src, &["is", "defined"]) {
         return Ok(Value::Bool(env.path_defined(expr.trim())));
     }
     if let Some((expr, test)) = split_top_words(src, &["is", "not", "none"]) {
         let _ = test;
-        return Ok(Value::Bool(!matches!(eval_concat(expr.trim(), env)?, Value::None)));
+        return Ok(Value::Bool(!matches!(
+            eval_addsub(expr.trim(), env)?,
+            Value::None
+        )));
     }
     if let Some((expr, _test)) = split_top_words(src, &["is", "none"]) {
-        return Ok(Value::Bool(matches!(eval_concat(expr.trim(), env)?, Value::None)));
+        return Ok(Value::Bool(matches!(
+            eval_addsub(expr.trim(), env)?,
+            Value::None
+        )));
+    }
+    if let Some((expr, test)) = split_top_words(src, &["is", "not", "string"]) {
+        let _ = test;
+        return Ok(Value::Bool(!matches!(
+            eval_addsub(expr.trim(), env)?,
+            Value::String(_)
+        )));
+    }
+    if let Some((expr, _test)) = split_top_words(src, &["is", "string"]) {
+        return Ok(Value::Bool(matches!(
+            eval_addsub(expr.trim(), env)?,
+            Value::String(_)
+        )));
     }
     if let Some((expr, _test)) = split_top_words(src, &["is", "mapping"]) {
-        return Ok(Value::Bool(matches!(eval_concat(expr.trim(), env)?, Value::Map(_))));
+        return Ok(Value::Bool(matches!(
+            eval_addsub(expr.trim(), env)?,
+            Value::Map(_)
+        )));
     }
     if let Some((expr, _test)) = split_top_words(src, &["is", "iterable"]) {
         return Ok(Value::Bool(matches!(
-            eval_concat(expr.trim(), env)?,
+            eval_addsub(expr.trim(), env)?,
             Value::String(_) | Value::List(_) | Value::Map(_)
         )));
     }
     if let Some((left, right)) = split_top_word(src, "in") {
-        let needle = eval_concat(left.trim(), env)?;
-        let haystack = eval_concat(right.trim(), env)?;
+        let needle = eval_addsub(left.trim(), env)?;
+        let haystack = eval_addsub(right.trim(), env)?;
         return Ok(Value::Bool(value_contains(&haystack, &needle)));
     }
     if let Some((left, right)) = split_top_op(src, "==") {
         return Ok(Value::Bool(
-            eval_concat(left.trim(), env)? == eval_concat(right.trim(), env)?,
+            eval_addsub(left.trim(), env)? == eval_addsub(right.trim(), env)?,
         ));
     }
     if let Some((left, right)) = split_top_op(src, "!=") {
         return Ok(Value::Bool(
-            eval_concat(left.trim(), env)? != eval_concat(right.trim(), env)?,
+            eval_addsub(left.trim(), env)? != eval_addsub(right.trim(), env)?,
         ));
     }
-    eval_concat(src, env)
+    eval_addsub(src, env)
 }
 
-fn eval_concat(src: &str, env: &Env) -> Result<Value> {
-    let parts = split_all_top_op(src, "+");
-    if parts.len() == 1 {
-        return eval_filter(parts[0].trim(), env);
+fn eval_addsub(src: &str, env: &Env) -> Result<Value> {
+    let terms = split_addsub_terms(src);
+    if terms.is_empty() {
+        return Ok(Value::None);
     }
+    let mut acc = eval_filter(terms[0].1.trim(), env)?;
+    for &(op, term) in &terms[1..] {
+        let right = eval_filter(term.trim(), env)?;
+        acc = match (op, acc, right) {
+            ('+', Value::List(mut left), Value::List(right)) => {
+                left.extend(right);
+                Value::List(left)
+            }
+            ('+', Value::List(mut left), right) => {
+                left.push(right);
+                Value::List(left)
+            }
+            ('+', Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+            ('-', Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+            ('+', left, right) => Value::String(left.as_output() + &right.as_output()),
+            ('-', left, right) => {
+                if let (Ok(a), Ok(b)) = (
+                    left.as_output().parse::<i64>(),
+                    right.as_output().parse::<i64>(),
+                ) {
+                    Value::Int(a - b)
+                } else {
+                    Value::None
+                }
+            }
+            _ => Value::None,
+        };
+    }
+    Ok(acc)
+}
 
-    let mut out = String::new();
-    for part in parts {
-        out.push_str(&eval_filter(part.trim(), env)?.as_output());
+fn split_addsub_terms(src: &str) -> Vec<(char, &str)> {
+    let bytes = src.as_bytes();
+    let mut terms = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut pending_op = '+';
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && (in_single || in_double) {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            match b {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'+' | b'-' if depth == 0 => {
+                    let is_unary = {
+                        let before = src[..i].trim_end();
+                        before.is_empty()
+                            || before.as_bytes().last().is_some_and(|c| {
+                                matches!(
+                                    c,
+                                    b'+' | b'-' | b'*' | b'/' | b'(' | b'[' | b',' | b'=' | b'|'
+                                )
+                            })
+                    };
+                    if !is_unary {
+                        terms.push((pending_op, &src[start..i]));
+                        pending_op = b as char;
+                        start = i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
     }
-    Ok(Value::String(out))
+    terms.push((pending_op, &src[start..]));
+    terms
 }
 
 fn eval_filter(src: &str, env: &Env) -> Result<Value> {
@@ -777,6 +1066,38 @@ fn eval_filter(src: &str, env: &Env) -> Result<Value> {
         value = match name {
             "trim" => Value::String(value.as_output().trim().to_string()),
             "length" => Value::Int(value_length(&value)),
+            "string" => Value::String(value.as_output()),
+            "join" => {
+                let sep = args
+                    .and_then(first_arg)
+                    .map(|arg| eval_expr(arg.trim(), env))
+                    .transpose()?
+                    .unwrap_or_else(|| Value::String(String::new()))
+                    .as_output();
+                match value {
+                    Value::List(items) => Value::String(
+                        items
+                            .iter()
+                            .map(Value::as_output)
+                            .collect::<Vec<_>>()
+                            .join(&sep),
+                    ),
+                    other => Value::String(other.as_output()),
+                }
+            }
+            "default" => {
+                let default_val = args
+                    .and_then(first_arg)
+                    .map(|arg| eval_expr(arg.trim(), env))
+                    .transpose()?
+                    .unwrap_or(Value::None);
+                let use_default = match &value {
+                    Value::None => true,
+                    Value::String(s) if s.is_empty() => true,
+                    _ => false,
+                };
+                if use_default { default_val } else { value }
+            }
             "tojson" => {
                 let indent = parse_indent_arg(args, env)?;
                 Value::String(to_json(&value, indent))
@@ -813,11 +1134,65 @@ fn eval_atom(src: &str, env: &Env) -> Result<Value> {
     if let Ok(value) = src.parse::<i64>() {
         return Ok(Value::Int(value));
     }
+    if src.starts_with('[') && src.ends_with(']') && matching_outer_brackets(src) {
+        return eval_list_literal(&src[1..src.len() - 1], env);
+    }
     if let Some((name, args)) = parse_function_call(src) {
         return eval_function_call(name, args, env);
     }
 
-    Ok(eval_path(src, env))
+    eval_path(src, env)
+}
+
+fn eval_list_literal(args: &str, env: &Env) -> Result<Value> {
+    let items = split_args(args)
+        .into_iter()
+        .map(|arg| eval_expr(arg, env))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::List(items))
+}
+
+fn matching_outer_brackets(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, b) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' && (in_single || in_double) {
+            escaped = true;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 && idx != bytes.len() - 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn eval_function_call(name: &str, args: &str, env: &Env) -> Result<Value> {
@@ -838,29 +1213,113 @@ fn eval_function_call(name: &str, args: &str, env: &Env) -> Result<Value> {
                 .as_output();
             Ok(Value::String(strftime_now_utc(&fmt)))
         }
+        "namespace" => {
+            let mut map = BTreeMap::new();
+            for arg in split_args(args) {
+                let Some((key, value)) = arg.split_once('=') else {
+                    continue;
+                };
+                map.insert(key.trim().to_string(), eval_expr(value.trim(), env)?);
+            }
+            Ok(Value::Map(map))
+        }
+        _ if env.macros.contains_key(name) => call_macro(env, name, args),
         _ => Ok(Value::None),
     }
 }
 
-fn eval_path(src: &str, env: &Env) -> Value {
+fn eval_path(src: &str, env: &Env) -> Result<Value> {
     let mut parser = PathParser::new(src);
     let Some(first) = parser.parse_identifier() else {
-        return Value::None;
+        return Ok(Value::None);
     };
     let mut cur = env.get(&first);
 
     while let Some(op) = parser.parse_path_op() {
         cur = match op {
-            PathOp::Member(name) | PathOp::Key(name) => cur.get_member(&name).unwrap_or(Value::None),
-            PathOp::Index(index) => cur.get_index(index).unwrap_or(Value::None),
-            PathOp::Slice { start, end } => cur.slice(start, end),
+            PathOp::Member(name) => cur.get_member(&name).unwrap_or(Value::None),
+            PathOp::Bracket(inner) => eval_bracket(&cur, &inner, env)?,
+            PathOp::Call { name, args } => call_method(&cur, &name, &args, env)?,
         };
     }
 
     if parser.remaining_is_blank() {
-        cur
+        Ok(cur)
     } else {
-        Value::None
+        Ok(Value::None)
+    }
+}
+
+fn eval_bracket(cur: &Value, inner: &str, env: &Env) -> Result<Value> {
+    let inner = inner.trim();
+    if let Some(key) = parse_string_literal(inner) {
+        return Ok(cur.get_member(&key).unwrap_or(Value::None));
+    }
+    if let Some((start, end)) = inner.split_once(':') {
+        let start = if start.trim().is_empty() {
+            None
+        } else {
+            Some(eval_to_i64(start.trim(), env)?)
+        };
+        let end = if end.trim().is_empty() {
+            None
+        } else {
+            Some(eval_to_i64(end.trim(), env)?)
+        };
+        return Ok(cur.slice(start, end));
+    }
+    let idx = eval_to_i64(inner, env)?;
+    Ok(cur.get_index(idx).unwrap_or(Value::None))
+}
+
+fn eval_to_i64(src: &str, env: &Env) -> Result<i64> {
+    match eval_expr(src, env)? {
+        Value::Int(i) => Ok(i),
+        Value::String(s) => s
+            .parse::<i64>()
+            .map_err(|_| FellmError::Tokenization(format!("expected integer, got {s}"))),
+        other => Err(FellmError::Tokenization(format!(
+            "expected integer, got {other:?}"
+        ))),
+    }
+}
+
+fn call_method(recv: &Value, name: &str, args: &str, env: &Env) -> Result<Value> {
+    match (recv, name) {
+        (Value::Map(map), "get") => {
+            let key = first_arg(args)
+                .map(|arg| eval_expr(arg.trim(), env))
+                .transpose()?
+                .unwrap_or(Value::None)
+                .as_output();
+            Ok(map.get(&key).cloned().unwrap_or(Value::None))
+        }
+        (Value::Map(map), "items") => Ok(Value::List(
+            map.iter()
+                .map(|(k, v)| Value::List(vec![Value::String(k.clone()), v.clone()]))
+                .collect(),
+        )),
+        (Value::String(s), "endswith") => {
+            let suffix = first_arg(args)
+                .map(|arg| eval_expr(arg.trim(), env))
+                .transpose()?
+                .unwrap_or_else(|| Value::String(String::new()))
+                .as_output();
+            Ok(Value::Bool(s.ends_with(&suffix)))
+        }
+        (Value::String(s), "split") => {
+            let sep = first_arg(args)
+                .map(|arg| eval_expr(arg.trim(), env))
+                .transpose()?
+                .unwrap_or_else(|| Value::String(String::new()))
+                .as_output();
+            Ok(Value::List(
+                s.split(&sep)
+                    .map(|part| Value::String(part.to_string()))
+                    .collect(),
+            ))
+        }
+        _ => Ok(Value::None),
     }
 }
 
@@ -887,9 +1346,8 @@ fn value_length(value: &Value) -> i64 {
 #[derive(Debug)]
 enum PathOp {
     Member(String),
-    Key(String),
-    Index(i64),
-    Slice { start: Option<i64>, end: Option<i64> },
+    Bracket(String),
+    Call { name: String, args: String },
 }
 
 struct PathParser<'a> {
@@ -922,7 +1380,14 @@ impl<'a> PathParser<'a> {
         match b {
             b'.' => {
                 self.pos += 1;
-                self.parse_identifier().map(PathOp::Member)
+                let name = self.parse_identifier()?;
+                self.skip_ws();
+                if self.src.as_bytes().get(self.pos) == Some(&b'(') {
+                    let args = self.parse_paren_args()?;
+                    Some(PathOp::Call { name, args })
+                } else {
+                    Some(PathOp::Member(name))
+                }
             }
             b'[' => self.parse_bracket(),
             _ => None,
@@ -932,6 +1397,7 @@ impl<'a> PathParser<'a> {
     fn parse_bracket(&mut self) -> Option<PathOp> {
         self.pos += 1;
         let start = self.pos;
+        let mut depth = 1i32;
         let mut in_single = false;
         let mut in_double = false;
         let mut escaped = false;
@@ -951,10 +1417,64 @@ impl<'a> PathParser<'a> {
                 in_single = !in_single;
             } else if b == b'"' && !in_single {
                 in_double = !in_double;
-            } else if b == b']' && !in_single && !in_double {
-                let inner = self.src[start..self.pos].trim();
+            } else if !in_single && !in_double {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let inner = self.src[start..self.pos].trim().to_string();
+                            self.pos += 1;
+                            return Some(PathOp::Bracket(inner));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.pos += 1;
+        }
+        None
+    }
+
+    fn parse_paren_args(&mut self) -> Option<String> {
+        if self.src.as_bytes().get(self.pos) != Some(&b'(') {
+            return None;
+        }
+        self.pos += 1;
+        let start = self.pos;
+        let mut depth = 1i32;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+        while self.pos < self.src.len() {
+            let b = self.src.as_bytes()[self.pos];
+            if escaped {
+                escaped = false;
                 self.pos += 1;
-                return parse_bracket_inner(inner);
+                continue;
+            }
+            if b == b'\\' && (in_single || in_double) {
+                escaped = true;
+                self.pos += 1;
+                continue;
+            }
+            if b == b'\'' && !in_double {
+                in_single = !in_single;
+            } else if b == b'"' && !in_single {
+                in_double = !in_double;
+            } else if !in_single && !in_double {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let args = self.src[start..self.pos].to_string();
+                            self.pos += 1;
+                            return Some(args);
+                        }
+                    }
+                    _ => {}
+                }
             }
             self.pos += 1;
         }
@@ -975,26 +1495,6 @@ impl<'a> PathParser<'a> {
         {
             self.pos += 1;
         }
-    }
-}
-
-fn parse_bracket_inner(inner: &str) -> Option<PathOp> {
-    if let Some(key) = parse_string_literal(inner) {
-        return Some(PathOp::Key(key));
-    }
-    if let Some((start, end)) = inner.split_once(':') {
-        let start = parse_optional_i64(start.trim())?;
-        let end = parse_optional_i64(end.trim())?;
-        return Some(PathOp::Slice { start, end });
-    }
-    inner.parse::<i64>().ok().map(PathOp::Index)
-}
-
-fn parse_optional_i64(src: &str) -> Option<Option<i64>> {
-    if src.is_empty() {
-        Some(None)
-    } else {
-        src.parse::<i64>().ok().map(Some)
     }
 }
 
@@ -1281,11 +1781,7 @@ fn parse_function_call(src: &str) -> Option<(&str, &str)> {
         return None;
     }
     let name = src[..open].trim();
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return None;
     }
     Some((name, &src[open + 1..src.len() - 1]))
@@ -1530,7 +2026,9 @@ impl<'a> JsonParser<'a> {
             }
             self.pos += 1;
         }
-        Err(FellmError::Tokenization("unterminated JSON string".to_string()))
+        Err(FellmError::Tokenization(
+            "unterminated JSON string".to_string(),
+        ))
     }
 
     fn parse_number(&mut self) -> Result<Value> {
@@ -1542,10 +2040,9 @@ impl<'a> JsonParser<'a> {
             self.pos += 1;
         }
         if self.peek() == Some(b'.') {
-            while self
-                .peek()
-                .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
-            {
+            while self.peek().is_some_and(|b| {
+                b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')
+            }) {
                 self.pos += 1;
             }
             return Ok(Value::String(self.src[start..self.pos].to_string()));
@@ -1834,8 +2331,96 @@ mod tests {
             tools: Vec::new(),
         };
 
-        let out = render("{{ 'A' + messages[0].content | trim + 'B' }} {{ messages|length }}", &ctx)
-            .unwrap();
+        let out = render(
+            "{{ 'A' + messages[0].content | trim + 'B' }} {{ messages|length }}",
+            &ctx,
+        )
+        .unwrap();
         assert_eq!(out, "AhiB 1");
+    }
+
+    fn lfm2_template() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/chat_template_lfm2.jinja");
+        if let Ok(tmpl) = std::fs::read_to_string(&path) {
+            return tmpl;
+        }
+        // Essential subset covering macros, namespace, .get(), generation, default.
+        r#"{{- bos_token -}}
+{%- set preserve_thinking = preserve_thinking | default(false) -%}
+{%- macro parse_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- else -%}
+        {{- content | string -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro render_tool_calls(tool_calls) -%}
+    {{- "<|tool_call_start|>[]<|tool_call_end|>" -}}
+{%- endmacro -%}
+{%- set ns = namespace(system_prompt="", last_user_index=-1) -%}
+{%- if messages[0]["role"] == "system" -%}
+    {%- if messages[0].get("content") -%}
+        {%- set ns.system_prompt = parse_content(messages[0]["content"]) -%}
+    {%- endif -%}
+    {%- set messages = messages[1:] -%}
+{%- endif -%}
+{%- for message in messages -%}
+    {{- "<|im_start|>" + message.role + "\n" -}}
+    {%- if message.role == "assistant" -%}
+        {%- generation -%}
+        {%- if message.content is defined -%}
+            {{- parse_content(message.content) -}}
+        {%- endif -%}
+        {%- if message.tool_calls is defined -%}
+            {{- render_tool_calls(message.tool_calls) -}}
+        {%- endif -%}
+        {{- "<|im_end|>\n" -}}
+        {%- endgeneration -%}
+    {%- else %}
+        {%- if message.get("content") -%}
+            {{- parse_content(message["content"]) -}}
+        {%- endif -%}
+        {{- "<|im_end|>\n" -}}
+    {%- endif %}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- "<|im_start|>assistant\n" -}}
+{%- endif -%}"#
+            .to_string()
+    }
+
+    #[test]
+    fn renders_lfm2_chat_template_user_message() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "bos_token".to_string(),
+            Value::String("<|startoftext|>".to_string()),
+        );
+        let ctx = TemplateContext {
+            messages: vec![Message::text("user", "who are you")],
+            add_generation_prompt: true,
+            vars,
+            tools: Vec::new(),
+        };
+
+        let out = render(&lfm2_template(), &ctx).unwrap();
+        assert!(
+            out.contains("who are you"),
+            "missing user content in:\n{out}"
+        );
+        assert!(
+            out.contains("<|im_start|>user"),
+            "missing user header in:\n{out}"
+        );
+        assert!(
+            !out.contains("<|tool_call_start|>[]"),
+            "macro body leaked tool-call junk:\n{out}"
+        );
+        assert!(
+            out.ends_with("<|im_start|>assistant\n"),
+            "missing generation prompt ending:\n{out}"
+        );
+        assert!(out.starts_with("<|startoftext|>"), "missing bos:\n{out}");
     }
 }

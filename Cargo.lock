@@ -110,6 +110,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arch-lfm2moe"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fellm-core",
+ "fellm-gguf",
+ "fellm-graph",
+ "fellm-plugin-abi",
+ "tracing",
+]
+
+[[package]]
 name = "arch-llama"
 version = "0.1.0"
 dependencies = [
@@ -550,6 +562,7 @@ dependencies = [
 name = "fellm-runtime"
 version = "0.1.0"
 dependencies = [
+ "arch-lfm2moe",
  "arch-llama",
  "backend-cpu",
  "bytemuck",

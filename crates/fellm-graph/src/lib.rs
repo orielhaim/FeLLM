@@ -1,7 +1,3 @@
-//! Operator DAG built on `petgraph::StableGraph`.
-
-#![deny(missing_docs)]
-
 pub mod builder;
 pub mod graph;
 pub mod plan;
