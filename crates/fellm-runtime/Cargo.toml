@@ -26,6 +26,7 @@ rayon.workspace = true
 bytemuck.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+half.workspace = true
 
 [lints]
 workspace = true

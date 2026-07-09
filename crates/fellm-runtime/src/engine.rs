@@ -1,7 +1,8 @@
 //! The Engine: the top-level user-facing API.
 
 use crate::backend_select::{BackendPreference, BackendSelect};
-use crate::executor::GraphExecutor;
+use crate::compiled::CompiledStep;
+use crate::executor::MutableBinding;
 use crate::hybrid_state::HybridConvState;
 use crate::kv_cache::KvCache;
 use crate::paged::{CacheManager, SequenceCache};
@@ -300,6 +301,8 @@ struct LoadedModel {
     step_graph: Graph,
     step_plan: ExecutionPlan,
     bindings: StepBindings,
+    /// Compiled step schedule, built once on first step and reused.
+    compiled: Option<CompiledStep>,
 }
 
 impl Engine {
@@ -340,10 +343,13 @@ impl Engine {
             "context / batch settings"
         );
 
-        let model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx)?;
+        let mut model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx)?;
 
         let backend = settings.backend.resolve()?;
         tracing::info!(backend = backend.id(), "compute backend ready");
+
+        // Compile the reusable step schedule once now that the backend is known.
+        model.compile_step(backend.as_ref())?;
 
         Ok(Self {
             gguf,
@@ -368,6 +374,10 @@ impl Engine {
     ) -> Result<Self> {
         let mut eng = Self::open_with(path, settings.backend_preference(BackendPreference::Cpu))?;
         eng.backend = backend;
+        // The step was compiled against the default backend; recompile so kernel
+        // handles match the injected one.
+        eng.model.compiled = None;
+        eng.model.compile_step(eng.backend.as_ref())?;
         Ok(eng)
     }
 
@@ -495,15 +505,18 @@ impl Engine {
         let gen_start = Instant::now();
         let mut logits: Option<Tensor> = None;
         let mut pos = 0usize;
+        let n_prompt = ids.len();
 
-        while pos < ids.len() {
-            let scheduled = (ids.len() - pos).min(n_batch);
+        while pos < n_prompt {
+            let scheduled = (n_prompt - pos).min(n_batch);
             let mut done = 0usize;
             while done < scheduled {
                 let chunk = (scheduled - done).min(n_ubatch);
                 for i in 0..chunk {
                     let abs = pos + done + i;
-                    logits = Some(self.step(ids[abs], abs)?);
+                    // Only the last prompt token needs lm_head / logits.
+                    let need_logits = abs + 1 == n_prompt;
+                    logits = Some(self.step(ids[abs], abs, need_logits)?);
                 }
                 done += chunk;
             }
@@ -512,7 +525,7 @@ impl Engine {
 
         let prompt_elapsed = gen_start.elapsed();
         let last_logits = logits.ok_or_else(|| FellmError::other("empty prompt"))?;
-        let start_pos = ids.len();
+        let start_pos = n_prompt;
 
         Ok(TokenStream {
             engine: self,
@@ -561,8 +574,12 @@ impl Engine {
     }
 
     /// One forward step for token id `tok` at position `pos`.
-    fn step(&mut self, tok: u32, pos: usize) -> Result<Tensor> {
-        self.model.step(self.backend.as_ref(), tok, pos)
+    ///
+    /// When `compute_logits` is false, `final_norm` + `lm_head` are skipped
+    /// (prefill mid-tokens still write KV / conv state).
+    fn step(&mut self, tok: u32, pos: usize, compute_logits: bool) -> Result<Tensor> {
+        self.model
+            .step(self.backend.as_ref(), tok, pos, compute_logits)
     }
 
     /// Free blocks remaining in the physical pool.
@@ -652,10 +669,13 @@ impl Engine {
         seq_cache: &mut SequenceCache,
         tok: u32,
         pos: usize,
+        compute_logits: bool,
     ) -> Result<Tensor> {
         // Temporarily swap active seq.
         std::mem::swap(&mut self.model.seq, seq_cache);
-        let result = self.model.step(self.backend.as_ref(), tok, pos);
+        let result = self
+            .model
+            .step(self.backend.as_ref(), tok, pos, compute_logits);
         std::mem::swap(&mut self.model.seq, seq_cache);
         result
     }
@@ -714,78 +734,33 @@ impl LoadedModel {
             step_graph,
             step_plan,
             bindings,
+            compiled: None,
         })
     }
 
-    fn reset(&mut self) {
-        self.cache.release_sequence(&mut self.seq);
-        self.seq = self.cache.new_sequence(self.max_seq);
-        if let Some(c) = &mut self.conv {
-            c.reset();
+    /// Build the reusable [`CompiledStep`] once (resolves kernels + preallocates
+    /// buffers). Idempotent: does nothing if already compiled.
+    fn compile_step(&mut self, backend: &dyn Backend) -> Result<()> {
+        if self.compiled.is_some() {
+            return Ok(());
         }
-    }
-
-    fn step(&mut self, backend: &dyn Backend, tok: u32, pos: usize) -> Result<Tensor> {
-        self.cache.ensure_writable(&mut self.seq, pos)?;
-        self.cache.tick();
-
-        let n_logical = self.seq.table(0).num_blocks().max(1);
-        let block_table = self.seq.flatten_block_tables();
-        let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
-        set_paged_context(Some(PagedKvContext {
-            arena: arena_ptr,
-            arena_len,
-            block_table,
-            n_logical_blocks: n_logical,
-            n_layers: self.cache.pool.n_layers(),
-            tokens_stride: self.cache.pool.tokens_stride(),
-            block_bytes: self.cache.pool.block_bytes(),
-            block_size: crate::paged::BLOCK_SIZE,
-        }));
-
-        let result = self.step_inner(backend, tok, pos);
-        set_paged_context(None);
-        result
-    }
-
-    fn step_inner(&mut self, backend: &dyn Backend, tok: u32, pos: usize) -> Result<Tensor> {
-        let pos_u32 = pos as u32;
-        let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, backend);
-
-        for &id in &self.bindings.rope {
-            let mut a = self.step_graph.node(id).attrs;
-            a.position = pos_u32;
-            exec.set_attrs(id, a);
-        }
-        for &id in &self.bindings.kv_write {
-            let mut a = self.step_graph.node(id).attrs;
-            a.position = pos_u32;
-            a.block_size = 16;
-            exec.set_attrs(id, a);
-        }
-        for &id in &self.bindings.attention {
-            let mut a = self.step_graph.node(id).attrs;
-            a.past_len = pos_u32;
-            a.block_size = 16;
-            exec.set_attrs(id, a);
-        }
-
-        exec.bind_input("token_id", scalar_u32_tensor(tok));
+        let mut mutable_inputs: std::collections::HashMap<String, MutableBinding> =
+            std::collections::HashMap::new();
 
         let dim = self.dummy_kv.tokens_stride;
         let shape = Shape::new(&[self.dummy_kv.max_seq as u64, dim as u64])?;
         for layer in 0..self.spec.n_attn_layers() {
-            exec.bind_mutable(
+            mutable_inputs.insert(
                 format!("k_in_{layer}"),
-                crate::executor::MutableBinding {
+                MutableBinding {
                     dtype: DType::F32,
                     shape: shape.clone(),
                     buffer: self.dummy_kv.k_buffer(layer),
                 },
             );
-            exec.bind_mutable(
+            mutable_inputs.insert(
                 format!("v_in_{layer}"),
-                crate::executor::MutableBinding {
+                MutableBinding {
                     dtype: DType::F32,
                     shape: shape.clone(),
                     buffer: self.dummy_kv.v_buffer(layer),
@@ -796,9 +771,9 @@ impl LoadedModel {
         if let Some(state) = &self.conv {
             let conv_shape = Shape::new(&[state.conv_elements() as u64])?;
             for conv_ord in 0..state.conv_layer_ids.len() {
-                exec.bind_mutable(
+                mutable_inputs.insert(
                     format!("conv_in_{conv_ord}"),
-                    crate::executor::MutableBinding {
+                    MutableBinding {
                         dtype: DType::F32,
                         shape: conv_shape.clone(),
                         buffer: state.conv_buffer(conv_ord),
@@ -807,10 +782,87 @@ impl LoadedModel {
             }
         }
 
-        let outs = exec.run()?;
-        outs.get("logits")
-            .cloned()
-            .ok_or_else(|| FellmError::other("no logits output"))
+        let compiled =
+            CompiledStep::compile(&self.step_graph, &self.step_plan, backend, &mutable_inputs)?;
+        self.compiled = Some(compiled);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.cache.release_sequence(&mut self.seq);
+        self.seq = self.cache.new_sequence(self.max_seq);
+        if let Some(c) = &mut self.conv {
+            c.reset();
+        }
+    }
+
+    fn step(
+        &mut self,
+        backend: &dyn Backend,
+        tok: u32,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<Tensor> {
+        self.cache.ensure_writable(&mut self.seq, pos)?;
+        self.cache.tick();
+
+        let n_logical = self.seq.table(0).num_blocks().max(1);
+        let block_table = self.seq.flatten_block_tables();
+        let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
+        set_paged_context(Some(PagedKvContext {
+            arena: arena_ptr,
+            arena_len,
+            block_table: std::sync::Arc::<[u32]>::from(block_table),
+            n_logical_blocks: n_logical,
+            n_layers: self.cache.pool.n_layers(),
+            tokens_stride: self.cache.pool.tokens_stride(),
+            block_bytes: self.cache.pool.block_bytes(),
+            block_size: crate::paged::BLOCK_SIZE,
+            elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
+        }));
+
+        let result = self.step_inner(backend, tok, pos, compute_logits);
+        set_paged_context(None);
+        result
+    }
+
+    fn step_inner(
+        &mut self,
+        backend: &dyn Backend,
+        tok: u32,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<Tensor> {
+        self.compile_step(backend)?;
+        let pos_u32 = pos as u32;
+
+        // Patch per-token attribute overrides into the compiled schedule, then
+        // bind the token id and run. Buffers / kernels are already resolved.
+        let step = self
+            .compiled
+            .as_mut()
+            .ok_or_else(|| FellmError::other("step not compiled"))?;
+
+        for &id in &self.bindings.rope {
+            let mut a = self.step_graph.node(id).attrs;
+            a.position = pos_u32;
+            step.set_attrs(id, a);
+        }
+        for &id in &self.bindings.kv_write {
+            let mut a = self.step_graph.node(id).attrs;
+            a.position = pos_u32;
+            a.block_size = 16;
+            step.set_attrs(id, a);
+        }
+        for &id in &self.bindings.attention {
+            let mut a = self.step_graph.node(id).attrs;
+            a.past_len = pos_u32;
+            a.block_size = 16;
+            step.set_attrs(id, a);
+        }
+
+        step.bind_input("token_id", scalar_u32_tensor(tok));
+        step.run(backend, compute_logits)
     }
 
     /// Access the shared cache manager (scheduler / multi-seq).
@@ -881,21 +933,35 @@ impl<'a> Iterator for TokenStream<'a> {
             return None;
         }
         let logits_tensor = self.pending_logits.take()?;
-        let logits: &[f32] = match logits_tensor.as_slice::<f32>() {
-            Ok(s) => s,
-            Err(e) => {
-                self.finished = true;
-                return Some(Err(e));
+        let mut logits_owned = logits_tensor;
+        let tok = match logits_owned.as_mut_slice::<f32>() {
+            Ok(work) => sampling::sample(
+                work,
+                self.params.temperature,
+                self.params.top_k,
+                self.params.top_p,
+                self.params.seed.wrapping_add(u64::from(self.emitted)),
+            ),
+            Err(_) => {
+                // Fallback if storage is shared / non-owned (should not happen
+                // on the compiled path).
+                let logits = match logits_owned.as_slice::<f32>() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.finished = true;
+                        return Some(Err(e));
+                    }
+                };
+                let mut work = logits.to_vec();
+                sampling::sample(
+                    &mut work,
+                    self.params.temperature,
+                    self.params.top_k,
+                    self.params.top_p,
+                    self.params.seed.wrapping_add(u64::from(self.emitted)),
+                )
             }
         };
-        let mut work = logits.to_vec();
-        let tok = sampling::sample(
-            &mut work,
-            self.params.temperature,
-            self.params.top_k,
-            self.params.top_p,
-            self.params.seed.wrapping_add(u64::from(self.emitted)),
-        );
         self.emitted += 1;
         self.stats.predicted_tokens = self.emitted;
 
@@ -912,7 +978,7 @@ impl<'a> Iterator for TokenStream<'a> {
         }
 
         if self.emitted < self.params.max_tokens && self.position + 1 < self.engine.model.max_seq {
-            match self.engine.step(tok, self.position) {
+            match self.engine.step(tok, self.position, true) {
                 Ok(next) => {
                     self.pending_logits = Some(next);
                     self.position += 1;

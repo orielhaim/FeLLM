@@ -9,3 +9,5 @@ license.workspace = true
 fellm-core.workspace = true
 abi_stable.workspace = true
 thiserror.workspace = true
+half.workspace = true
+bytemuck.workspace = true

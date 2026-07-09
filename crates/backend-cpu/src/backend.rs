@@ -194,8 +194,8 @@ impl Backend for CpuBackend {
             OpKind::SiluGate => launch_silu_gate(inputs, outputs),
             OpKind::Softmax => launch_softmax(attrs, inputs, outputs),
             OpKind::Attention => launch_attention(self, attrs, inputs, outputs),
-            OpKind::Add => launch_add(inputs, outputs),
-            OpKind::Mul => launch_mul(inputs, outputs),
+            OpKind::Add => launch_add(inputs, outputs, &self.profile),
+            OpKind::Mul => launch_mul(inputs, outputs, &self.profile),
             OpKind::Reshape => launch_reshape(inputs, outputs),
             OpKind::Cast => launch_cast(attrs, inputs, outputs),
             OpKind::Concat => launch_concat(inputs, outputs),
@@ -450,7 +450,11 @@ fn launch_attention(
     Ok(())
 }
 
-fn launch_add(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+fn launch_add(
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+    profile: &CpuHardwareProfile,
+) -> Result<()> {
     if inputs.len() < 2 || outputs.is_empty() {
         return Err(FellmError::other("add: bad arity"));
     }
@@ -458,13 +462,15 @@ fn launch_add(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
     let a = as_f32_slice(&inputs[0])?;
     let b = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
-    for i in 0..y.len() {
-        y[i] = a[i] + b[i];
-    }
+    crate::kernels::simd_f32::add_f32(a, b, y, profile);
     Ok(())
 }
 
-fn launch_mul(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+fn launch_mul(
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+    profile: &CpuHardwareProfile,
+) -> Result<()> {
     if inputs.len() < 2 || outputs.is_empty() {
         return Err(FellmError::other("mul: bad arity"));
     }
@@ -472,9 +478,7 @@ fn launch_mul(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
     let a = as_f32_slice(&inputs[0])?;
     let b = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
-    for i in 0..y.len() {
-        y[i] = a[i] * b[i];
-    }
+    crate::kernels::simd_f32::mul_f32(a, b, y, profile);
     Ok(())
 }
 
@@ -634,7 +638,9 @@ fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorM
             }
             // SAFETY: runtime uniquely owns arena for this step.
             let dst = unsafe { ctx.row_mut(layer, pos, is_v) };
-            dst.copy_from_slice(row);
+            for (d, &s) in dst.iter_mut().zip(row.iter()) {
+                *d = half::f16::from_f32(s);
+            }
             Ok(())
         });
     }

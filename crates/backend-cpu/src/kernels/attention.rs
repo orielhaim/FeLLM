@@ -1,4 +1,5 @@
 use crate::cpu_profile::CpuHardwareProfile;
+use crate::kernels::simd_f32;
 use fellm_plugin_abi as paged_ctx;
 use rayon::prelude::*;
 
@@ -31,11 +32,11 @@ pub fn attention_step(
             let q_head = &q[h * head_dim..(h + 1) * head_dim];
             attention_head_tiled(
                 q_head, k_cache, v_cache, out_h, n_kv_heads, head_dim, seq, kv_h, scale, kv_tile,
+                profile,
             );
         });
 }
 
-/// PagedAttention: K/V rows resolved via [`PagedKvContext`] block tables.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_step_paged(
     q: &[f32],
@@ -54,29 +55,18 @@ pub fn attention_step_paged(
     let seq = past_len + 1;
     let heads_per_kv = n_heads / n_kv_heads;
     let kv_tile = profile.kv_tile_for(head_dim, seq);
+    let ctx = paged_ctx::snapshot_paged_context().expect("paged attention requires PagedKvContext");
+    debug_assert_eq!(ctx.tokens_stride, n_kv_heads * head_dim);
 
-    // Serial over heads when using thread-local paged ctx (Rayon would need Send ctx).
-    // For multi-head parallelism we gather rows into a contiguous scratch first.
-    let tokens_stride = n_kv_heads * head_dim;
-    let mut k_contig = vec![0.0f32; seq * tokens_stride];
-    let mut v_contig = vec![0.0f32; seq * tokens_stride];
-    paged_ctx::with_paged_context(|ctx| {
-        let ctx = ctx.expect("paged attention requires PagedKvContext");
-        for t in 0..seq {
-            // SAFETY: ctx arena valid for step; rows are tokens_stride.
-            let k_row = unsafe { ctx.k_row(layer, t) };
-            let v_row = unsafe { ctx.v_row(layer, t) };
-            let dst_k = &mut k_contig[t * tokens_stride..(t + 1) * tokens_stride];
-            let dst_v = &mut v_contig[t * tokens_stride..(t + 1) * tokens_stride];
-            dst_k.copy_from_slice(k_row);
-            dst_v.copy_from_slice(v_row);
-        }
-    });
-
-    attention_step(
-        q, &k_contig, &v_contig, out, n_heads, n_kv_heads, head_dim, past_len, scale, profile,
-    );
-    let _ = (heads_per_kv, kv_tile);
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(h, out_h)| {
+            let kv_h = h / heads_per_kv;
+            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+            attention_head_paged(
+                q_head, &ctx, out_h, head_dim, seq, kv_h, scale, kv_tile, layer, profile,
+            );
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,6 +81,7 @@ fn attention_head_tiled(
     kv_h: usize,
     scale: f32,
     kv_tile: usize,
+    profile: &CpuHardwareProfile,
 ) {
     let mut m = f32::NEG_INFINITY;
     let mut l = 0.0f32;
@@ -113,7 +104,7 @@ fn attention_head_tiled(
         // scores = Q · K_tile^T * scale
         for (i, t) in (tile_start..tile_end).enumerate() {
             let k_row = kv_row(k_cache, n_kv_heads, head_dim, t, kv_h);
-            scores[i] = dot(q_head, k_row) * scale;
+            scores[i] = simd_f32::dot_f32(q_head, k_row, profile) * scale;
         }
 
         // Online softmax update against this tile.
@@ -131,9 +122,7 @@ fn attention_head_tiled(
         };
 
         if alpha != 1.0 {
-            for o in out_h.iter_mut() {
-                *o *= alpha;
-            }
+            simd_f32::scale_f32(out_h, alpha, profile);
             l *= alpha;
         }
 
@@ -144,9 +133,7 @@ fn attention_head_tiled(
             l_tile += p;
             let t = tile_start + i;
             let v_row = kv_row(v_cache, n_kv_heads, head_dim, t, kv_h);
-            for d in 0..head_dim {
-                out_h[d] += p * v_row[d];
-            }
+            simd_f32::axpy_f32(out_h, v_row, p, profile);
         }
         l += l_tile;
         m = m_new;
@@ -154,10 +141,77 @@ fn attention_head_tiled(
     }
 
     if l > 0.0 {
-        let inv = 1.0 / l;
-        for o in out_h.iter_mut() {
-            *o *= inv;
+        simd_f32::scale_f32(out_h, 1.0 / l, profile);
+    }
+}
+
+/// Online-softmax tiled attention reading f16 K/V rows from the paged arena.
+#[allow(clippy::too_many_arguments)]
+fn attention_head_paged(
+    q_head: &[f32],
+    ctx: &paged_ctx::PagedKvContext,
+    out_h: &mut [f32],
+    head_dim: usize,
+    seq: usize,
+    kv_h: usize,
+    scale: f32,
+    kv_tile: usize,
+    layer: usize,
+    profile: &CpuHardwareProfile,
+) {
+    let mut m = f32::NEG_INFINITY;
+    let mut l = 0.0f32;
+    out_h.fill(0.0);
+
+    let mut scores = vec![0.0f32; kv_tile];
+    let mut tile_start = 0usize;
+    while tile_start < seq {
+        let tile_end = (tile_start + kv_tile).min(seq);
+        let tile_len = tile_end - tile_start;
+
+        for (i, t) in (tile_start..tile_end).enumerate() {
+            // SAFETY: arena valid for step; read-only during attention.
+            let k_full = unsafe { ctx.k_row(layer, t) };
+            let k_head = &k_full[kv_h * head_dim..(kv_h + 1) * head_dim];
+            scores[i] = simd_f32::dot_f32_f16(q_head, k_head, profile) * scale;
         }
+
+        let mut m_tile = f32::NEG_INFINITY;
+        for i in 0..tile_len {
+            if scores[i] > m_tile {
+                m_tile = scores[i];
+            }
+        }
+        let m_new = if m_tile > m { m_tile } else { m };
+        let alpha = if m.is_finite() {
+            (m - m_new).exp()
+        } else {
+            0.0
+        };
+
+        if alpha != 1.0 {
+            simd_f32::scale_f32(out_h, alpha, profile);
+            l *= alpha;
+        }
+
+        let mut l_tile = 0.0f32;
+        for i in 0..tile_len {
+            let p = (scores[i] - m_new).exp();
+            scores[i] = p;
+            l_tile += p;
+            let t = tile_start + i;
+            // SAFETY: same as K path.
+            let v_full = unsafe { ctx.v_row(layer, t) };
+            let v_head = &v_full[kv_h * head_dim..(kv_h + 1) * head_dim];
+            simd_f32::axpy_f32_f16(out_h, v_head, p, profile);
+        }
+        l += l_tile;
+        m = m_new;
+        tile_start = tile_end;
+    }
+
+    if l > 0.0 {
+        simd_f32::scale_f32(out_h, 1.0 / l, profile);
     }
 }
 
@@ -167,20 +221,15 @@ fn kv_row(cache: &[f32], n_kv_heads: usize, head_dim: usize, t: usize, kv_h: usi
     &cache[base..base + head_dim]
 }
 
+/// Scalar reference dot used by the naive test path.
+#[cfg(test)]
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     debug_assert_eq!(n, b.len());
     let mut s = 0.0f32;
-    let mut i = 0;
-    // 4-wide unroll; wide/SIMD can be layered later without changing numerics.
-    while i + 4 <= n {
-        s += a[i] * b[i] + a[i + 1] * b[i + 1] + a[i + 2] * b[i + 2] + a[i + 3] * b[i + 3];
-        i += 4;
-    }
-    while i < n {
+    for i in 0..n {
         s += a[i] * b[i];
-        i += 1;
     }
     s
 }
@@ -277,6 +326,9 @@ pub fn attention_step_naive(
 mod tests {
     use super::*;
     use crate::cpu_profile::CpuHardwareProfile;
+    use crate::kernels::simd_f32;
+    use fellm_plugin_abi::{PagedKvContext, set_paged_context};
+    use half::f16;
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
@@ -345,5 +397,112 @@ mod tests {
     fn matches_naive_longer() {
         run_case(8, 8, 64, 128, 5);
         run_case(16, 4, 128, 65, 6);
+    }
+
+    #[test]
+    fn paged_matches_contig_f16_roundtrip() {
+        // Build a tiny 1-block arena, write f16 K/V, compare paged vs contig (f32).
+        let n_heads = 4;
+        let n_kv = 2;
+        let head_dim = 8;
+        let seq = 5;
+        let tokens_stride = n_kv * head_dim;
+        let block_size = 16usize;
+        let block_elems = 2 * block_size * tokens_stride;
+        let raw_bytes = block_elems * 2;
+        let block_bytes = (raw_bytes + 63) & !63;
+
+        let mut rng = 42u64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng >> 33) as f32 / (u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| next()).collect();
+        let k_f32: Vec<f32> = (0..seq * tokens_stride).map(|_| next()).collect();
+        let v_f32: Vec<f32> = (0..seq * tokens_stride).map(|_| next()).collect();
+
+        let mut arena = vec![0u8; block_bytes];
+        {
+            let elems: &mut [f16] = bytemuck::cast_slice_mut(&mut arena[..raw_bytes]);
+            for t in 0..seq {
+                let k_dst = &mut elems[t * tokens_stride..(t + 1) * tokens_stride];
+                for (d, &s) in k_dst.iter_mut().zip(k_f32[t * tokens_stride..].iter()) {
+                    *d = f16::from_f32(s);
+                }
+                let v_base = block_size * tokens_stride + t * tokens_stride;
+                let v_dst = &mut elems[v_base..v_base + tokens_stride];
+                for (d, &s) in v_dst.iter_mut().zip(v_f32[t * tokens_stride..].iter()) {
+                    *d = f16::from_f32(s);
+                }
+            }
+        }
+
+        // Contig path uses original f32; paged uses f16 roundtrip — allow looser tol.
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let past = seq - 1;
+        let profile = CpuHardwareProfile::detect();
+
+        let mut out_contig = vec![0.0f32; n_heads * head_dim];
+        attention_step(
+            &q,
+            &k_f32,
+            &v_f32,
+            &mut out_contig,
+            n_heads,
+            n_kv,
+            head_dim,
+            past,
+            scale,
+            &profile,
+        );
+
+        set_paged_context(Some(PagedKvContext {
+            arena: arena.as_mut_ptr(),
+            arena_len: arena.len(),
+            block_table: std::sync::Arc::<[u32]>::from(vec![0]),
+            n_logical_blocks: 1,
+            n_layers: 1,
+            tokens_stride,
+            block_bytes,
+            block_size,
+            elem_bytes: 2,
+        }));
+
+        let mut out_paged = vec![0.0f32; n_heads * head_dim];
+        attention_step_paged(
+            &q,
+            &mut out_paged,
+            n_heads,
+            n_kv,
+            head_dim,
+            past,
+            scale,
+            0,
+            &profile,
+        );
+        set_paged_context(None);
+
+        let err = max_abs_diff(&out_contig, &out_paged);
+        assert!(
+            err < 2e-2,
+            "paged vs contig max abs err {err} (f16 roundtrip)"
+        );
+    }
+
+    #[test]
+    fn dot_f32_f16_matches_scalar() {
+        let a: Vec<f32> = (0..17).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f16> = a.iter().map(|&x| f16::from_f32(x + 0.5)).collect();
+        let mut expected = 0.0f32;
+        for i in 0..a.len() {
+            expected += a[i] * b[i].to_f32();
+        }
+        let profile = CpuHardwareProfile::detect();
+        let got = simd_f32::dot_f32_f16(&a, &b, &profile);
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "got {got} expected {expected}"
+        );
     }
 }

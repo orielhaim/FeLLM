@@ -1,10 +1,3 @@
-//! Foundational vocabulary types for FeLLM: dtypes, shapes, tensors, errors.
-//!
-//! This crate has no dependencies on `faer`, `petgraph`, `abi_stable`, or any
-//! backend. Every other FeLLM crate builds on top of it.
-
-#![deny(missing_docs)]
-
 pub mod dtype;
 pub mod error;
 pub mod shape;

@@ -858,7 +858,9 @@ name = "fellm-plugin-abi"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "bytemuck",
  "fellm-core",
+ "half",
  "thiserror 2.0.18",
 ]
 
@@ -886,6 +888,7 @@ dependencies = [
  "fellm-model",
  "fellm-plugin-abi",
  "fellm-tokenizer",
+ "half",
  "rand 0.9.4",
  "rand_chacha",
  "rayon",

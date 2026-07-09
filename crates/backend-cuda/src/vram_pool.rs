@@ -1,5 +1,3 @@
-//! Device-side KV arena (fixed-size physical blocks in VRAM).
-
 use fellm_core::error::{FellmError, Result};
 
 #[cfg(feature = "cuda")]
@@ -33,7 +31,9 @@ impl DeviceKvArena {
             }
             let tokens_stride = n_kv_heads.max(1) * head_dim.max(1);
             let block_elems = 2 * BLOCK_SIZE * tokens_stride;
-            let block_bytes = block_elems * 4;
+            // Match CPU PhysicalPool: store f16 (2 bytes/elem), pad to 64 bytes.
+            let raw_bytes = block_elems * 2;
+            let block_bytes = (raw_bytes + 63) & !63;
             let total = n_blocks
                 .checked_mul(block_bytes)
                 .ok_or_else(|| FellmError::other("DeviceKvArena: size overflow"))?;
@@ -67,7 +67,7 @@ impl DeviceKvArena {
         self.block_bytes
     }
 
-    /// f32 elements per token row.
+    /// Elements per token row (`n_kv_heads * head_dim`, stored as f16).
     #[must_use]
     pub fn tokens_stride(&self) -> usize {
         self.tokens_stride

@@ -1,10 +1,12 @@
-//! Physical block arena with O(1) free-list allocation.
-
 use fellm_core::error::{FellmError, Result};
 use fellm_core::storage::AlignedBuffer;
+use half::f16;
 
 /// Tokens stored in one physical block.
 pub const BLOCK_SIZE: usize = 16;
+
+/// Bytes per KV element (`f16`).
+pub const ELEM_BYTES: usize = 2;
 
 /// Metadata for one physical block.
 #[derive(Debug, Clone, Copy, Default)]
@@ -19,7 +21,7 @@ pub struct BlockMeta {
 ///
 /// Each physical block holds K and V for [`BLOCK_SIZE`] tokens of **one**
 /// attention layer:
-/// `2 × BLOCK_SIZE × n_kv_heads × head_dim` f32 elements.
+/// `2 × BLOCK_SIZE × n_kv_heads × head_dim` f16 elements (plus 64-byte pad).
 pub struct PhysicalPool {
     arena: AlignedBuffer,
     meta: Vec<BlockMeta>,
@@ -45,8 +47,9 @@ impl PhysicalPool {
         let tokens_stride = n_kv_heads.max(1) * head_dim.max(1);
         // K then V for BLOCK_SIZE tokens.
         let block_elems = 2 * BLOCK_SIZE * tokens_stride;
-        let block_bytes = block_elems * 4;
-        // Ensure each block starts on a 64-byte boundary.
+        let raw_bytes = block_elems * ELEM_BYTES;
+        // Pad so each block starts on a 64-byte boundary.
+        let block_bytes = (raw_bytes + 63) & !63;
         debug_assert_eq!(
             block_bytes % 64,
             0,
@@ -86,19 +89,19 @@ impl PhysicalPool {
         self.n_layers
     }
 
-    /// Per-token K (or V) stride in f32 elements.
+    /// Per-token K (or V) stride in elements.
     #[must_use]
     pub fn tokens_stride(&self) -> usize {
         self.tokens_stride
     }
 
-    /// Bytes per physical block.
+    /// Bytes per physical block (includes alignment padding).
     #[must_use]
     pub fn block_bytes(&self) -> usize {
         self.block_bytes
     }
 
-    /// f32 elements per physical block.
+    /// f16 elements per physical block (payload, excluding pad).
     #[must_use]
     pub fn block_elems(&self) -> usize {
         self.block_elems
@@ -176,15 +179,21 @@ impl PhysicalPool {
         &mut self.arena.as_mut_slice()[off..end]
     }
 
-    fn block_f32(&self, id: u32) -> &[f32] {
+    /// Payload bytes for K|V (excludes trailing alignment pad).
+    fn block_payload_bytes(&self) -> usize {
+        self.block_elems * ELEM_BYTES
+    }
+
+    fn block_f16(&self, id: u32) -> &[f16] {
         let off = self.block_byte_offset(id);
-        let bytes = &self.arena.as_slice()[off..off + self.block_bytes];
+        let bytes = &self.arena.as_slice()[off..off + self.block_payload_bytes()];
         bytemuck::cast_slice(bytes)
     }
 
-    fn block_f32_mut(&mut self, id: u32) -> &mut [f32] {
+    fn block_f16_mut(&mut self, id: u32) -> &mut [f16] {
         let off = self.block_byte_offset(id);
-        let bytes = &mut self.arena.as_mut_slice()[off..off + self.block_bytes];
+        let n = self.block_payload_bytes();
+        let bytes = &mut self.arena.as_mut_slice()[off..off + n];
         bytemuck::cast_slice_mut(bytes)
     }
 
@@ -205,35 +214,35 @@ impl PhysicalPool {
     }
 
     /// K row for `(physical_block, slot)` — length `tokens_stride`.
-    pub fn k_row(&self, id: u32, slot: usize) -> &[f32] {
+    pub fn k_row(&self, id: u32, slot: usize) -> &[f16] {
         debug_assert!(slot < BLOCK_SIZE);
-        let block = self.block_f32(id);
+        let block = self.block_f16(id);
         let base = slot * self.tokens_stride;
         &block[base..base + self.tokens_stride]
     }
 
     /// Mutable K row.
-    pub fn k_row_mut(&mut self, id: u32, slot: usize) -> &mut [f32] {
+    pub fn k_row_mut(&mut self, id: u32, slot: usize) -> &mut [f16] {
         debug_assert!(slot < BLOCK_SIZE);
         let stride = self.tokens_stride;
-        let block = self.block_f32_mut(id);
+        let block = self.block_f16_mut(id);
         let base = slot * stride;
         &mut block[base..base + stride]
     }
 
     /// V row for `(physical_block, slot)`.
-    pub fn v_row(&self, id: u32, slot: usize) -> &[f32] {
+    pub fn v_row(&self, id: u32, slot: usize) -> &[f16] {
         debug_assert!(slot < BLOCK_SIZE);
-        let block = self.block_f32(id);
+        let block = self.block_f16(id);
         let base = BLOCK_SIZE * self.tokens_stride + slot * self.tokens_stride;
         &block[base..base + self.tokens_stride]
     }
 
     /// Mutable V row.
-    pub fn v_row_mut(&mut self, id: u32, slot: usize) -> &mut [f32] {
+    pub fn v_row_mut(&mut self, id: u32, slot: usize) -> &mut [f16] {
         debug_assert!(slot < BLOCK_SIZE);
         let stride = self.tokens_stride;
-        let block = self.block_f32_mut(id);
+        let block = self.block_f16_mut(id);
         let base = BLOCK_SIZE * stride + slot * stride;
         &mut block[base..base + stride]
     }
@@ -302,12 +311,23 @@ mod tests {
     #[test]
     fn block_alignment() {
         let pool = PhysicalPool::new(8, 1, 4, 64).unwrap();
-        // tokens_stride = 256, block_elems = 2*16*256 = 8192, bytes = 32768 (64-aligned)
+        // tokens_stride = 256, block_elems = 2*16*256 = 8192, raw = 16384, pad = 16384
+        assert_eq!(pool.block_bytes(), 16384);
         assert_eq!(pool.block_bytes() % 64, 0);
         for id in 0..pool.n_blocks() as u32 {
             let off = pool.block_byte_offset(id);
             assert_eq!(off % 64, 0, "block {id} offset {off}");
         }
+    }
+
+    #[test]
+    fn block_bytes_halved_vs_f32() {
+        // Typical: n_kv=8, head_dim=64 → stride=512, elems=2*16*512=16384
+        // f32 was 65536; f16 is 32768.
+        let pool = PhysicalPool::new(1, 1, 8, 64).unwrap();
+        assert_eq!(pool.tokens_stride(), 512);
+        assert_eq!(pool.block_elems(), 16384);
+        assert_eq!(pool.block_bytes(), 32768);
     }
 
     #[test]
@@ -318,17 +338,17 @@ mod tests {
         {
             let row = pool.k_row_mut(id, 3);
             for (i, x) in row.iter_mut().enumerate() {
-                *x = i as f32;
+                *x = f16::from_f32(i as f32);
             }
         }
         {
             let row = pool.v_row_mut(id, 3);
             for (i, x) in row.iter_mut().enumerate() {
-                *x = 100.0 + i as f32;
+                *x = f16::from_f32(100.0 + i as f32);
             }
         }
-        assert_eq!(pool.k_row(id, 3)[0], 0.0);
-        assert_eq!(pool.v_row(id, 3)[0], 100.0);
+        assert_eq!(pool.k_row(id, 3)[0].to_f32(), 0.0);
+        assert_eq!(pool.v_row(id, 3)[0].to_f32(), 100.0);
     }
 
     #[test]
@@ -338,8 +358,8 @@ mod tests {
         let b = pool.alloc_block().unwrap();
         pool.inc_ref(a);
         pool.inc_ref(b);
-        pool.k_row_mut(a, 0)[0] = 42.0;
+        pool.k_row_mut(a, 0)[0] = f16::from_f32(42.0);
         pool.copy_block(a, b);
-        assert_eq!(pool.k_row(b, 0)[0], 42.0);
+        assert_eq!(pool.k_row(b, 0)[0].to_f32(), 42.0);
     }
 }

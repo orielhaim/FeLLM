@@ -283,10 +283,11 @@ impl Scheduler {
         if seq.prefill_pos < seq.prompt_ids.len() {
             let tok = seq.prompt_ids[seq.prefill_pos];
             let pos = seq.prefill_pos;
-            let logits = engine.step_sequence(&mut seq.seq_cache, tok, pos)?;
+            let need_logits = seq.prefill_pos + 1 == seq.prompt_ids.len();
+            let logits = engine.step_sequence(&mut seq.seq_cache, tok, pos, need_logits)?;
             seq.prefill_pos += 1;
             seq.position = seq.prefill_pos;
-            if seq.prefill_pos == seq.prompt_ids.len() {
+            if need_logits {
                 seq.pending_logits = Some(logits);
                 seq.prompt_tokens = seq.prompt_ids.len() as u32;
                 // Insert prefix into radix tree for sharing.
@@ -296,18 +297,29 @@ impl Scheduler {
         }
 
         // Decode
-        let Some(logits_tensor) = seq.pending_logits.take() else {
+        let Some(mut logits_owned) = seq.pending_logits.take() else {
             return Ok(None);
         };
-        let logits = logits_tensor.as_slice::<f32>()?;
-        let mut work = logits.to_vec();
-        let tok = crate::sampling::sample(
-            &mut work,
-            seq.params.temperature,
-            seq.params.top_k,
-            seq.params.top_p,
-            seq.params.seed.wrapping_add(u64::from(seq.emitted)),
-        );
+        let tok = match logits_owned.as_mut_slice::<f32>() {
+            Ok(work) => crate::sampling::sample(
+                work,
+                seq.params.temperature,
+                seq.params.top_k,
+                seq.params.top_p,
+                seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+            ),
+            Err(_) => {
+                let logits = logits_owned.as_slice::<f32>()?;
+                let mut work = logits.to_vec();
+                crate::sampling::sample(
+                    &mut work,
+                    seq.params.temperature,
+                    seq.params.top_k,
+                    seq.params.top_p,
+                    seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+                )
+            }
+        };
         seq.emitted += 1;
         if seq.first_token_at.is_none() {
             seq.first_token_at = Some(std::time::Instant::now());
@@ -341,7 +353,7 @@ impl Scheduler {
             return Ok(Some(self.finish_seq(seq, engine)?));
         }
 
-        let next = engine.step_sequence(&mut seq.seq_cache, tok, seq.position)?;
+        let next = engine.step_sequence(&mut seq.seq_cache, tok, seq.position, true)?;
         seq.position += 1;
         seq.pending_logits = Some(next);
 

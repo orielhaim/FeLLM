@@ -83,4 +83,26 @@ impl Tensor {
         bytemuck::try_cast_slice(bytes)
             .map_err(|e| FellmError::other(format!("bytemuck cast failed: {e:?}")))
     }
+
+    pub fn as_mut_slice<T: bytemuck::Pod>(&mut self) -> Result<&mut [T]> {
+        if self.layout.dtype.is_quantized() {
+            return Err(FellmError::UnsupportedDType(self.layout.dtype));
+        }
+        if !self.layout.is_contiguous() {
+            return Err(FellmError::other("as_mut_slice requires contiguous layout"));
+        }
+        let offset = self.layout.offset_bytes;
+        let byte_len = self.layout.byte_size();
+        let storage = Arc::get_mut(&mut self.storage)
+            .ok_or_else(|| FellmError::other("as_mut_slice requires uniquely owned storage Arc"))?;
+        let Storage::Owned(buf) = storage else {
+            return Err(FellmError::other("as_mut_slice requires Storage::Owned"));
+        };
+        let buf = Arc::get_mut(buf).ok_or_else(|| {
+            FellmError::other("as_mut_slice requires uniquely owned AlignedBuffer")
+        })?;
+        let bytes = &mut buf.as_mut_slice()[offset..offset + byte_len];
+        bytemuck::try_cast_slice_mut(bytes)
+            .map_err(|e| FellmError::other(format!("bytemuck cast failed: {e:?}")))
+    }
 }

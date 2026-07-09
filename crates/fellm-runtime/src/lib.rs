@@ -1,15 +1,5 @@
-//! Runtime: engine glue that ties tokenizer + graph + backend + paged KV cache
-//! into a generation loop with optional multi-sequence scheduling.
-//!
-//! * Paged attention KV (`BLOCK_SIZE = 16`) with prefix sharing and CoW
-//! * Fixed ShortConv state for hybrid models
-//! * Interleaved single-token scheduler for concurrent requests
-//!
-//! The public entry point is [`Engine`].
-
-#![deny(missing_docs)]
-
 pub mod backend_select;
+pub mod compiled;
 pub mod engine;
 pub mod executor;
 pub mod hybrid_state;

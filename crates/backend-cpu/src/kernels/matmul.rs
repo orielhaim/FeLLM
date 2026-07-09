@@ -1,15 +1,155 @@
-//! Matmul / matvec.
-//!
-//! Computes `y[i] = sum_j W[i,j] * x[j]` where W is `[out_dim, in_dim]`.
-//! Quantized weights are fused: each block is unpacked in-register and
-//! immediately FMAd into the accumulator — no f32 row scratch in RAM.
-
-use crate::dequant::{QK_K, QK4_0, QK8_0, get_scale_min_k4};
+use crate::dequant::{QK_K, QK4_0, QK8_0};
+use crate::kernels::vec_dot_q4k::vec_dot_q4_k_q8_k_row;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use half::f16;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use wide::f32x8;
+
+#[derive(Clone)]
+pub struct Q8KBlock {
+    /// Block scale: `x[i] ≈ d * qs[i]`.
+    pub d: f32,
+    /// Quantized activations, one i8 per weight.
+    pub qs: [i8; QK_K],
+    /// Group sums: `bsums[g] = Σ qs[16*g .. 16*g+16]`.
+    pub bsums: [i16; QK_K / 16],
+}
+
+impl Default for Q8KBlock {
+    fn default() -> Self {
+        Self {
+            d: 0.0,
+            qs: [0i8; QK_K],
+            bsums: [0i16; QK_K / 16],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Q80XBlock {
+    d: f32,
+    qs: [i8; QK8_0],
+}
+
+impl Default for Q80XBlock {
+    fn default() -> Self {
+        Self {
+            d: 0.0,
+            qs: [0i8; QK8_0],
+        }
+    }
+}
+
+thread_local! {
+    /// Reused Q8_K activation scratch (avoids alloc-per-matmul).
+    static Q8K_SCRATCH: RefCell<Vec<Q8KBlock>> = const { RefCell::new(Vec::new()) };
+    /// Reused Q8_0 activation scratch.
+    static Q80_SCRATCH: RefCell<Vec<Q80XBlock>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn quantize_row_q8_k(x: &[f32], out: &mut [Q8KBlock]) {
+    debug_assert_eq!(x.len() % QK_K, 0);
+    debug_assert_eq!(out.len(), x.len() / QK_K);
+    for (b, blk) in out.iter_mut().enumerate() {
+        let xb = &x[b * QK_K..(b + 1) * QK_K];
+        let amax = xb.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        if amax == 0.0 {
+            blk.d = 0.0;
+            blk.qs = [0i8; QK_K];
+            blk.bsums = [0i16; QK_K / 16];
+            continue;
+        }
+        let iscale = 127.0 / amax;
+        for i in 0..QK_K {
+            let v = (xb[i] * iscale).round() as i32;
+            blk.qs[i] = v.clamp(-128, 127) as i8;
+        }
+        for g in 0..QK_K / 16 {
+            let mut s = 0i32;
+            for l in 0..16 {
+                s += blk.qs[g * 16 + l] as i32;
+            }
+            blk.bsums[g] = s as i16;
+        }
+        blk.d = amax / 127.0;
+    }
+}
+
+/// int8·int8 dot with i32 accumulation over `n` elements.
+#[inline]
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: feature gate above.
+            return unsafe { dot_i8_avx2(a, b) };
+        }
+    }
+    dot_i8_scalar(a, b)
+}
+
+#[inline]
+fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    let n = a.len();
+    let mut acc = 0i32;
+    let mut i = 0;
+    while i + 8 <= n {
+        for k in 0..8 {
+            acc += a[i + k] as i32 * b[i + k] as i32;
+        }
+        i += 8;
+    }
+    while i < n {
+        acc += a[i] as i32 * b[i] as i32;
+        i += 1;
+    }
+    acc
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+    // SAFETY: caller gated on AVX2; Rust 2024 requires unsafe ops in unsafe fn bodies.
+    unsafe {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+
+        let n = a.len();
+        let mut acc = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let va = _mm256_loadu_si256(a.as_ptr().add(i).cast());
+            let vb = _mm256_loadu_si256(b.as_ptr().add(i).cast());
+            let a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+            let a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
+            let b_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+            let b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
+            let p_lo = _mm256_madd_epi16(a_lo, b_lo);
+            let p_hi = _mm256_madd_epi16(a_hi, b_hi);
+            acc = _mm256_add_epi32(acc, p_lo);
+            acc = _mm256_add_epi32(acc, p_hi);
+            i += 32;
+        }
+        let hi = _mm256_extracti128_si256(acc, 1);
+        let lo = _mm256_castsi256_si128(acc);
+        let sum2 = _mm_add_epi32(lo, hi);
+        let shuf = _mm_shuffle_epi32(sum2, 0b01_00_11_10);
+        let sum4 = _mm_add_epi32(sum2, shuf);
+        let shuf2 = _mm_shuffle_epi32(sum4, 0b10_11_00_01);
+        let sum = _mm_add_epi32(sum4, shuf2);
+        let mut total = _mm_cvtsi128_si32(sum);
+        while i < n {
+            total += a[i] as i32 * b[i] as i32;
+            i += 1;
+        }
+        total
+    }
+}
 
 /// f32 weight, f32 input -> f32 output. Row-major weight.
 pub fn matvec_f32(w: &[f32], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
@@ -53,13 +193,31 @@ pub fn matvec_quant(
             if in_dim % QK_K != 0 {
                 return Err(FellmError::other("Q4_K: in_dim not multiple of 256"));
             }
-            matvec_q4_k(w_bytes, x, y, out_dim, in_dim, bytes_per_row);
+            let n = in_dim / QK_K;
+            let mut xq = Q8K_SCRATCH.with(|c| c.replace(Vec::new()));
+            if xq.len() < n {
+                xq.resize(n, Q8KBlock::default());
+            }
+            quantize_row_q8_k(x, &mut xq[..n]);
+            matvec_q4_k(w_bytes, &xq[..n], y, out_dim, in_dim, bytes_per_row);
+            Q8K_SCRATCH.with(|c| {
+                c.replace(xq);
+            });
         }
         DType::Q6K => {
             if in_dim % QK_K != 0 {
                 return Err(FellmError::other("Q6_K: in_dim not multiple of 256"));
             }
-            matvec_q6_k(w_bytes, x, y, out_dim, in_dim, bytes_per_row);
+            let n = in_dim / QK_K;
+            let mut xq = Q8K_SCRATCH.with(|c| c.replace(Vec::new()));
+            if xq.len() < n {
+                xq.resize(n, Q8KBlock::default());
+            }
+            quantize_row_q8_k(x, &mut xq[..n]);
+            matvec_q6_k(w_bytes, &xq[..n], y, out_dim, in_dim, bytes_per_row);
+            Q8K_SCRATCH.with(|c| {
+                c.replace(xq);
+            });
         }
         other => return Err(FellmError::UnsupportedDType(other)),
     }
@@ -119,89 +277,81 @@ fn matvec_q8_0(
 ) {
     let block_bytes = DType::Q8_0.bytes_per_block();
     let n_blocks = in_dim / QK8_0;
-    y.par_iter_mut().enumerate().for_each(|(i, yi)| {
-        let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
-        let mut acc = 0.0f32;
-        for b in 0..n_blocks {
-            let base = b * block_bytes;
-            let d = f16::from_bits(u16::from_le_bytes([row[base], row[base + 1]])).to_f32();
-            let qs = &row[base + 2..base + 2 + 32];
-            let xb = &x[b * QK8_0..(b + 1) * QK8_0];
-            let mut sum = 0.0f32;
-            let mut j = 0;
-            while j + 8 <= 32 {
-                let mut wv = [0.0f32; 8];
-                for k in 0..8 {
-                    wv[k] = (qs[j + k] as i8) as f32;
-                }
-                sum += (f32x8::from(wv)
-                    * f32x8::from(*<&[f32; 8]>::try_from(&xb[j..j + 8]).unwrap()))
-                .reduce_add();
-                j += 8;
-            }
-            while j < 32 {
-                sum += (qs[j] as i8) as f32 * xb[j];
-                j += 1;
-            }
-            acc += d * sum;
+    let mut xq = Q80_SCRATCH.with(|c| c.replace(Vec::new()));
+    if xq.len() < n_blocks {
+        xq.resize(n_blocks, Q80XBlock::default());
+    }
+    for b in 0..n_blocks {
+        let xb = &x[b * QK8_0..(b + 1) * QK8_0];
+        let amax = xb.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let out = &mut xq[b];
+        if amax == 0.0 {
+            out.d = 0.0;
+            out.qs = [0i8; QK8_0];
+            continue;
         }
-        *yi = acc;
+        let iscale = 127.0 / amax;
+        for i in 0..QK8_0 {
+            out.qs[i] = ((xb[i] * iscale).round() as i32).clamp(-128, 127) as i8;
+        }
+        out.d = amax / 127.0;
+    }
+    let chunk = 64usize.max(y.len() / (rayon::current_num_threads() * 4).max(1));
+    y.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(ci, y_chunk)| {
+            let row0 = ci * chunk;
+            for (j, yi) in y_chunk.iter_mut().enumerate() {
+                let i = row0 + j;
+                let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+                let mut acc = 0.0f32;
+                for b in 0..n_blocks {
+                    let base = b * block_bytes;
+                    let d = f16::from_bits(u16::from_le_bytes([row[base], row[base + 1]])).to_f32();
+                    let wqs: &[i8] = bytemuck::cast_slice(&row[base + 2..base + 2 + 32]);
+                    let xb = &xq[b];
+                    let dot = dot_i8(wqs, &xb.qs);
+                    acc += d * xb.d * dot as f32;
+                }
+                *yi = acc;
+            }
+        });
+    Q80_SCRATCH.with(|c| {
+        c.replace(xq);
     });
 }
 
 fn matvec_q4_k(
     w_bytes: &[u8],
-    x: &[f32],
+    xq: &[Q8KBlock],
     y: &mut [f32],
     _out_dim: usize,
     in_dim: usize,
     bytes_per_row: usize,
 ) {
-    let block_bytes = DType::Q4K.bytes_per_block();
     let n_blocks = in_dim / QK_K;
-    y.par_iter_mut().enumerate().for_each(|(i, yi)| {
-        let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
-        let mut acc = 0.0f32;
-        for b in 0..n_blocks {
-            let base = b * block_bytes;
-            let d = f16::from_bits(u16::from_le_bytes([row[base], row[base + 1]])).to_f32();
-            let dmin = f16::from_bits(u16::from_le_bytes([row[base + 2], row[base + 3]])).to_f32();
-            let scales_bytes = &row[base + 4..base + 4 + 12];
-            let qs = &row[base + 16..base + 16 + 128];
-            let x_block = &x[b * QK_K..(b + 1) * QK_K];
-
-            let mut is = 0usize;
-            let mut q_off = 0usize;
-            let mut y_off = 0usize;
-            for _ in 0..4 {
-                let (sc0, m0) = get_scale_min_k4(is, scales_bytes);
-                let (sc1, m1) = get_scale_min_k4(is + 1, scales_bytes);
-                let d1 = d * sc0 as f32;
-                let m1f = dmin * m0 as f32;
-                let d2 = d * sc1 as f32;
-                let m2f = dmin * m1 as f32;
-                let q = &qs[q_off..q_off + 32];
-                let x_lo = &x_block[y_off..y_off + 32];
-                let x_hi = &x_block[y_off + 32..y_off + 64];
-
-                let (sum_q_lo, sum_x_lo) = q4_nibble_dot_lo(q, x_lo);
-                let (sum_q_hi, sum_x_hi) = q4_nibble_dot_hi(q, x_hi);
-                // w = d*sc*nibble - dmin*m  →  contrib = d*sc*(n·x) - dmin*m*(Σx)
-                acc += d1 * sum_q_lo - m1f * sum_x_lo;
-                acc += d2 * sum_q_hi - m2f * sum_x_hi;
-
-                q_off += 32;
-                y_off += 64;
-                is += 2;
+    debug_assert_eq!(xq.len(), n_blocks);
+    // Chunk by physical-core count so each worker streams many rows over the
+    // same quantized activation (llama.cpp / ggml style). Avoid oversubscription.
+    let n_threads = crate::cpu_profile::CpuHardwareProfile::get()
+        .physical_cores
+        .max(1);
+    let chunk = (y.len() / n_threads).max(16);
+    y.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(ci, y_chunk)| {
+            let row0 = ci * chunk;
+            for (j, yi) in y_chunk.iter_mut().enumerate() {
+                let i = row0 + j;
+                let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+                *yi = vec_dot_q4_k_q8_k_row(row, xq);
             }
-        }
-        *yi = acc;
-    });
+        });
 }
 
 fn matvec_q6_k(
     w_bytes: &[u8],
-    x: &[f32],
+    xq: &[Q8KBlock],
     y: &mut [f32],
     _out_dim: usize,
     in_dim: usize,
@@ -209,67 +359,38 @@ fn matvec_q6_k(
 ) {
     let block_bytes = DType::Q6K.bytes_per_block();
     let n_blocks = in_dim / QK_K;
-    y.par_iter_mut().enumerate().for_each(|(i, yi)| {
-        let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
-        let mut acc = 0.0f32;
-        for b in 0..n_blocks {
-            let block = &row[b * block_bytes..(b + 1) * block_bytes];
-            let x_block = &x[b * QK_K..(b + 1) * QK_K];
-            acc += fused_q6_k_block(block, x_block);
-        }
-        *yi = acc;
-    });
+    let chunk = 64usize.max(y.len() / (rayon::current_num_threads() * 4).max(1));
+    y.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(ci, y_chunk)| {
+            let row0 = ci * chunk;
+            for (j, yi) in y_chunk.iter_mut().enumerate() {
+                let i = row0 + j;
+                let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+                let mut acc = 0.0f32;
+                for b in 0..n_blocks {
+                    let block = &row[b * block_bytes..(b + 1) * block_bytes];
+                    acc += fused_q6_k_block(block, &xq[b]);
+                }
+                *yi = acc;
+            }
+        });
 }
 
-/// Dot low nibbles of 32 packed bytes against `x[0..32]`; also returns Σx.
-#[inline]
-fn q4_nibble_dot_lo(q: &[u8], x: &[f32]) -> (f32, f32) {
-    debug_assert!(q.len() >= 32 && x.len() >= 32);
-    let mut sum_q = f32x8::ZERO;
-    let mut sum_x = f32x8::ZERO;
-    let mut l = 0;
-    while l + 8 <= 32 {
-        let mut nib = [0.0f32; 8];
-        for k in 0..8 {
-            nib[k] = (q[l + k] & 0x0F) as f32;
-        }
-        let xv = f32x8::from(*<&[f32; 8]>::try_from(&x[l..l + 8]).unwrap());
-        sum_q += f32x8::from(nib) * xv;
-        sum_x += xv;
-        l += 8;
-    }
-    (sum_q.reduce_add(), sum_x.reduce_add())
-}
-
-/// Dot high nibbles of 32 packed bytes against `x[0..32]`; also returns Σx.
-#[inline]
-fn q4_nibble_dot_hi(q: &[u8], x: &[f32]) -> (f32, f32) {
-    debug_assert!(q.len() >= 32 && x.len() >= 32);
-    let mut sum_q = f32x8::ZERO;
-    let mut sum_x = f32x8::ZERO;
-    let mut l = 0;
-    while l + 8 <= 32 {
-        let mut nib = [0.0f32; 8];
-        for k in 0..8 {
-            nib[k] = (q[l + k] >> 4) as f32;
-        }
-        let xv = f32x8::from(*<&[f32; 8]>::try_from(&x[l..l + 8]).unwrap());
-        sum_q += f32x8::from(nib) * xv;
-        sum_x += xv;
-        l += 8;
-    }
-    (sum_q.reduce_add(), sum_x.reduce_add())
-}
-
-/// Fused Q6_K block · x (matches ggml `dequantize_row_q6_K` layout).
-fn fused_q6_k_block(block: &[u8], x: &[f32]) -> f32 {
+/// Fused Q6_K block · quantized-x (matches ggml `dequantize_row_q6_K` layout).
+///
+/// Uses int8·int8 dots: unpack each 6-bit weight to `q-32` (i8 range) and
+/// multiply by the i8 activation, accumulating in i32 per scale group, then
+/// scale by `d*sc*xd`.
+fn fused_q6_k_block(block: &[u8], xb: &Q8KBlock) -> f32 {
     debug_assert_eq!(block.len(), DType::Q6K.bytes_per_block());
-    debug_assert_eq!(x.len(), QK_K);
 
-    let ql = &block[0..128];
-    let qh = &block[128..192];
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
     let scales: &[i8] = bytemuck::cast_slice(&block[192..208]);
     let d = f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
+    let xd = xb.d;
+    let xqs = &xb.qs;
 
     let mut acc = 0.0f32;
     let mut y_off = 0usize;
@@ -277,22 +398,30 @@ fn fused_q6_k_block(block: &[u8], x: &[f32]) -> f32 {
     let mut qh_off = 0usize;
     let mut sc_off = 0usize;
     for _ in 0..2 {
-        let ql = &ql[ql_off..ql_off + 64];
-        let qh = &qh[qh_off..qh_off + 32];
+        let ql = &ql_all[ql_off..ql_off + 64];
+        let qh = &qh_all[qh_off..qh_off + 32];
         let sc = &scales[sc_off..sc_off + 8];
-        let xb = &x[y_off..y_off + 128];
 
+        // Each of the four 32-weight lanes spans two 16-elem scale groups
+        // (is = l/16). Accumulate an i32 dot per (lane, group) then scale.
+        let mut dots = [[0i32; 2]; 4]; // [lane][is]
         for l in 0..32 {
             let is = l / 16;
-            let q1 = ((ql[l] & 0xF) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+            let q1 = ((ql[l] & 0xF) as i32 | (((qh[l]) & 3) as i32) << 4) - 32;
             let q2 = ((ql[l + 32] & 0xF) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
             let q3 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
             let q4 = ((ql[l + 32] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
 
-            acc += d * sc[is] as f32 * q1 as f32 * xb[l];
-            acc += d * sc[is + 2] as f32 * q2 as f32 * xb[l + 32];
-            acc += d * sc[is + 4] as f32 * q3 as f32 * xb[l + 64];
-            acc += d * sc[is + 6] as f32 * q4 as f32 * xb[l + 96];
+            dots[0][is] += q1 * xqs[y_off + l] as i32;
+            dots[1][is] += q2 * xqs[y_off + l + 32] as i32;
+            dots[2][is] += q3 * xqs[y_off + l + 64] as i32;
+            dots[3][is] += q4 * xqs[y_off + l + 96] as i32;
+        }
+        for is in 0..2 {
+            acc += d * sc[is] as f32 * dots[0][is] as f32;
+            acc += d * sc[is + 2] as f32 * dots[1][is] as f32;
+            acc += d * sc[is + 4] as f32 * dots[2][is] as f32;
+            acc += d * sc[is + 6] as f32 * dots[3][is] as f32;
         }
 
         y_off += 128;
@@ -300,7 +429,7 @@ fn fused_q6_k_block(block: &[u8], x: &[f32]) -> f32 {
         qh_off += 32;
         sc_off += 8;
     }
-    acc
+    acc * xd
 }
 
 #[inline]
@@ -461,8 +590,12 @@ mod tests {
         matvec_ref(w, dtype, x, &mut y_ref, out_dim, in_dim);
         let err = max_abs_diff(&y_fused, &y_ref);
         let scale = y_ref.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
-        // Accumulation order can differ slightly from dequant-then-dot.
-        let tol = (1e-4_f32).max(1e-5 * scale);
+        // Q4_0 stays f32-exact; the int8-activation paths (Q8_0/Q4_K/Q6_K)
+        // quantize x to 7 bits, so a small relative error is expected.
+        let tol = match dtype {
+            DType::Q4_0 => (1e-4_f32).max(1e-5 * scale),
+            _ => (1e-3_f32).max(5e-3 * scale),
+        };
         assert!(
             err < tol,
             "dtype={dtype:?} max abs err {err} tol={tol} (out={out_dim} in={in_dim})"
