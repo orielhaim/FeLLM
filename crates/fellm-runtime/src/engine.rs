@@ -2,7 +2,8 @@
 
 use crate::executor::GraphExecutor;
 use crate::kv_cache::KvCache;
-use arch_llama::{LlamaArch, LlamaConfig};
+use arch_llama::parse_assistant_output;
+use arch_llama::{LlamaArch, LlamaConfig, PositionNodes};
 use backend_cpu::CpuBackend;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
@@ -10,10 +11,158 @@ use fellm_core::shape::{Layout, Shape};
 use fellm_core::storage::{AlignedBuffer, Storage};
 use fellm_core::tensor::Tensor;
 use fellm_gguf::GgufFile;
+use fellm_graph::Graph;
 use fellm_graph::plan::ExecutionPlan;
-use fellm_tokenizer::{Message, Tokenizer, load as load_tokenizer};
+use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Default context size when the caller does not override
+pub const DEFAULT_CTX_SIZE: usize = 8192;
+/// Default evaluation batch size (`n_batch`): max prompt tokens scheduled per
+/// prompt-processing pass.
+pub const DEFAULT_BATCH_SIZE: usize = 2048;
+/// Default physical batch size (`n_ubatch`): max prompt tokens processed in
+/// one compute chunk.
+pub const DEFAULT_UBATCH_SIZE: usize = 512;
+
+/// Engine load / runtime settings (mirrors llama.cpp context params).
+#[derive(Debug, Clone, Copy)]
+pub struct EngineSettings {
+    /// Context length (`n_ctx`). `None` → default [`DEFAULT_CTX_SIZE`].
+    /// Use [`EngineSettings::ctx_from_model`] / CLI `0` to take the GGUF max.
+    pub n_ctx: Option<usize>,
+    /// When true, `n_ctx` is the model's GGUF `context_length` (auto-detect).
+    pub n_ctx_from_model: bool,
+    /// Evaluation batch size (`n_batch`): max prompt tokens to schedule during
+    /// prompt processing.
+    pub n_batch: usize,
+    /// Physical batch size (`n_ubatch`): max prompt tokens per compute chunk.
+    /// Must be `<= n_batch`.
+    pub n_ubatch: usize,
+}
+
+impl Default for EngineSettings {
+    fn default() -> Self {
+        Self {
+            n_ctx: Some(DEFAULT_CTX_SIZE),
+            n_ctx_from_model: false,
+            n_batch: DEFAULT_BATCH_SIZE,
+            n_ubatch: DEFAULT_UBATCH_SIZE,
+        }
+    }
+}
+
+impl EngineSettings {
+    /// Use the model's GGUF-reported maximum context length.
+    #[must_use]
+    pub fn ctx_from_model(mut self) -> Self {
+        self.n_ctx = None;
+        self.n_ctx_from_model = true;
+        self
+    }
+
+    /// Set an explicit context size (clamped to the model max at open).
+    #[must_use]
+    pub fn ctx_size(mut self, n: usize) -> Self {
+        self.n_ctx = Some(n);
+        self.n_ctx_from_model = false;
+        self
+    }
+
+    /// Set evaluation batch size.
+    #[must_use]
+    pub fn batch_size(mut self, n: usize) -> Self {
+        self.n_batch = n.max(1);
+        self
+    }
+
+    /// Set physical batch size.
+    #[must_use]
+    pub fn ubatch_size(mut self, n: usize) -> Self {
+        self.n_ubatch = n.max(1);
+        self
+    }
+
+    /// Resolve `n_ctx` given the model's maximum from GGUF metadata.
+    #[must_use]
+    pub fn resolve_n_ctx(self, model_max: usize) -> usize {
+        let model_max = model_max.max(1);
+        if self.n_ctx_from_model {
+            return model_max;
+        }
+        let requested = self.n_ctx.unwrap_or(DEFAULT_CTX_SIZE).max(1);
+        requested.min(model_max)
+    }
+
+    /// Physical chunk size used during prompt processing.
+    #[must_use]
+    pub fn resolve_ubatch(self) -> usize {
+        let n_batch = self.n_batch.max(1);
+        self.n_ubatch.max(1).min(n_batch)
+    }
+}
+
+/// Timing / throughput stats for one generation
+///
+/// Timers start **after** the model is loaded into memory (`Engine::open`).
+#[derive(Debug, Clone, Default)]
+pub struct GenStats {
+    /// Prompt tokens processed (prefill).
+    pub prompt_tokens: u32,
+    /// Generated tokens (decode), excluding the stop token if not counted as output.
+    pub predicted_tokens: u32,
+    /// Wall time for prompt processing (prefill), until logits for the first
+    /// sample are ready.
+    pub prompt_ms: f64,
+    /// Wall time from start of generation until the first sampled token
+    /// (includes prompt processing + first sample). Excludes model load.
+    pub time_to_first_token_ms: f64,
+    /// Wall time spent in the decode / token-generation loop after the first
+    /// token (subsequent tokens only). Zero if fewer than 2 tokens emitted.
+    pub predicted_ms: f64,
+    /// Total wall time from generation start to finish.
+    pub total_ms: f64,
+}
+
+impl GenStats {
+    /// Prompt-processing throughput (tokens / second).
+    #[must_use]
+    pub fn prompt_tok_per_sec(&self) -> f64 {
+        if self.prompt_ms <= 0.0 || self.prompt_tokens == 0 {
+            return 0.0;
+        }
+        f64::from(self.prompt_tokens) / (self.prompt_ms / 1000.0)
+    }
+
+    /// Generation throughput (tokens / second) for tokens after the first.
+    ///
+    /// Matches common llama.cpp reporting: eval speed over predicted tokens
+    /// after TTFT. If only one token was produced, returns 0.
+    #[must_use]
+    pub fn predicted_tok_per_sec(&self) -> f64 {
+        let n = self.predicted_tokens.saturating_sub(1);
+        if self.predicted_ms <= 0.0 || n == 0 {
+            return 0.0;
+        }
+        f64::from(n) / (self.predicted_ms / 1000.0)
+    }
+
+    /// Overall generation throughput including the first token
+    /// (`predicted_tokens / (total - prompt)` when possible).
+    #[must_use]
+    pub fn generation_tok_per_sec(&self) -> f64 {
+        if self.predicted_tokens == 0 {
+            return 0.0;
+        }
+        let gen_ms = (self.total_ms - self.prompt_ms).max(0.0);
+        if gen_ms <= 0.0 {
+            return 0.0;
+        }
+        f64::from(self.predicted_tokens) / (gen_ms / 1000.0)
+    }
+}
 
 /// Sampling parameters.
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +194,7 @@ impl Default for GenParams {
 /// Builder for [`Engine`].
 pub struct EngineBuilder {
     model_path: Option<String>,
-    max_seq: Option<usize>,
+    settings: EngineSettings,
 }
 
 impl EngineBuilder {
@@ -54,7 +203,7 @@ impl EngineBuilder {
     pub fn new() -> Self {
         Self {
             model_path: None,
-            max_seq: None,
+            settings: EngineSettings::default(),
         }
     }
 
@@ -65,10 +214,17 @@ impl EngineBuilder {
         self
     }
 
-    /// Override max sequence length.
+    /// Override max sequence / context length (`n_ctx`).
     #[must_use]
     pub fn max_seq(mut self, n: usize) -> Self {
-        self.max_seq = Some(n);
+        self.settings = self.settings.ctx_size(n);
+        self
+    }
+
+    /// Full engine settings (context, batch, ubatch).
+    #[must_use]
+    pub fn settings(mut self, settings: EngineSettings) -> Self {
+        self.settings = settings;
         self
     }
 
@@ -77,7 +233,7 @@ impl EngineBuilder {
         let path = self
             .model_path
             .ok_or_else(|| FellmError::other("no model path"))?;
-        Engine::open(Path::new(&path), self.max_seq)
+        Engine::open_with(Path::new(&path), self.settings)
     }
 }
 
@@ -92,17 +248,37 @@ pub struct Engine {
     #[allow(dead_code)]
     gguf: Arc<GgufFile>,
     tokenizer: Box<dyn Tokenizer>,
+    #[allow(dead_code)]
     arch: LlamaArch,
     backend: CpuBackend,
     config: LlamaConfig,
     kv: KvCache,
-    #[allow(dead_code)]
+    /// Resolved context length (`n_ctx`).
     max_seq: usize,
+    /// Model's GGUF-reported maximum context.
+    model_max_ctx: usize,
+    /// Evaluation / physical batch settings.
+    settings: EngineSettings,
+    /// Cached per-token forward graph (built once at open).
+    step_graph: Graph,
+    /// Cached execution plan.
+    step_plan: ExecutionPlan,
+    /// Nodes whose attrs are patched each step.
+    position_nodes: PositionNodes,
 }
 
 impl Engine {
-    /// Open a GGUF model file.
+    /// Open a GGUF model with default settings (ctx 8192, clamped to model max).
     pub fn open(path: &Path, max_seq_override: Option<usize>) -> Result<Self> {
+        let mut settings = EngineSettings::default();
+        if let Some(n) = max_seq_override {
+            settings = settings.ctx_size(n);
+        }
+        Self::open_with(path, settings)
+    }
+
+    /// Open a GGUF model with explicit settings.
+    pub fn open_with(path: &Path, settings: EngineSettings) -> Result<Self> {
         tracing::info!(path = ?path, "opening GGUF");
         let gguf = Arc::new(GgufFile::open(path)?);
         let tokenizer = load_tokenizer(&gguf)?;
@@ -115,7 +291,18 @@ impl Engine {
 
         let arch = LlamaArch::new();
         let config = arch.config_from_gguf(&gguf)?;
-        let max_seq = max_seq_override.unwrap_or(config.context_length.min(8192));
+        let model_max_ctx = config.context_length.max(1);
+        let max_seq = settings.resolve_n_ctx(model_max_ctx);
+        let n_ubatch = settings.resolve_ubatch();
+        let n_batch = settings.n_batch.max(1);
+
+        tracing::info!(
+            n_ctx = max_seq,
+            model_max_ctx,
+            n_batch,
+            n_ubatch,
+            "context / batch settings"
+        );
 
         let kv = KvCache::new(
             config.n_layers,
@@ -123,6 +310,16 @@ impl Engine {
             config.n_kv_heads,
             config.head_dim(),
         )?;
+
+        tracing::info!("building step graph (once)");
+        let step_graph = arch.build_graph(&gguf, &config)?;
+        let step_plan = ExecutionPlan::from_graph(&step_graph)?;
+        let position_nodes = LlamaArch::collect_position_nodes(&step_graph);
+        tracing::info!(
+            nodes = step_graph.node_count(),
+            rope = position_nodes.rope.len(),
+            "step graph ready"
+        );
 
         Ok(Self {
             gguf,
@@ -132,6 +329,16 @@ impl Engine {
             config,
             kv,
             max_seq,
+            model_max_ctx,
+            settings: EngineSettings {
+                n_ctx: Some(max_seq),
+                n_ctx_from_model: settings.n_ctx_from_model,
+                n_batch,
+                n_ubatch,
+            },
+            step_graph,
+            step_plan,
+            position_nodes,
         })
     }
 
@@ -147,67 +354,131 @@ impl Engine {
         &self.config
     }
 
+    /// Resolved context length (`n_ctx`).
+    #[must_use]
+    pub fn n_ctx(&self) -> usize {
+        self.max_seq
+    }
+
+    /// Model GGUF maximum context length.
+    #[must_use]
+    pub fn model_max_ctx(&self) -> usize {
+        self.model_max_ctx
+    }
+
+    /// Active engine settings (resolved `n_ctx`).
+    #[must_use]
+    pub fn settings(&self) -> EngineSettings {
+        self.settings
+    }
+
     /// Generate tokens from a raw prompt string (completion mode).
     ///
     /// Does **not** apply a chat template. Prefer [`Engine::chat`] for
     /// instruction-tuned models.
-    pub fn generate(&mut self, prompt: &str, params: GenParams) -> Result<TokenStream> {
+    pub fn generate(&mut self, prompt: &str, params: GenParams) -> Result<TokenStream<'_>> {
         self.kv.reset();
         let ids = self.tokenizer.encode(prompt, true)?;
         tracing::info!(n_tokens = ids.len(), "prompt tokenized");
         self.generate_from_ids(&ids, params)
     }
 
-    /// Generate a reply to a chat conversation.
-    ///
-    /// Applies the model's GGUF `tokenizer.chat_template` when present
-    /// (Llama 3 / Mistral / Qwen style). Falls back to joining message
-    /// contents if the model has no template (base / completion models).
-    pub fn chat(&mut self, messages: &[Message], params: GenParams) -> Result<TokenStream> {
+    /// Generate a reply to a chat conversation (no tools).
+    pub fn chat(&mut self, messages: &[Message], params: GenParams) -> Result<TokenStream<'_>> {
+        self.chat_with_tools(messages, &[], params)
+    }
+
+    /// Generate a reply with an optional tool list.
+    pub fn chat_with_tools(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        params: GenParams,
+    ) -> Result<TokenStream<'_>> {
         self.kv.reset();
-        let prompt = match self.tokenizer.apply_chat_template(messages, true)? {
+        let prompt = match self
+            .tokenizer
+            .apply_chat_template_with_tools(messages, tools, true)?
+        {
             Some(formatted) => {
                 tracing::debug!(prompt = %formatted, "chat template applied");
                 formatted
             }
-            None => {
-                // No template: concatenate contents (base model / raw completion).
-                messages
-                    .iter()
-                    .map(|m| m.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            None => messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
-        // Template already includes BOS when the model defines one — do not
-        // double-prepend. `encode` still dedupes if BOS is present.
         let ids = self.tokenizer.encode(&prompt, true)?;
         tracing::info!(n_tokens = ids.len(), "chat prompt tokenized");
         self.generate_from_ids(&ids, params)
     }
 
     /// Convenience: single-turn user chat.
-    pub fn chat_user(&mut self, user: &str, params: GenParams) -> Result<TokenStream> {
-        self.chat(
-            &[Message {
-                role: "user".into(),
-                content: user.into(),
-            }],
-            params,
-        )
+    pub fn chat_user(&mut self, user: &str, params: GenParams) -> Result<TokenStream<'_>> {
+        self.chat(&[Message::text("user", user)], params)
     }
 
-    fn generate_from_ids(&mut self, ids: &[u32], params: GenParams) -> Result<TokenStream> {
+    /// Run one chat turn and parse the assistant output for tool calls.
+    ///
+    /// Returns either plain text or a list of [`ToolCall`]s. Callers that
+    /// execute tools should append `Message::assistant_tools(...)` and
+    /// `Message::tool_result(...)` then call again.
+    pub fn chat_turn(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        params: GenParams,
+    ) -> Result<AssistantOutput> {
+        let mut stream = self.chat_with_tools(messages, tools, params)?;
+        let mut bytes = Vec::new();
+        while let Some(tok_result) = stream.next() {
+            let tok = tok_result?;
+            bytes.extend_from_slice(&stream.decode_token(tok)?);
+        }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        Ok(parse_assistant_output(&text))
+    }
+
+    fn generate_from_ids(&mut self, ids: &[u32], params: GenParams) -> Result<TokenStream<'_>> {
         if ids.is_empty() {
             return Err(FellmError::other("empty prompt"));
         }
-        let stop_token_ids = self.stop_token_ids();
-        let mut logits: Option<Tensor> = None;
-        for (pos, &tok) in ids.iter().enumerate() {
-            logits = Some(self.step(tok, pos, false)?);
+        if ids.len() >= self.max_seq {
+            return Err(FellmError::other(format!(
+                "prompt length {} exceeds context size n_ctx={}",
+                ids.len(),
+                self.max_seq
+            )));
         }
+
+        let stop_token_ids = self.stop_token_ids();
+        let n_batch = self.settings.n_batch.max(1);
+        let n_ubatch = self.settings.resolve_ubatch();
+
+        let gen_start = Instant::now();
+        let mut logits: Option<Tensor> = None;
+        let mut pos = 0usize;
+
+        while pos < ids.len() {
+            let scheduled = (ids.len() - pos).min(n_batch);
+            let mut done = 0usize;
+            while done < scheduled {
+                let chunk = (scheduled - done).min(n_ubatch);
+                for i in 0..chunk {
+                    let abs = pos + done + i;
+                    logits = Some(self.step(ids[abs], abs)?);
+                }
+                done += chunk;
+            }
+            pos += scheduled;
+        }
+
+        let prompt_elapsed = gen_start.elapsed();
         let last_logits = logits.ok_or_else(|| FellmError::other("empty prompt"))?;
         let start_pos = ids.len();
+
         Ok(TokenStream {
             engine: self,
             params,
@@ -216,50 +487,61 @@ impl Engine {
             position: start_pos,
             finished: false,
             stop_token_ids,
+            stats: GenStats {
+                prompt_tokens: ids.len() as u32,
+                predicted_tokens: 0,
+                prompt_ms: duration_ms(prompt_elapsed),
+                time_to_first_token_ms: 0.0,
+                predicted_ms: 0.0,
+                total_ms: 0.0,
+            },
+            gen_start,
+            first_token_at: None,
+            last_token_at: None,
         })
     }
 
-    /// Tokens that should end generation (EOS / EOT and friends).
     fn stop_token_ids(&self) -> Vec<u32> {
         let mut stops = Vec::new();
         if let Some(eos) = self.tokenizer.eos() {
             stops.push(eos);
         }
-        // Llama 3 Instruct often uses <|eot_id|> as eos already; also stop on
-        // <|end_of_text|> if distinct and present in the rendered vocabulary
-        // via a second encode of the surface form.
-        if let Ok(ids) = self.tokenizer.encode("<|end_of_text|>", false)
-            && ids.len() == 1
-        {
-            let id = ids[0];
-            if !stops.contains(&id) {
-                stops.push(id);
-            }
-        }
-        if let Ok(ids) = self.tokenizer.encode("<|eot_id|>", false)
-            && ids.len() == 1
-        {
-            let id = ids[0];
-            if !stops.contains(&id) {
-                stops.push(id);
+        for surface in ["<|end_of_text|>", "<|eot_id|>", "<|eom_id|>"] {
+            if let Ok(ids) = self.tokenizer.encode(surface, false)
+                && ids.len() == 1
+            {
+                let id = ids[0];
+                if !stops.contains(&id) {
+                    stops.push(id);
+                }
             }
         }
         stops
     }
 
     /// One forward step for token id `tok` at position `pos`.
-    fn step(&mut self, tok: u32, pos: usize, _final_token: bool) -> Result<Tensor> {
-        let graph = self.arch.build_step_graph(&self.gguf, &self.config, pos)?;
-        let plan = ExecutionPlan::from_graph(&graph)?;
-        let mut exec = GraphExecutor::new(&graph, &plan, &self.backend);
+    fn step(&mut self, tok: u32, pos: usize) -> Result<Tensor> {
+        let pos_u32 = pos as u32;
+        let mut exec = GraphExecutor::new(&self.step_graph, &self.step_plan, &self.backend);
 
-        // Read-only inputs.
+        for &id in &self.position_nodes.rope {
+            let mut a = self.step_graph.node(id).attrs;
+            a.position = pos_u32;
+            exec.set_attrs(id, a);
+        }
+        for &id in &self.position_nodes.kv_write {
+            let mut a = self.step_graph.node(id).attrs;
+            a.position = pos_u32;
+            exec.set_attrs(id, a);
+        }
+        for &id in &self.position_nodes.attention {
+            let mut a = self.step_graph.node(id).attrs;
+            a.past_len = pos_u32;
+            exec.set_attrs(id, a);
+        }
+
         exec.bind_input("token_id", scalar_u32_tensor(tok));
-        exec.bind_input("position", scalar_u32_tensor(pos as u32));
-        exec.bind_input("past_len", scalar_u32_tensor(pos as u32));
 
-        // Mutable KV cache bindings. The graph's `KvWrite` op mutates these
-        // in place at position `pos`, and Attention reads them afterward.
         let dim = self.kv.tokens_stride;
         let shape = Shape::new(&[self.kv.max_seq as u64, dim as u64])?;
         for layer in 0..self.config.n_layers {
@@ -299,12 +581,47 @@ pub struct TokenStream<'a> {
     position: usize,
     finished: bool,
     stop_token_ids: Vec<u32>,
+    stats: GenStats,
+    gen_start: Instant,
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
 }
 
 impl<'a> TokenStream<'a> {
     /// Decode a token id to bytes.
     pub fn decode_token(&self, id: u32) -> Result<Vec<u8>> {
         self.engine.tokenizer.decode_token(id)
+    }
+
+    /// Snapshot of timing / throughput stats (updated as tokens are emitted).
+    #[must_use]
+    pub fn stats(&self) -> GenStats {
+        let mut s = self.stats.clone();
+        s.total_ms = duration_ms(self.gen_start.elapsed());
+        if let Some(first) = self.first_token_at {
+            s.time_to_first_token_ms = duration_ms(first.duration_since(self.gen_start));
+            if let Some(last) = self.last_token_at
+                && s.predicted_tokens > 1
+            {
+                s.predicted_ms = duration_ms(last.duration_since(first));
+            }
+        }
+        s
+    }
+
+    /// Finalize stats after the stream is exhausted (or partially consumed).
+    #[must_use]
+    pub fn finish_stats(&mut self) -> GenStats {
+        self.stats.total_ms = duration_ms(self.gen_start.elapsed());
+        if let Some(first) = self.first_token_at {
+            self.stats.time_to_first_token_ms = duration_ms(first.duration_since(self.gen_start));
+            if let Some(last) = self.last_token_at
+                && self.stats.predicted_tokens > 1
+            {
+                self.stats.predicted_ms = duration_ms(last.duration_since(first));
+            }
+        }
+        self.stats.clone()
     }
 }
 
@@ -316,7 +633,6 @@ impl<'a> Iterator for TokenStream<'a> {
             return None;
         }
         let logits_tensor = self.pending_logits.take()?;
-        // Sample.
         let logits: &[f32] = match logits_tensor.as_slice::<f32>() {
             Ok(s) => s,
             Err(e) => {
@@ -333,16 +649,22 @@ impl<'a> Iterator for TokenStream<'a> {
             self.params.seed.wrapping_add(u64::from(self.emitted)),
         );
         self.emitted += 1;
+        self.stats.predicted_tokens = self.emitted;
 
-        // Check stop tokens (EOS / EOT).
+        let now = Instant::now();
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(now);
+            self.stats.time_to_first_token_ms = duration_ms(now.duration_since(self.gen_start));
+        }
+        self.last_token_at = Some(now);
+
         if self.stop_token_ids.contains(&tok) {
             self.finished = true;
             return Some(Ok(tok));
         }
 
-        // If we have room, step once more to prepare next logits.
         if self.emitted < self.params.max_tokens && self.position + 1 < self.engine.kv.max_seq {
-            match self.engine.step(tok, self.position, false) {
+            match self.engine.step(tok, self.position) {
                 Ok(next) => {
                     self.pending_logits = Some(next);
                     self.position += 1;
@@ -359,7 +681,9 @@ impl<'a> Iterator for TokenStream<'a> {
     }
 }
 
-// ---- small helpers ----
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
 
 fn scalar_u32_tensor(v: u32) -> Tensor {
     let mut buf = AlignedBuffer::new_zeroed(4, 4);
@@ -368,3 +692,44 @@ fn scalar_u32_tensor(v: u32) -> Tensor {
     let storage = Arc::new(Storage::Owned(Arc::new(buf)));
     Tensor::from_storage(layout, storage)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_ctx_is_8192_clamped_to_model() {
+        let s = EngineSettings::default();
+        assert_eq!(s.resolve_n_ctx(131_072), 8192);
+        assert_eq!(s.resolve_n_ctx(4096), 4096);
+    }
+
+    #[test]
+    fn ctx_zero_uses_model_max() {
+        let s = EngineSettings::default().ctx_from_model();
+        assert_eq!(s.resolve_n_ctx(131_072), 131_072);
+    }
+
+    #[test]
+    fn ubatch_capped_by_batch() {
+        let s = EngineSettings::default().batch_size(256).ubatch_size(512);
+        assert_eq!(s.resolve_ubatch(), 256);
+    }
+
+    #[test]
+    fn gen_stats_tok_per_sec() {
+        let s = GenStats {
+            prompt_tokens: 100,
+            predicted_tokens: 50,
+            prompt_ms: 1000.0,
+            time_to_first_token_ms: 1050.0,
+            predicted_ms: 2000.0,
+            total_ms: 3000.0,
+        };
+        assert!((s.prompt_tok_per_sec() - 100.0).abs() < 1e-6);
+        assert!((s.predicted_tok_per_sec() - 24.5).abs() < 1e-6);
+        assert!((s.generation_tok_per_sec() - 25.0).abs() < 1e-6);
+    }
+}
+
+// Re-exports live in lib.rs.

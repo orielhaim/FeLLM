@@ -118,6 +118,7 @@ dependencies = [
  "fellm-gguf",
  "fellm-graph",
  "fellm-plugin-abi",
+ "fellm-tokenizer",
  "tracing",
 ]
 

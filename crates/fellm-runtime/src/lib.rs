@@ -15,6 +15,10 @@ pub mod engine;
 pub mod executor;
 pub mod kv_cache;
 
-pub use engine::{Engine, EngineBuilder, GenParams, TokenStream};
+pub use arch_llama::parse_assistant_output;
+pub use engine::{
+    DEFAULT_BATCH_SIZE, DEFAULT_CTX_SIZE, DEFAULT_UBATCH_SIZE, Engine, EngineBuilder,
+    EngineSettings, GenParams, GenStats, TokenStream,
+};
+pub use fellm_tokenizer::{AssistantOutput, Message, ToolCall, ToolDef};
 pub use kv_cache::KvCache;
-pub use fellm_tokenizer::Message;

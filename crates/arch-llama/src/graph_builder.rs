@@ -7,14 +7,17 @@ use fellm_graph::{Graph, GraphBuilder, NodeId};
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 
 /// Build the graph.
-pub fn build(gguf: &GgufFile, cfg: &LlamaConfig, position: usize) -> Result<Graph> {
+///
+/// Position-dependent attrs (`Rope.position`, `KvWrite.position`,
+/// `Attention.past_len`) are left at 0 and patched each step by the runtime
+/// via [`fellm_runtime::GraphExecutor::set_attrs`].
+pub fn build(gguf: &GgufFile, cfg: &LlamaConfig) -> Result<Graph> {
     let mut gb = GraphBuilder::new();
 
     let d_model = cfg.d_model;
     let head_dim = cfg.head_dim();
     let n_heads = cfg.n_heads;
     let n_kv = cfg.n_kv_heads;
-    let d_ff = cfg.d_ff;
     let vocab = cfg.vocab_size;
     let kv_stride = n_kv * head_dim;
     let q_stride = n_heads * head_dim;
@@ -35,10 +38,8 @@ pub fn build(gguf: &GgufFile, cfg: &LlamaConfig, position: usize) -> Result<Grap
     let inv_freqs_tensor = make_f32_tensor(&inv_freqs_data);
     let inv_freqs_node = gb.constant("rope_inv_freqs", inv_freqs_tensor);
 
-    // Inputs
+    // Inputs — only token_id is required; position is patched into OpAttrs.
     let token_id = gb.input("token_id", DType::U32, Shape::new(&[1])?);
-    let _position_in = gb.input("position", DType::U32, Shape::new(&[1])?);
-    let _past_len_in = gb.input("past_len", DType::U32, Shape::new(&[1])?);
 
     // Embedding lookup.
     let mut x = gb.op(
@@ -57,7 +58,6 @@ pub fn build(gguf: &GgufFile, cfg: &LlamaConfig, position: usize) -> Result<Grap
             gguf,
             cfg,
             layer,
-            position,
             x,
             kv_stride,
             q_stride,
@@ -99,7 +99,6 @@ fn build_layer(
     gguf: &GgufFile,
     cfg: &LlamaConfig,
     layer: usize,
-    position: usize,
     x_in: NodeId,
     kv_stride: usize,
     q_stride: usize,
@@ -188,12 +187,12 @@ fn build_layer(
         format!("blk.{layer}.v_proj"),
     );
 
-    // Apply RoPE to Q and K.
+    // Apply RoPE to Q and K. `position` is patched each step by the runtime.
     let rope_attrs_q = OpAttrs {
         n_heads: n_heads as u32,
         head_dim: head_dim as u32,
         rope_dim: cfg.rope_dim as u32,
-        position: position as u32,
+        position: 0,
         rope_base: cfg.rope_base,
         ..Default::default()
     };
@@ -201,7 +200,7 @@ fn build_layer(
         n_heads: n_kv as u32,
         head_dim: head_dim as u32,
         rope_dim: cfg.rope_dim as u32,
-        position: position as u32,
+        position: 0,
         rope_base: cfg.rope_base,
         ..Default::default()
     };
@@ -234,7 +233,7 @@ fn build_layer(
     );
 
     let kv_write_attrs = OpAttrs {
-        position: position as u32,
+        position: 0,
         ..Default::default()
     };
     let k_cache_updated = gb.op_in_place(
@@ -260,7 +259,7 @@ fn build_layer(
         n_heads: n_heads as u32,
         n_kv_heads: n_kv as u32,
         head_dim: head_dim as u32,
-        past_len: position as u32,
+        past_len: 0,
         scale: 1.0 / (head_dim as f32).sqrt(),
         ..Default::default()
     };

@@ -12,6 +12,7 @@ fellm-graph.workspace = true
 fellm-plugin-abi.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+fellm-tokenizer.workspace = true
 
 [lints]
 workspace = true

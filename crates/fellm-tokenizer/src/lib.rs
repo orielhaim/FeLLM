@@ -14,7 +14,10 @@ use fellm_core::error::{FellmError, Result};
 use fellm_gguf::GgufFile;
 use std::collections::BTreeMap;
 
-pub use template::{Message, TemplateContext, Value, render as render_chat_template};
+pub use template::{
+    AssistantOutput, Message, TemplateContext, ToolCall, ToolDef, ToolFunctionCall, Value,
+    render as render_chat_template,
+};
 
 /// A token id.
 pub type TokenId = u32;
@@ -63,7 +66,7 @@ pub trait Tokenizer: Send + Sync {
         None
     }
 
-    /// Apply the model's chat template to `messages` and return the prompt text.
+    /// Apply the model's chat template to `messages` (no tools).
     ///
     /// Returns `None` if the model has no chat template.
     fn apply_chat_template(
@@ -71,9 +74,24 @@ pub trait Tokenizer: Send + Sync {
         messages: &[Message],
         add_generation_prompt: bool,
     ) -> Result<Option<String>> {
+        self.apply_chat_template_with_tools(messages, &[], add_generation_prompt)
+    }
+
+    /// Apply the GGUF chat template with an optional tool list.
+    ///
+    /// Uses the general Jinja subset engine — no architecture-specific
+    /// formatters. The template source from the GGUF file is the source of
+    /// truth for prompt layout.
+    fn apply_chat_template_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        add_generation_prompt: bool,
+    ) -> Result<Option<String>> {
         let Some(tmpl) = self.chat_template() else {
             return Ok(None);
         };
+
         let mut vars = BTreeMap::new();
         if let Some(s) = self.bos_str() {
             vars.insert("bos_token".into(), Value::String(s.to_string()));
@@ -85,6 +103,7 @@ pub trait Tokenizer: Send + Sync {
             messages: messages.to_vec(),
             add_generation_prompt,
             vars,
+            tools: tools.to_vec(),
         };
         Ok(Some(render_chat_template(tmpl, &ctx)?))
     }

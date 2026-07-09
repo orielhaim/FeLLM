@@ -2,14 +2,13 @@
 
 use clap::{Parser, Subcommand};
 use fellm_gguf::GgufFile;
-use fellm_runtime::{Engine, GenParams};
+use fellm_runtime::{Engine, EngineSettings, GenParams};
 use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "fellm", version, about = "FeLLM inference engine (Phase 1)")]
 struct Cli {
-    /// Log level filter.
     #[arg(long, default_value = "info", global = true)]
     log: String,
 
@@ -19,9 +18,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Generate tokens from a prompt.
     Run(RunArgs),
-    /// Print GGUF metadata and tensor list.
     Inspect(InspectArgs),
 }
 
@@ -54,8 +51,20 @@ struct RunArgs {
     /// RNG seed.
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Optional max sequence length override.
-    #[arg(long)]
+    /// Context size (`n_ctx`). Default 8192, clamped to the model maximum.
+    /// Pass `0` to use the model's GGUF-reported maximum context length.
+    #[arg(long = "ctx-size", short = 'c', default_value_t = 8192)]
+    ctx_size: usize,
+    /// Evaluation batch size (`n_batch`): max prompt tokens to schedule during
+    /// prompt processing. Larger may improve performance but uses more memory.
+    #[arg(long = "batch-size", short = 'b', default_value_t = 2048)]
+    batch_size: usize,
+    /// Physical batch size (`n_ubatch`): max prompt tokens processed in one
+    /// compute chunk. Larger may improve performance but uses more memory.
+    #[arg(long = "ubatch-size", default_value_t = 512)]
+    ubatch_size: usize,
+    /// Optional max sequence length override (alias of `--ctx-size`).
+    #[arg(long, hide = true)]
     max_seq: Option<usize>,
 }
 
@@ -87,7 +96,18 @@ fn init_tracing(filter: &str) {
 }
 
 fn run(args: RunArgs) -> fellm_core::error::Result<()> {
-    let mut engine = Engine::open(&args.model, args.max_seq)?;
+    let mut settings = EngineSettings::default()
+        .batch_size(args.batch_size)
+        .ubatch_size(args.ubatch_size);
+
+    let ctx = args.max_seq.unwrap_or(args.ctx_size);
+    settings = if ctx == 0 {
+        settings.ctx_from_model()
+    } else {
+        settings.ctx_size(ctx)
+    };
+
+    let mut engine = Engine::open_with(&args.model, settings)?;
     let params = GenParams {
         max_tokens: args.max_tokens,
         temperature: args.temperature,
@@ -113,15 +133,9 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     let mut stream = if use_chat {
         let mut messages = Vec::new();
         if let Some(sys) = &args.system {
-            messages.push(fellm_runtime::Message {
-                role: "system".into(),
-                content: sys.clone(),
-            });
+            messages.push(fellm_runtime::Message::text("system", sys.clone()));
         }
-        messages.push(fellm_runtime::Message {
-            role: "user".into(),
-            content: args.prompt.clone(),
-        });
+        messages.push(fellm_runtime::Message::text("user", args.prompt.clone()));
         engine.chat(&messages, params)?
     } else {
         engine.generate(&args.prompt, params)?
@@ -149,11 +163,30 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
             .ok();
     }
     println!();
+
+    let stats = stream.finish_stats();
+    eprintln!(
+        "prompt eval: {} tok in {:.2}ms ({:.2} tok/s)",
+        stats.prompt_tokens,
+        stats.prompt_ms,
+        stats.prompt_tok_per_sec()
+    );
+    eprintln!(
+        "eval: {} tok in {:.2}ms ({:.2} tok/s)",
+        stats.predicted_tokens,
+        (stats.total_ms - stats.prompt_ms).max(0.0),
+        stats.generation_tok_per_sec()
+    );
+    eprintln!(
+        "TTFT: {:.2}ms",
+        stats.time_to_first_token_ms
+    );
+    eprintln!("total: {:.2}ms", stats.total_ms);
+
     Ok(())
 }
 
 fn flush_valid_utf8_prefix(buf: &mut Vec<u8>) -> String {
-    // Find the longest prefix of buf that's valid UTF-8.
     let mut cut = buf.len();
     while cut > 0 {
         if std::str::from_utf8(&buf[..cut]).is_ok() {

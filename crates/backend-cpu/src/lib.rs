@@ -6,8 +6,11 @@
 
 #![deny(missing_docs)]
 
+/// CPU backend implementing the FeLLM plugin ABI.
 pub mod backend;
+/// GGUF k-quant / legacy quant dequantization.
 pub mod dequant;
+/// Hand-rolled CPU kernels (matmul, attention, RoPE, sampling, …).
 pub mod kernels;
 
 pub use backend::CpuBackend;

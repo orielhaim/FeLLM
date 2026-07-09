@@ -1,6 +1,9 @@
+//! Llama config extracted from GGUF metadata.
+
 use fellm_core::error::Result;
 use fellm_gguf::GgufFile;
 
+/// Kind of RoPE frequency scaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeScalingType {
     /// No scaling.
@@ -134,6 +137,11 @@ impl LlamaConfig {
         })
     }
 
+    /// Precompute inverse frequencies for RoPE, applying any scaling.
+    ///
+    /// Returns a vector of length `rope_dim / 2` containing `inv_freq[i]` such
+    /// that the rotation angle for position `p`, pair index `i` is
+    /// `p * inv_freq[i]`.
     #[must_use]
     pub fn compute_rope_inv_freqs(&self) -> Vec<f32> {
         let half = self.rope_dim / 2;

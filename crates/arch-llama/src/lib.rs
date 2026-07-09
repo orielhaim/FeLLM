@@ -19,10 +19,15 @@
 
 #![deny(missing_docs)]
 
+/// Llama hyperparameter extraction from GGUF metadata.
 pub mod config;
+/// Per-step forward graph construction.
 pub mod graph_builder;
+/// Llama-family assistant tool-call response parsing.
+pub mod tools;
 
 pub use config::LlamaConfig;
+pub use tools::parse_assistant_output;
 
 use fellm_core::error::Result;
 use fellm_gguf::GgufFile;
@@ -43,15 +48,39 @@ impl LlamaArch {
         LlamaConfig::from_gguf(gguf)
     }
 
-    /// Build a graph that executes one token forward at `position`.
-    pub fn build_step_graph(
-        &self,
-        gguf: &GgufFile,
-        config: &LlamaConfig,
-        position: usize,
-    ) -> Result<Graph> {
-        graph_builder::build(gguf, config, position)
+    /// Build a graph that executes one token forward.
+    ///
+    /// Position-dependent attrs are placeholders; the runtime patches them
+    /// each step.
+    pub fn build_graph(&self, gguf: &GgufFile, config: &LlamaConfig) -> Result<Graph> {
+        graph_builder::build(gguf, config)
     }
+
+    /// Collect nodes whose attrs must be patched each decode step.
+    #[must_use]
+    pub fn collect_position_nodes(graph: &Graph) -> PositionNodes {
+        let mut nodes = PositionNodes::default();
+        for (id, node) in graph.iter_nodes() {
+            match node.op {
+                Some(fellm_plugin_abi::op::OpKind::Rope) => nodes.rope.push(id),
+                Some(fellm_plugin_abi::op::OpKind::KvWrite) => nodes.kv_write.push(id),
+                Some(fellm_plugin_abi::op::OpKind::Attention) => nodes.attention.push(id),
+                _ => {}
+            }
+        }
+        nodes
+    }
+}
+
+/// Node ids that carry position / past_len attrs.
+#[derive(Debug, Default, Clone)]
+pub struct PositionNodes {
+    /// RoPE ops.
+    pub rope: Vec<fellm_graph::NodeId>,
+    /// KV write ops.
+    pub kv_write: Vec<fellm_graph::NodeId>,
+    /// Attention ops.
+    pub attention: Vec<fellm_graph::NodeId>,
 }
 
 impl Default for LlamaArch {
