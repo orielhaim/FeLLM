@@ -155,7 +155,8 @@ fn dequantize_q4_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
     Ok(())
 }
 
-fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+#[inline]
+pub fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     debug_assert!(j < 8);
     debug_assert!(q.len() >= 12);
     if j < 4 {
