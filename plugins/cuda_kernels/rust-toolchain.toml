@@ -1,0 +1,6 @@
+# Oxide-only toolchain. Never used by the FeLLM host workspace.
+# Host stays on the repo-root rust-toolchain.toml (stable 1.96.1).
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rustc-dev", "llvm-tools", "rust-analyzer", "clippy"]
+profile = "minimal"

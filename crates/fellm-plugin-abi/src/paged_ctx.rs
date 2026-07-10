@@ -1,8 +1,134 @@
+use core::ffi::c_int;
 use half::f16;
 use std::sync::{Arc, Mutex};
 
 /// Bytes per KV element in the paged arena (`f16`).
 pub const PAGED_KV_ELEM_BYTES: usize = 2;
+
+/// POD snapshot of the host paged KV arena for the plugin C ABI.
+///
+/// Pointers remain valid only while the host's [`set_paged_context`] install
+/// is live (one inference step). Plugins must not cache across launches.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PagedKvSnapshot {
+    /// Host arena bytes (K|V blocks) — always set when context is installed.
+    pub arena: *mut u8,
+    /// Host arena length in bytes.
+    pub arena_len: usize,
+    /// Flattened block table pointer (`layer * n_logical + logical → phys`).
+    pub block_table: *const u32,
+    /// Length of `block_table`.
+    pub n_block_table: usize,
+    /// Logical blocks per layer.
+    pub n_logical_blocks: usize,
+    /// Attention layer count.
+    pub n_layers: usize,
+    /// Elements per token row (`n_kv_heads * head_dim`).
+    pub tokens_stride: usize,
+    /// Bytes per physical block.
+    pub block_bytes: usize,
+    /// Block size in tokens.
+    pub block_size: usize,
+    /// Bytes per element (2 for f16).
+    pub elem_bytes: usize,
+    /// Device (VRAM) arena base, or null if host-only.
+    pub device_arena: *mut u8,
+    /// Device arena length in bytes (`0` if host-only).
+    pub device_arena_len: usize,
+}
+
+/// Host callback: fill `out` from the process-wide paged context.
+///
+/// Returns `0` if a context is installed, `1` if none, negative on error.
+pub type HostSnapshotPagedFn = unsafe extern "C" fn(out: *mut PagedKvSnapshot) -> c_int;
+
+/// C ABI entry the host passes to plugins via [`crate::c_abi::HostContext`].
+///
+/// Lives in the host binary so plugins share the same `PAGED_CTX` static.
+pub unsafe extern "C" fn host_snapshot_paged_kv(out: *mut PagedKvSnapshot) -> c_int {
+    if out.is_null() {
+        return -1;
+    }
+    let guard = match PAGED_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -2,
+    };
+    let Some(ctx) = guard.as_ref() else {
+        return 1;
+    };
+    // SAFETY: caller provides a valid `PagedKvSnapshot` slot.
+    unsafe {
+        *out = PagedKvSnapshot {
+            arena: ctx.arena,
+            arena_len: ctx.arena_len,
+            block_table: ctx.block_table.as_ptr(),
+            n_block_table: ctx.block_table.len(),
+            n_logical_blocks: ctx.n_logical_blocks,
+            n_layers: ctx.n_layers,
+            tokens_stride: ctx.tokens_stride,
+            block_bytes: ctx.block_bytes,
+            block_size: ctx.block_size,
+            elem_bytes: ctx.elem_bytes,
+            device_arena: ctx.device_arena,
+            device_arena_len: ctx.device_arena_len,
+        };
+    }
+    0
+}
+
+impl PagedKvSnapshot {
+    /// Physical block id for `(layer, logical_block)`.
+    #[must_use]
+    pub fn physical(&self, layer: usize, logical: usize) -> u32 {
+        let idx = layer * self.n_logical_blocks + logical;
+        debug_assert!(idx < self.n_block_table);
+        // SAFETY: host guarantees table covers all logical blocks for the step.
+        unsafe { *self.block_table.add(idx) }
+    }
+
+    #[inline]
+    fn row_byte_len(&self) -> usize {
+        self.tokens_stride * self.elem_bytes
+    }
+
+    /// K row for logical token `t` at `layer` (full `tokens_stride` as `f16`).
+    ///
+    /// # Safety
+    /// Arena must outlive the returned slice; caller must not mutate concurrently.
+    pub unsafe fn k_row(&self, layer: usize, t: usize) -> &[f16] {
+        let logical = t / self.block_size;
+        let slot = t % self.block_size;
+        let phys = self.physical(layer, logical);
+        let off = (phys as usize) * self.block_bytes;
+        let row_bytes = self.row_byte_len();
+        let base = off + slot * row_bytes;
+        debug_assert!(base + row_bytes <= self.arena_len);
+        unsafe {
+            let ptr = self.arena.add(base) as *const f16;
+            std::slice::from_raw_parts(ptr, self.tokens_stride)
+        }
+    }
+
+    /// V row for logical token `t` at `layer`.
+    ///
+    /// # Safety
+    /// Same as [`Self::k_row`].
+    pub unsafe fn v_row(&self, layer: usize, t: usize) -> &[f16] {
+        let logical = t / self.block_size;
+        let slot = t % self.block_size;
+        let phys = self.physical(layer, logical);
+        let off = (phys as usize) * self.block_bytes;
+        let row_bytes = self.row_byte_len();
+        let v_base = self.block_size * row_bytes;
+        let base = off + v_base + slot * row_bytes;
+        debug_assert!(base + row_bytes <= self.arena_len);
+        unsafe {
+            let ptr = self.arena.add(base) as *const f16;
+            std::slice::from_raw_parts(ptr, self.tokens_stride)
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PagedKvContext {
@@ -24,6 +150,10 @@ pub struct PagedKvContext {
     pub block_size: usize,
     /// Bytes per element (always 2 for f16).
     pub elem_bytes: usize,
+    /// Optional VRAM mirror of `arena` (null = host-only).
+    pub device_arena: *mut u8,
+    /// Device arena byte length.
+    pub device_arena_len: usize,
 }
 
 // SAFETY: The runtime guarantees the arena lives for the duration of the step

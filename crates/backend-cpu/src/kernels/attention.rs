@@ -467,6 +467,8 @@ mod tests {
             block_bytes,
             block_size,
             elem_bytes: 2,
+            device_arena: std::ptr::null_mut(),
+            device_arena_len: 0,
         }));
 
         let mut out_paged = vec![0.0f32; n_heads * head_dim];

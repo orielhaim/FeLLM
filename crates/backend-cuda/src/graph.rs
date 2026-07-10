@@ -79,6 +79,20 @@ impl GraphCache {
             .map(|(_, g)| g)
     }
 
+    /// True if a graph covering `past_len` is cached.
+    #[must_use]
+    pub fn has(&self, past_len: u32) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.get(past_len).is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = past_len;
+            false
+        }
+    }
+
     /// Capture `body` on the device stream into `bucket`.
     ///
     /// `body` must only enqueue GPU work (no host sync).

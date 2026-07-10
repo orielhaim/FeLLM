@@ -5,6 +5,7 @@
 //! `catch_unwind` so panics never unwind across FFI.
 
 use crate::op::OpAttrs;
+use crate::paged_ctx::{host_snapshot_paged_kv, HostSnapshotPagedFn};
 use crate::tensor_ref::{TensorMut, TensorRef};
 use crate::{ABI_VERSION, AbiVersion, StreamHandle};
 use core::ffi::{c_char, c_int, c_void};
@@ -33,6 +34,11 @@ pub struct HostContext {
     pub allocator_opaque: *mut c_void,
     /// Backend id the host expects this plugin to serve (NUL-terminated).
     pub backend_id: [c_char; PLUGIN_NAME_MAX],
+    /// Snapshot the host process-wide paged KV arena (required for Attention/KvWrite).
+    ///
+    /// Plugins must use this instead of their own `PAGED_CTX` static — a `cdylib`
+    /// gets a separate copy of `fellm-plugin-abi` statics.
+    pub snapshot_paged: Option<HostSnapshotPagedFn>,
 }
 
 // SAFETY: HostContext is POD; pointer validity is the caller's contract.
@@ -62,6 +68,7 @@ impl HostContext {
             default_stream,
             allocator_opaque,
             backend_id: id,
+            snapshot_paged: Some(host_snapshot_paged_kv),
         }
     }
 }
@@ -105,7 +112,7 @@ impl PluginManifest {
 pub const fn abi_hash() -> u64 {
     // FNV-1a 64-bit over "fellm-abi-{major}.{minor}.{patch}"
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = b"fellm-abi-0.1.0";
+    let bytes = b"fellm-abi-0.3.0";
     let mut i = 0;
     while i < bytes.len() {
         hash ^= bytes[i] as u64;

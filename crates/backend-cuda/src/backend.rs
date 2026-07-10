@@ -1,7 +1,7 @@
 //! [`CudaBackend`]: prefers CUDA plugins, falls back to [`CpuBackend`] per op.
 
 use crate::device::CudaDeviceState;
-use crate::graph::GraphCache;
+use crate::graph::{GraphBucket, GraphCache};
 use crate::pinned_swap::PinnedSwapArena;
 use crate::vram_pool::DeviceKvArena;
 use backend_cpu::CpuBackend;
@@ -11,6 +11,7 @@ use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::traits::{Backend, BackendCaps, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use fellm_plugin_host::PluginHost;
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -92,10 +93,88 @@ impl CudaBackend {
     ) -> Result<()> {
         let arena = DeviceKvArena::new(&self.device, n_blocks, n_kv_heads, head_dim)?;
         let block_bytes = arena.block_bytes();
-        let swap = PinnedSwapArena::new(&self.device, swap_blocks, block_bytes)?;
+        let swap = PinnedSwapArena::new(&self.device, swap_blocks.max(1), block_bytes)?;
+        tracing::info!(
+            n_blocks,
+            block_bytes,
+            vram_mib = arena.byte_len() / (1024 * 1024),
+            "DeviceKvArena ready"
+        );
         *self.kv_arena.lock().expect("kv arena lock") = Some(arena);
         *self.swap.lock().expect("swap lock") = Some(swap);
         Ok(())
+    }
+
+    /// `(device_ptr, byte_len)` for the VRAM KV arena, if initialized.
+    #[must_use]
+    pub fn device_kv_ptr(&self) -> Option<(*mut u8, usize)> {
+        let guard = self.kv_arena.lock().expect("kv arena lock");
+        let arena = guard.as_ref()?;
+        #[cfg(feature = "cuda")]
+        {
+            Some((arena.device_ptr() as *mut u8, arena.byte_len()))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = arena;
+            None
+        }
+    }
+
+    /// Upload host PhysicalPool bytes into the VRAM arena (prefix / cold start).
+    pub fn sync_kv_host_to_device(&self, host: &[u8]) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let mut guard = self.kv_arena.lock().expect("kv arena lock");
+            let arena = guard
+                .as_mut()
+                .ok_or_else(|| FellmError::other("DeviceKvArena not initialized"))?;
+            if host.len() != arena.byte_len() {
+                return Err(FellmError::other(format!(
+                    "KV H2D size mismatch: host={} device={}",
+                    host.len(),
+                    arena.byte_len()
+                )));
+            }
+            self.device
+                .stream()
+                .memcpy_htod(host, arena.buffer_mut())
+                .map_err(|e| FellmError::other(format!("KV H2D: {e}")))?;
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = host;
+            Err(FellmError::other("cuda feature disabled"))
+        }
+    }
+
+    /// Download VRAM arena into host PhysicalPool (swap / debug).
+    pub fn sync_kv_device_to_host(&self, host: &mut [u8]) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let guard = self.kv_arena.lock().expect("kv arena lock");
+            let arena = guard
+                .as_ref()
+                .ok_or_else(|| FellmError::other("DeviceKvArena not initialized"))?;
+            if host.len() != arena.byte_len() {
+                return Err(FellmError::other(format!(
+                    "KV D2H size mismatch: host={} device={}",
+                    host.len(),
+                    arena.byte_len()
+                )));
+            }
+            self.device
+                .stream()
+                .memcpy_dtoh(arena.buffer(), host)
+                .map_err(|e| FellmError::other(format!("KV D2H: {e}")))?;
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = host;
+            Err(FellmError::other("cuda feature disabled"))
+        }
     }
 
     /// Graph cache (inference thread only).
@@ -103,9 +182,16 @@ impl CudaBackend {
         &self.graphs
     }
 
+    /// Whether `FELLM_CUDA_GRAPHS=1` is set.
+    #[must_use]
+    pub fn graphs_enabled() -> bool {
+        std::env::var_os("FELLM_CUDA_GRAPHS")
+            .is_some_and(|v| v != "0" && v != "false" && v != "off")
+    }
+
     /// Capture a decode graph for `bucket` by running `body` under stream capture.
     #[cfg(feature = "cuda")]
-    pub fn capture_decode_graph<F>(&self, bucket: crate::graph::GraphBucket, body: F) -> Result<()>
+    pub fn capture_decode_graph<F>(&self, bucket: GraphBucket, body: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,
     {
@@ -113,8 +199,47 @@ impl CudaBackend {
         graphs.capture(&self.device, bucket, body)
     }
 
+    /// Capture decode for the bucket containing `past_len` if not already present.
+    pub fn ensure_decode_graph<F>(&self, past_len: u32, max_ctx: u32, body: F) -> Result<bool>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        if !Self::graphs_enabled() {
+            return Ok(false);
+        }
+        let bucket = GraphBucket::buckets_for_ctx(max_ctx)
+            .into_iter()
+            .find(|b| b.contains(past_len))
+            .ok_or_else(|| FellmError::other("no graph bucket for past_len"))?;
+        {
+            let graphs = self.graphs.lock().expect("graphs lock");
+            if graphs.has(past_len) {
+                return Ok(false);
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.capture_decode_graph(bucket, body)?;
+            tracing::info!(
+                past_len,
+                min = bucket.min_past,
+                max = bucket.max_past,
+                "captured CUDA decode graph"
+            );
+            return Ok(true);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (bucket, body);
+            Ok(false)
+        }
+    }
+
     /// Launch a previously captured graph for `past_len`, if one exists.
     pub fn try_launch_graph(&self, past_len: u32) -> Result<bool> {
+        if !Self::graphs_enabled() {
+            return Ok(false);
+        }
         let graphs = self.graphs.lock().expect("graphs lock");
         graphs.launch(past_len)
     }
@@ -131,8 +256,23 @@ impl Backend for CudaBackend {
         "cuda"
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn capabilities(&self) -> BackendCaps {
         self.caps
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            self.device
+                .stream()
+                .synchronize()
+                .map_err(|e| FellmError::other(format!("cuda synchronize: {e}")))?;
+        }
+        Ok(())
     }
 
     fn resolve_kernel(

@@ -348,6 +348,21 @@ impl Engine {
         let backend = settings.backend.resolve()?;
         tracing::info!(backend = backend.id(), "compute backend ready");
 
+        // B2: size VRAM KV arena to match the host PhysicalPool.
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+            let pool = &model.cache.pool;
+            let swap_blocks = (pool.n_blocks() / 2).max(1);
+            if let Err(e) = cuda.init_kv_arena(
+                pool.n_blocks(),
+                model.spec.n_kv_heads.max(1),
+                model.spec.head_dim.max(1),
+                swap_blocks,
+            ) {
+                tracing::warn!(error = %e, "DeviceKvArena init failed; paged ops stay host-only");
+            }
+        }
+
         // Compile the reusable step schedule once now that the backend is known.
         model.compile_step(backend.as_ref())?;
 
@@ -374,6 +389,20 @@ impl Engine {
     ) -> Result<Self> {
         let mut eng = Self::open_with(path, settings.backend_preference(BackendPreference::Cpu))?;
         eng.backend = backend;
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = eng
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cuda::CudaBackend>()
+        {
+            let pool = &eng.model.cache.pool;
+            let _ = cuda.init_kv_arena(
+                pool.n_blocks(),
+                eng.model.spec.n_kv_heads.max(1),
+                eng.model.spec.head_dim.max(1),
+                (pool.n_blocks() / 2).max(1),
+            );
+        }
         // The step was compiled against the default backend; recompile so kernel
         // handles match the injected one.
         eng.model.compiled = None;
@@ -808,6 +837,28 @@ impl LoadedModel {
 
         let n_logical = self.seq.table(0).num_blocks().max(1);
         let block_table = self.seq.flatten_block_tables();
+
+        let (device_arena, device_arena_len) = {
+            #[cfg(feature = "backend-cuda")]
+            {
+                if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+                    // Mirror host arena into VRAM so prefix / CPU writes are visible.
+                    let host = self.cache.pool.arena_bytes();
+                    if let Err(e) = cuda.sync_kv_host_to_device(host) {
+                        tracing::warn!(error = %e, "KV H2D sync failed");
+                    }
+                    cuda.device_kv_ptr()
+                        .unwrap_or((std::ptr::null_mut(), 0))
+                } else {
+                    (std::ptr::null_mut(), 0)
+                }
+            }
+            #[cfg(not(feature = "backend-cuda"))]
+            {
+                (std::ptr::null_mut(), 0usize)
+            }
+        };
+
         let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
         set_paged_context(Some(PagedKvContext {
             arena: arena_ptr,
@@ -819,9 +870,12 @@ impl LoadedModel {
             block_bytes: self.cache.pool.block_bytes(),
             block_size: crate::paged::BLOCK_SIZE,
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
+            device_arena,
+            device_arena_len,
         }));
 
         let result = self.step_inner(backend, tok, pos, compute_logits);
+        let _ = backend.synchronize();
         set_paged_context(None);
         result
     }
@@ -862,6 +916,39 @@ impl LoadedModel {
         }
 
         step.bind_input("token_id", scalar_u32_tensor(tok));
+
+        // B3: optionally capture this decode under a CUDA graph (once per past_len
+        // bucket). Replay is not used yet — kernel attrs (token/past_len) change
+        // every step and need cudaGraphExecKernelNodeSetParams (follow-up).
+        #[cfg(feature = "backend-cuda")]
+        if pos > 0 {
+            if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+                if backend_cuda::CudaBackend::graphs_enabled() {
+                    let max_ctx = self.max_seq as u32;
+                    let mut captured: Option<Tensor> = None;
+                    let capture_result = cuda.ensure_decode_graph(pos_u32, max_ctx, || {
+                        captured = Some(step.run(backend, compute_logits)?);
+                        Ok(())
+                    });
+                    match capture_result {
+                        Ok(true) => {
+                            if let Some(t) = captured {
+                                return Ok(t);
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                past_len = pos_u32,
+                                "CUDA graph capture skipped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         step.run(backend, compute_logits)
     }
 

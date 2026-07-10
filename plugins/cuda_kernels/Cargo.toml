@@ -1,5 +1,8 @@
 # Standalone package (excluded from FeLLM workspace).
-# Default path: cuda-oxide under WSL (`cargo oxide build --release`).
+# Build ONLY with Pipeline B: scripts/wsl-build-plugin.sh
+#   → cargo oxide build --release  (nightly-2026-04-03 via rust-toolchain.toml)
+#
+# Do NOT `cargo build` this crate with the host stable toolchain.
 [workspace]
 
 [package]
@@ -13,5 +16,12 @@ description = "FeLLM CUDA kernel plugin (cuda-oxide)"
 crate-type = ["cdylib"]
 
 [dependencies]
+# FeLLM C ABI (path deps; compiled with oxide nightly inside this package only)
 fellm-plugin-abi = { path = "../../crates/fellm-plugin-abi" }
 fellm-core = { path = "../../crates/fellm-core" }
+half = "2.7"
+
+# cuda-oxide (git) — same pins as `cargo oxide new`
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }

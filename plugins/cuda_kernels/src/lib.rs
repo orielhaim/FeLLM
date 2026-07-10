@@ -1,30 +1,162 @@
-//! FeLLM CUDA kernel plugin — cuda-oxide is the only kernel path.
+//! FeLLM CUDA kernel plugin — built only with cuda-oxide (Pipeline B).
 //!
-//! Build under WSL2:
 //! ```text
-//! cargo oxide build --release
-//! cp target/release/libcuda_kernels.so ../../plugins/dist/
+//! bash scripts/wsl-build-plugin.sh
 //! ```
-//!
-//! Until oxide kernels are registered here, this plugin exports the C ABI and
-//! registers **zero** ops so the host uses the embedded CPU backend (correct
-//! Q4_K / attention). Never ship simplified host “stubs” that override CPU.
 
+mod buffers;
+mod launchers;
+mod oxide_kernels;
+mod tensor;
+
+use cuda_core::CudaContext;
+use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::{
-    abi_hash, HostContext, KernelRegistryVtable, PluginManifest,
+    abi_hash, HostContext, KernelRegistryVtable, PluginManifest, PluginOpRegistration,
 };
-use fellm_plugin_abi::{AbiVersion, ABI_VERSION};
-use std::os::raw::c_int;
+use fellm_plugin_abi::op::OpKind;
+use fellm_plugin_abi::{AbiVersion, PagedKvSnapshot, ABI_VERSION};
+use oxide_kernels::kernels;
+use std::ffi::CStr;
+use std::os::raw::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
-static mut HOST_CTX: Option<HostContext> = None;
+pub use oxide_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS};
 
-/// Q4_K super-block size in bytes (GGUF).
-pub const Q4K_BLOCK_BYTES: usize = 144;
-/// Q4_K elements per super-block.
-pub const Q4K_BLOCK_ELEMS: usize = 256;
 /// Paged KV tokens per physical block.
 pub const PAGED_BLOCK_SIZE: usize = 16;
+
+static HOST_CTX: Mutex<Option<HostContext>> = Mutex::new(None);
+
+/// Snapshot host paged KV via the callback installed in [`HostContext`].
+///
+/// Must not use `fellm_plugin_abi::snapshot_paged_context` — that static lives
+/// in this `.so`, not in the host process that called `set_paged_context`.
+pub(crate) fn host_paged_snapshot() -> Option<PagedKvSnapshot> {
+    let guard = HOST_CTX.lock().ok()?;
+    let ctx = guard.as_ref()?;
+    let snap_fn = ctx.snapshot_paged?;
+    let mut out = PagedKvSnapshot {
+        arena: std::ptr::null_mut(),
+        arena_len: 0,
+        block_table: std::ptr::null(),
+        n_block_table: 0,
+        n_logical_blocks: 0,
+        n_layers: 0,
+        tokens_stride: 0,
+        block_bytes: 0,
+        block_size: 0,
+        elem_bytes: 0,
+        device_arena: std::ptr::null_mut(),
+        device_arena_len: 0,
+    };
+    let rc = unsafe { snap_fn(&mut out) };
+    if rc == 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+static OXIDE_CTX: OnceLock<Arc<CudaContext>> = OnceLock::new();
+static OXIDE_MODULE: OnceLock<kernels::LoadedModule> = OnceLock::new();
+
+pub(crate) fn oxide_ctx() -> &'static Arc<CudaContext> {
+    OXIDE_CTX.get_or_init(|| CudaContext::new(0).expect("cuda_kernels: CudaContext::new(0)"))
+}
+
+/// Path of this loaded `.so` (oxide embeds PTX in `.oxart` here, not in the host exe).
+fn this_plugin_path() -> PathBuf {
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const i8,
+        dli_fbase: *mut c_void,
+        dli_sname: *const i8,
+        dli_saddr: *mut c_void,
+    }
+    unsafe extern "C" {
+        fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+    }
+    let mut info = DlInfo {
+        dli_fname: std::ptr::null(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    let addr = _fellm_plugin_abi_version as *const c_void;
+    let rc = unsafe { dladdr(addr, &mut info) };
+    assert!(rc != 0 && !info.dli_fname.is_null(), "dladdr failed for plugin");
+    let cstr = unsafe { CStr::from_ptr(info.dli_fname) };
+    PathBuf::from(cstr.to_string_lossy().as_ref())
+}
+
+pub(crate) fn oxide_module() -> &'static kernels::LoadedModule {
+    OXIDE_MODULE.get_or_init(|| {
+        let ctx = oxide_ctx();
+        let path = this_plugin_path();
+        let bundles = cuda_core::embedded::artifact_bundles_from_binary_path(&path)
+            .unwrap_or_else(|e| panic!("read .oxart from {}: {e}", path.display()));
+        let bundle = bundles
+            .into_iter()
+            .find(|b| b.name == "cuda_kernels" || b.name == env!("CARGO_PKG_NAME"))
+            .unwrap_or_else(|| panic!("no oxide artifact bundle in {}", path.display()));
+
+        use cuda_core::embedded::ArtifactPayloadKind;
+        let module = if let Some(emb) = cuda_core::embedded::EmbeddedModule::new(bundle.clone()) {
+            emb.load(ctx)
+                .unwrap_or_else(|e| panic!("load cubin/ptx from plugin: {e}"))
+        } else if let Some(nvvm) = bundle.payload(ArtifactPayloadKind::NvvmIr) {
+            // Kernels using sin/exp emit NVVM IR; compile via libNVVM + nvJitLink.
+            let arch = if bundle.target.is_empty() {
+                "sm_80"
+            } else {
+                bundle.target.as_str()
+            };
+            let cubin = cuda_host::ltoir::build_cubin_from_nvvm_ir(nvvm, &bundle.name, arch)
+                .unwrap_or_else(|e| panic!("NVVM→cubin for {}: {e}", bundle.name));
+            ctx.load_module_from_image(&cubin)
+                .unwrap_or_else(|e| panic!("load cubin: {e}"))
+        } else if let Some(ltoir) = bundle.payload(ArtifactPayloadKind::Ltoir) {
+            let arch = if bundle.target.is_empty() {
+                "sm_80"
+            } else {
+                bundle.target.as_str()
+            };
+            let cubin = cuda_host::ltoir::link_ltoir_to_cubin(ltoir, &bundle.name, arch)
+                .unwrap_or_else(|e| panic!("LTOIR→cubin for {}: {e}", bundle.name));
+            ctx.load_module_from_image(&cubin)
+                .unwrap_or_else(|e| panic!("load cubin: {e}"))
+        } else {
+            panic!(
+                "bundle '{}' has no cubin/ptx/nvvm/ltoir payload (target={})",
+                bundle.name, bundle.target
+            );
+        };
+        kernels::from_module(module).expect("bind LoadedModule")
+    })
+}
+
+fn register_one(
+    vt: &KernelRegistryVtable,
+    op: OpKind,
+    inputs: &[DType],
+    output: DType,
+    launch: fellm_plugin_abi::c_abi::PluginLaunchFn,
+) -> c_int {
+    let mut reg = PluginOpRegistration {
+        op_kind: op as u32,
+        n_input_dtypes: inputs.len() as u32,
+        input_dtypes: [0; fellm_plugin_abi::PLUGIN_MAX_INPUT_DTYPES],
+        output_dtype: output as u32,
+        launch: Some(launch),
+    };
+    for (i, d) in inputs.iter().enumerate() {
+        reg.input_dtypes[i] = *d as u32;
+    }
+    unsafe { (vt.register_op)(vt.registry, &reg) }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _fellm_plugin_abi_version() -> AbiVersion {
@@ -42,7 +174,8 @@ pub unsafe extern "C" fn _fellm_plugin_init(ctx: *const HostContext) -> c_int {
         if ctx.is_null() {
             return -1;
         }
-        unsafe { HOST_CTX = Some(*ctx) };
+        *HOST_CTX.lock().expect("host ctx") = Some(unsafe { *ctx });
+        // Module load is lazy on first kernel launch (needs CUDA/NVVM env).
         0
     }))
     .unwrap_or(-99)
@@ -54,10 +187,67 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         if registry.is_null() {
             return -1;
         }
-        let _vt = unsafe { &mut *registry };
-        // Register oxide #[kernel] launchers here when ready, e.g.:
-        //   q4k_gemv, paged_attention, kv_write_paged
-        // Until then: zero ops → host CpuBackend handles the full forward pass.
+        let vt = unsafe { &*registry };
+        let f32 = DType::F32;
+        let q4k = DType::Q4K;
+
+        // RmsNorm: [x f32, w f32] → f32
+        if register_one(
+            vt,
+            OpKind::RmsNorm,
+            &[f32, f32],
+            f32,
+            launchers::launch_rmsnorm,
+        ) != 0
+        {
+            return -2;
+        }
+        // SiluGate
+        if register_one(
+            vt,
+            OpKind::SiluGate,
+            &[f32, f32],
+            f32,
+            launchers::launch_silu_gate,
+        ) != 0
+        {
+            return -3;
+        }
+        // Rope: [x, inv_freqs]
+        if register_one(vt, OpKind::Rope, &[f32, f32], f32, launchers::launch_rope) != 0 {
+            return -4;
+        }
+        // Q4_K MatMul + paged Attention + KvWrite (B2).
+        if register_one(
+            vt,
+            OpKind::MatMul,
+            &[q4k, f32],
+            f32,
+            launchers::launch_q4k_matmul,
+        ) != 0
+        {
+            return -5;
+        }
+        if register_one(
+            vt,
+            OpKind::Attention,
+            &[f32, f32, f32],
+            f32,
+            launchers::launch_attention,
+        ) != 0
+        {
+            return -6;
+        }
+        if register_one(
+            vt,
+            OpKind::KvWrite,
+            &[f32, f32],
+            f32,
+            launchers::launch_kv_write,
+        ) != 0
+        {
+            return -7;
+        }
         0
     }))
     .unwrap_or(-99)
@@ -66,6 +256,6 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _fellm_plugin_shutdown() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        unsafe { HOST_CTX = None };
+        *HOST_CTX.lock().expect("host ctx") = None;
     }));
 }

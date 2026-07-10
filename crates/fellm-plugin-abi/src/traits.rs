@@ -8,6 +8,7 @@ use crate::op::OpKind;
 use crate::{StreamHandle, TensorMut, TensorRef};
 use fellm_core::dtype::DType;
 use fellm_core::error::Result;
+use std::any::Any;
 
 /// Opaque handle to a resolved kernel implementation.
 #[repr(transparent)]
@@ -69,6 +70,14 @@ pub trait Backend: Send + Sync + 'static {
         outputs: &mut [TensorMut],
         stream: StreamHandle,
     ) -> Result<()>;
+
+    /// Downcast to a concrete backend (CUDA graph / VRAM hooks).
+    fn as_any(&self) -> &dyn Any;
+
+    /// Synchronize the default compute stream (no-op on CPU).
+    fn synchronize(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A model architecture.

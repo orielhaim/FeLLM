@@ -81,6 +81,10 @@ impl Backend for CpuBackend {
         "cpu"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn capabilities(&self) -> BackendCaps {
         self.caps
     }
