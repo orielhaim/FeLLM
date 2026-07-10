@@ -23,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use oxide_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS};
+pub use oxide_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS};
 
 /// Paged KV tokens per physical block.
 pub const PAGED_BLOCK_SIZE: usize = 16;
@@ -190,6 +190,8 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         let vt = unsafe { &*registry };
         let f32 = DType::F32;
         let q4k = DType::Q4K;
+        let q6k = DType::Q6K;
+        let u32 = DType::U32;
 
         // RmsNorm: [x f32, w f32] → f32
         if register_one(
@@ -217,7 +219,7 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         if register_one(vt, OpKind::Rope, &[f32, f32], f32, launchers::launch_rope) != 0 {
             return -4;
         }
-        // Q4_K MatMul + paged Attention + KvWrite (B2).
+        // Q4_K / Q6_K MatMul + paged Attention + KvWrite (B2).
         if register_one(
             vt,
             OpKind::MatMul,
@@ -227,6 +229,16 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         ) != 0
         {
             return -5;
+        }
+        if register_one(
+            vt,
+            OpKind::MatMul,
+            &[q6k, f32],
+            f32,
+            launchers::launch_q6k_matmul,
+        ) != 0
+        {
+            return -15;
         }
         if register_one(
             vt,
@@ -248,11 +260,56 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         {
             return -7;
         }
-        // Add / Embedding stay on CPU until oxide kernels match CPU numerics.
-        // Residual + embed are cheap vs matmul; hybrid is correct with per-op D2H.
+        if register_one(vt, OpKind::Add, &[f32, f32], f32, launchers::launch_add) != 0 {
+            return -8;
+        }
+        if register_one(
+            vt,
+            OpKind::Embedding,
+            &[f32, u32],
+            f32,
+            launchers::launch_embedding_f32,
+        ) != 0
+        {
+            return -9;
+        }
+        if register_one(
+            vt,
+            OpKind::Embedding,
+            &[q4k, u32],
+            f32,
+            launchers::launch_embedding_q4k,
+        ) != 0
+        {
+            return -10;
+        }
+        if register_one(
+            vt,
+            OpKind::Embedding,
+            &[q6k, u32],
+            f32,
+            launchers::launch_embedding_q6k,
+        ) != 0
+        {
+            return -11;
+        }
         0
     }))
     .unwrap_or(-99)
+}
+
+/// Mark a host f32 buffer's device cache entry stale after a CPU write.
+///
+/// `ptr` is the host data pointer; `nbytes` is the byte length of the f32 slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_invalidate_f32(ptr: *const f32, nbytes: usize) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if ptr.is_null() || nbytes < 4 {
+            return;
+        }
+        let len = nbytes / 4;
+        buffers::invalidate_f32(ptr, len);
+    }));
 }
 
 #[unsafe(no_mangle)]

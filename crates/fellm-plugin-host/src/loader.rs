@@ -4,8 +4,8 @@ use crate::registry::KernelRegistry;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
-    HostContext, PluginAbiVersionFn, PluginInitFn, PluginManifestFn, PluginRegisterFn,
-    PluginShutdownFn, abi_hash, symbols,
+    HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestFn,
+    PluginRegisterFn, PluginShutdownFn, abi_hash, symbols,
 };
 use libloading::Library;
 use std::ffi::OsStr;
@@ -17,6 +17,7 @@ pub struct LoadedPlugin {
     pub path: PathBuf,
     _lib: Library,
     shutdown: Option<PluginShutdownFn>,
+    invalidate_f32: Option<PluginInvalidateF32Fn>,
 }
 
 impl Drop for LoadedPlugin {
@@ -60,6 +61,26 @@ impl PluginHost {
     #[must_use]
     pub fn plugin_count(&self) -> usize {
         self.plugins.len()
+    }
+
+    /// Invalidate device mirrors for host f32 buffers written by CPU fallback.
+    ///
+    /// Call after any CPU op that mutates activation tensors so the next GPU
+    /// `ensure_f32` re-uploads instead of trusting a stale `device_valid` cache.
+    pub fn invalidate_f32_outputs(&self, outputs: &[fellm_plugin_abi::TensorMut]) {
+        for out in outputs {
+            if out.dtype().is_some_and(|d| d == fellm_core::dtype::DType::F32)
+                && !out.data.is_null()
+                && out.byte_len >= 4
+            {
+                let ptr = out.data as *const f32;
+                for plugin in &self.plugins {
+                    if let Some(inv) = plugin.invalidate_f32 {
+                        unsafe { inv(ptr, out.byte_len as usize) };
+                    }
+                }
+            }
+        }
     }
 
     /// Load all plugins from `dir` (or `FELLM_PLUGIN_DIR` if `dir` is `None`).
@@ -140,11 +161,14 @@ impl PluginHost {
 
         let shutdown: Option<PluginShutdownFn> =
             unsafe { lib.get(symbols::SHUTDOWN).ok().map(|s| *s) };
+        let invalidate_f32: Option<PluginInvalidateF32Fn> =
+            unsafe { lib.get(symbols::INVALIDATE_F32).ok().map(|s| *s) };
 
         self.plugins.push(LoadedPlugin {
             path: path.to_path_buf(),
             _lib: lib,
             shutdown,
+            invalidate_f32,
         });
         Ok(())
     }

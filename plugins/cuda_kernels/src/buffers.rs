@@ -42,13 +42,16 @@ fn f32_cache() -> &'static Mutex<HashMap<usize, F32Entry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Ensure `host` is resident on device. Reuses allocations; always H2D so
-/// hybrid CPU ops (Add/Embedding) cannot leave stale VRAM.
-pub fn ensure_f32(stream: &CudaStream, host: &[f32], _force_upload: bool) -> Result<usize, i32> {
+/// Ensure `host` is resident on device. Reuses allocations; skips H2D when the
+/// cached buffer already matches `len` and is `device_valid` (unless `force_upload`).
+pub fn ensure_f32(stream: &CudaStream, host: &[f32], force_upload: bool) -> Result<usize, i32> {
     let key = host.as_ptr() as usize;
     let len = host.len();
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
     if let Some(e) = guard.get_mut(&key) {
+        if e.len == len && !force_upload && e.device_valid {
+            return Ok(key);
+        }
         if e.len != len {
             e.buf = DeviceBuffer::from_host(stream, host).map_err(|_| -3)?;
             e.len = len;
@@ -68,6 +71,24 @@ pub fn ensure_f32(stream: &CudaStream, host: &[f32], _force_upload: bool) -> Res
         },
     );
     Ok(key)
+}
+
+/// Mark a host f32 buffer's device mirror stale (e.g. after a CPU fallback write).
+///
+/// Next [`ensure_f32`] will H2D. No-op if the pointer is not cached.
+pub fn invalidate_f32(host_ptr: *const f32, len: usize) {
+    if host_ptr.is_null() || len == 0 {
+        return;
+    }
+    let key = host_ptr as usize;
+    let Ok(mut guard) = f32_cache().lock() else {
+        return;
+    };
+    if let Some(e) = guard.get_mut(&key) {
+        if e.len == len {
+            e.device_valid = false;
+        }
+    }
 }
 
 /// Ensure a device buffer exists for an output slice (no H2D; marks invalid).
@@ -148,16 +169,20 @@ fn u32_cache() -> &'static Mutex<HashMap<usize, U32Entry>> {
 }
 
 /// Ensure a u32 slice (e.g. block table) is resident; keyed by host ptr.
+///
+/// Always re-uploads when the entry exists: block tables mutate in place as
+/// new logical blocks are allocated during decode.
 pub fn ensure_u32(stream: &CudaStream, host: &[u32]) -> Result<usize, i32> {
     let key = host.as_ptr() as usize;
     let len = host.len();
     let mut guard = u32_cache().lock().map_err(|_| -30)?;
     if let Some(e) = guard.get_mut(&key) {
-        if e.len == len {
-            return Ok(key);
+        if e.len != len {
+            e.buf = DeviceBuffer::from_host(stream, host).map_err(|_| -3)?;
+            e.len = len;
+        } else {
+            e.buf.copy_from_host(stream, host).map_err(|_| -3)?;
         }
-        e.buf = DeviceBuffer::from_host(stream, host).map_err(|_| -3)?;
-        e.len = len;
         return Ok(key);
     }
     let buf = DeviceBuffer::from_host(stream, host).map_err(|_| -3)?;

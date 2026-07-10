@@ -1,8 +1,8 @@
-//! FFI launch wrappers: activation-cached H2D → oxide kernel → D2H.
+//! FFI launch wrappers: activation-cached H2D → oxide kernel → optional D2H.
 
 use crate::buffers;
 use crate::tensor::{bytes_slice, dims, f32_slice, f32_slice_mut, u32_slice};
-use crate::{host_paged_snapshot, oxide_ctx, oxide_module, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS};
+use crate::{host_paged_snapshot, oxide_ctx, oxide_module, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS};
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use fellm_core::dtype::DType;
 use fellm_plugin_abi::op::OpAttrs;
@@ -23,17 +23,17 @@ fn run(body: impl FnOnce() -> LaunchResult) -> i32 {
     }
 }
 
-/// Finish a launch: mark output valid and always D2H for numerical parity with
-/// the host graph (sampling + any CPU fallback). Allocation reuse still avoids
-/// per-op `cudaMalloc`; skip-H2D when `device_valid` cuts redundant uploads.
+/// Finish a launch: mark output device-valid; D2H only when `sync_host` (e.g. lm_head logits).
 fn finish_out(
     stream: &cuda_core::CudaStream,
     out_key: usize,
     out: &mut [f32],
-    _sync_host: bool,
+    sync_host: bool,
 ) -> LaunchResult {
     buffers::mark_valid(out_key)?;
-    buffers::download_to(stream, out_key, out)?;
+    if sync_host {
+        buffers::download_to(stream, out_key, out)?;
+    }
     Ok(())
 }
 
@@ -439,7 +439,137 @@ pub unsafe extern "C" fn launch_q4k_matmul(
         buffers::put_f32(x_key, xd, true)?;
         buffers::put_f32(o_key, od, false)?;
         rc??;
-        finish_out(&stream, o_key, out, true)
+        // Sync host only for vocab-sized outputs (lm_head / sampling).
+        finish_out(&stream, o_key, out, out_dim >= 16384)
+    })
+}
+
+/// Q6_K matvec: weight [out,in] Q6K × x [in] f32 → y [out] f32.
+pub unsafe extern "C" fn launch_q6k_matmul(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let x_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        if w_t.dtype != DType::Q6K as u32 {
+            return Err(-10);
+        }
+        let wdims = dims(w_t);
+        if wdims.len() < 2 {
+            return Err(-2);
+        }
+        let out_dim = wdims[0] as u32;
+        let in_dim = wdims[1] as usize;
+        if in_dim % (Q6K_BLOCK_ELEMS as usize) != 0 {
+            return Err(-2);
+        }
+        let n_blocks = (in_dim / Q6K_BLOCK_ELEMS as usize) as u32;
+        let wb = bytes_slice(w_t);
+        let expect = out_dim as usize * n_blocks as usize * Q6K_BLOCK_BYTES as usize;
+        if wb.len() < expect {
+            return Err(-2);
+        }
+        let x = f32_slice(x_t)?;
+        let out = f32_slice_mut(out_t)?;
+        if x.len() != in_dim || out.len() != out_dim as usize {
+            return Err(-2);
+        }
+
+        let ctx = oxide_ctx();
+        let stream = ctx.default_stream();
+        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let module = oxide_module();
+        let rc = buffers::with_weight(w_key, |wd| unsafe {
+            module
+                .q6k_gemv_row(&stream, cfg_1d(out_dim), wd, &xd, out_dim, n_blocks, &mut od)
+                .map_err(|_| -4)
+        });
+        buffers::put_f32(x_key, xd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, out_dim >= 16384)
+    })
+}
+
+/// Q6_K embedding: dequantize one weight row on device.
+pub unsafe extern "C" fn launch_embedding_q6k(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let tok_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        if w_t.dtype != DType::Q6K as u32 {
+            return Err(-10);
+        }
+        let wdims = dims(w_t);
+        if wdims.len() < 2 {
+            return Err(-2);
+        }
+        let dim = wdims[1] as usize;
+        if dim % (Q6K_BLOCK_ELEMS as usize) != 0 {
+            return Err(-2);
+        }
+        let n_blocks = (dim / Q6K_BLOCK_ELEMS as usize) as u32;
+        let wb = bytes_slice(w_t);
+        let ids = u32_slice(tok_t)?;
+        if ids.is_empty() {
+            return Err(-2);
+        }
+        let token_id = ids[0];
+        let out = f32_slice_mut(out_t)?;
+        if out.len() != dim {
+            return Err(-2);
+        }
+        let row_bytes = n_blocks as usize * Q6K_BLOCK_BYTES as usize;
+        let need = (token_id as usize + 1) * row_bytes;
+        if wb.len() < need {
+            return Err(-2);
+        }
+
+        let ctx = oxide_ctx();
+        let stream = ctx.default_stream();
+        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let module = oxide_module();
+        let rc = buffers::with_weight(w_key, |wd| unsafe {
+            module
+                .embedding_q6k_row(
+                    &stream,
+                    cfg_1d(dim as u32),
+                    wd,
+                    token_id,
+                    dim as u32,
+                    n_blocks,
+                    &mut od,
+                )
+                .map_err(|_| -4)
+        });
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, false)
     })
 }
 

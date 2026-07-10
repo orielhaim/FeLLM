@@ -1,4 +1,4 @@
-//! Load `cuda_kernels` if present; expects B1 oxide ops registered.
+//! Load `cuda_kernels` if present; expects oxide ops including Add/Embedding.
 
 use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::HostContext;
@@ -28,11 +28,10 @@ fn load_cuda_kernels_registers_b1_ops() {
     let ctx = HostContext::new(0, 0, std::ptr::null_mut(), "cuda");
     host.load_path(&path, &ctx).expect("load cuda_kernels");
     let n = host.registry().len();
-    // B2: RmsNorm, SiluGate, Rope, MatMul(Q4K), Attention, KvWrite.
-    // Add/Embedding intentionally CPU until oxide numerics match.
+    // RmsNorm, SiluGate, Rope, MatMul(Q4K), Attention, KvWrite, Add, Embedding×2.
     assert!(
-        n >= 6,
-        "expected ≥6 oxide ops, got {n} from {}",
+        n >= 8,
+        "expected ≥8 oxide ops, got {n} from {}",
         path.display()
     );
     assert!(
@@ -63,6 +62,21 @@ fn load_cuda_kernels_registers_b1_ops() {
     assert!(
         host.registry()
             .lookup(OpKind::KvWrite, &[DType::F32, DType::F32], DType::F32)
+            .is_some()
+    );
+    assert!(
+        host.registry()
+            .lookup(OpKind::Add, &[DType::F32, DType::F32], DType::F32)
+            .is_some()
+    );
+    assert!(
+        host.registry()
+            .lookup(OpKind::Embedding, &[DType::F32, DType::U32], DType::F32)
+            .is_some()
+    );
+    assert!(
+        host.registry()
+            .lookup(OpKind::Embedding, &[DType::Q4K, DType::U32], DType::F32)
             .is_some()
     );
 }

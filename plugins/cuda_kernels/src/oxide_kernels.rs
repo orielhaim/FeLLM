@@ -7,6 +7,10 @@ use cuda_host::cuda_module;
 pub const Q4K_BLOCK_BYTES: u32 = 144;
 /// Elements per Q4_K super-block.
 pub const Q4K_BLOCK_ELEMS: u32 = 256;
+/// Q6_K super-block size (GGUF / ggml).
+pub const Q6K_BLOCK_BYTES: u32 = 210;
+/// Elements per Q6_K super-block.
+pub const Q6K_BLOCK_ELEMS: u32 = 256;
 
 #[cuda_module]
 pub mod kernels {
@@ -261,6 +265,75 @@ pub mod kernels {
         }
     }
 
+    /// Q6_K × f32 GEMV: one thread per output row.
+    ///
+    /// Weight layout matches ggml `block_q6_K` (210 bytes / 256 elems).
+    #[kernel]
+    pub fn q6k_gemv_row(
+        w: &[u8],
+        x: &[f32],
+        out_dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let row = idx.get();
+        if row >= out_dim as usize {
+            return;
+        }
+        let row_bytes = (n_blocks * Q6K_BLOCK_BYTES) as usize;
+        let row_off = row * row_bytes;
+        let mut acc = 0.0f32;
+
+        let mut b = 0u32;
+        while b < n_blocks {
+            let blk = row_off + (b as usize) * Q6K_BLOCK_BYTES as usize;
+            let d_bits = u16::from_le_bytes([w[blk + 208], w[blk + 209]]);
+            let d = f16_to_f32(d_bits);
+            let x_off = (b as usize) * Q6K_BLOCK_ELEMS as usize;
+
+            let mut half = 0usize;
+            while half < 2 {
+                let ql = blk + half * 64;
+                let qh = blk + 128 + half * 32;
+                let sc = blk + 192 + half * 8;
+                let y0 = x_off + half * 128;
+
+                let mut l = 0usize;
+                while l < 32 {
+                    let is = l / 16;
+                    let q1 = ((w[ql + l] & 0xF) as i32
+                        | (((w[qh + l] >> 0) & 3) as i32) << 4)
+                        - 32;
+                    let q2 = ((w[ql + l + 32] & 0xF) as i32
+                        | (((w[qh + l] >> 2) & 3) as i32) << 4)
+                        - 32;
+                    let q3 = ((w[ql + l] >> 4) as i32
+                        | (((w[qh + l] >> 4) & 3) as i32) << 4)
+                        - 32;
+                    let q4 = ((w[ql + l + 32] >> 4) as i32
+                        | (((w[qh + l] >> 6) & 3) as i32) << 4)
+                        - 32;
+                    let s0 = w[sc + is] as i8 as f32;
+                    let s1 = w[sc + is + 2] as i8 as f32;
+                    let s2 = w[sc + is + 4] as i8 as f32;
+                    let s3 = w[sc + is + 6] as i8 as f32;
+                    acc += d * s0 * (q1 as f32) * x[y0 + l];
+                    acc += d * s1 * (q2 as f32) * x[y0 + l + 32];
+                    acc += d * s2 * (q3 as f32) * x[y0 + l + 64];
+                    acc += d * s3 * (q4 as f32) * x[y0 + l + 96];
+                    l += 1;
+                }
+                half += 1;
+            }
+            b += 1;
+        }
+
+        if let Some(o) = out.get_mut(idx) {
+            *o = acc;
+        }
+    }
+
     /// Tiled Q4_K × f32 GEMV: 32 threads per output row, shared-memory reduce.
     ///
     /// Launch: `grid = (out_dim, 1, 1)`, `block = (32, 1, 1)`.
@@ -463,6 +536,65 @@ pub mod kernels {
         };
         if let Some(o) = out.get_mut(idx) {
             *o = d * scale * q - dmin * min_v;
+        }
+    }
+
+    /// Dequantize one Q6_K embedding row into f32.
+    #[kernel]
+    pub fn embedding_q6k_row(
+        w: &[u8],
+        token_id: u32,
+        dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= dim as usize {
+            return;
+        }
+        let row_bytes = (n_blocks * Q6K_BLOCK_BYTES) as usize;
+        let row_off = (token_id as usize) * row_bytes;
+        let b = i / Q6K_BLOCK_ELEMS as usize;
+        let j = i % Q6K_BLOCK_ELEMS as usize;
+        let blk = row_off + b * Q6K_BLOCK_BYTES as usize;
+
+        let d_bits = u16::from_le_bytes([w[blk + 208], w[blk + 209]]);
+        let d = f16_to_f32(d_bits);
+
+        let half = j / 128;
+        let local = j % 128;
+        let ql = blk + half * 64;
+        let qh = blk + 128 + half * 32;
+        let sc = blk + 192 + half * 8;
+
+        // Inverse of the 4-way pack in dequantize_q6_k_block.
+        let lane = local % 32;
+        let quad = local / 32; // 0..3 → q1..q4
+        let is = lane / 16;
+        let qh_shift = match quad {
+            0 => 0u32,
+            1 => 2,
+            2 => 4,
+            _ => 6,
+        };
+        let ql_idx = if quad == 0 || quad == 2 {
+            lane
+        } else {
+            lane + 32
+        };
+        let nibble = if quad == 0 || quad == 1 {
+            (w[ql + ql_idx] & 0xF) as i32
+        } else {
+            (w[ql + ql_idx] >> 4) as i32
+        };
+        let q = (nibble | ((((w[qh + lane] >> qh_shift) & 3) as i32) << 4)) - 32;
+        let scale = w[sc + is + quad * 2] as i8 as f32;
+        // sc indexing: q1→sc[is], q2→sc[is+2], q3→sc[is+4], q4→sc[is+6]
+        // quad*2 gives 0,2,4,6 ✓
+
+        if let Some(o) = out.get_mut(idx) {
+            *o = d * scale * (q as f32);
         }
     }
 

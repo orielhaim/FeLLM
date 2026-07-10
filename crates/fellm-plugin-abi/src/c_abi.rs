@@ -171,6 +171,10 @@ pub type PluginInitFn = unsafe extern "C" fn(ctx: *const HostContext) -> c_int;
 pub type PluginRegisterFn = unsafe extern "C" fn(registry: *mut KernelRegistryVtable) -> c_int;
 /// Required plugin entry: tear down plugin state.
 pub type PluginShutdownFn = unsafe extern "C" fn();
+/// Optional: invalidate a host f32 buffer's device mirror after a CPU write.
+///
+/// `ptr` is the host `*const f32`; `nbytes` is the byte length of the slice.
+pub type PluginInvalidateF32Fn = unsafe extern "C" fn(ptr: *const f32, nbytes: usize);
 
 /// Symbol names resolved by the host loader.
 pub mod symbols {
@@ -184,4 +188,6 @@ pub mod symbols {
     pub const REGISTER: &[u8] = b"_fellm_plugin_register\0";
     /// `_fellm_plugin_shutdown`
     pub const SHUTDOWN: &[u8] = b"_fellm_plugin_shutdown\0";
+    /// `_fellm_plugin_invalidate_f32` (optional)
+    pub const INVALIDATE_F32: &[u8] = b"_fellm_plugin_invalidate_f32\0";
 }

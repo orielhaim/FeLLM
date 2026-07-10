@@ -5,6 +5,398 @@ target triple = "nvptx64-nvidia-cuda"
 
 @__shared_mem_1 = addrspace(3) global [256 x float] undef, align 4
 @__shared_mem_0 = addrspace(3) global [32 x float] undef, align 4
+define void @q6k_gemv_row(i8* %v0, i64 %v1, i8* %v2, i64 %v3, i32 %v4, i32 %v5, i8* %v6, i64 %v7) #0 {
+entry:
+  %v8 = insertvalue { i8*, i64 } undef, i8* %v0, 0
+  %v9 = insertvalue { i8*, i64 } %v8, i64 %v1, 1
+  %v10 = insertvalue { i8*, i64 } undef, i8* %v2, 0
+  %v11 = insertvalue { i8*, i64 } %v10, i64 %v3, 1
+  %v12 = insertvalue { i8*, i64 } undef, i8* %v6, 0
+  %v13 = insertvalue { i8*, i64 } %v12, i64 %v7, 1
+  br label %bb0
+bb0:
+  %v14 = phi { i8*, i64 } [ %v9, %entry ]
+  %v15 = phi { i8*, i64 } [ %v11, %entry ]
+  %v16 = phi i32 [ %v4, %entry ]
+  %v17 = phi i32 [ %v5, %entry ]
+  %v18 = phi { i8*, i64 } [ %v13, %entry ]
+  %v253 = alloca {  }, align 1
+  %v19 = bitcast {  }* %v253 to i8*
+  %v254 = alloca [2 x i8], align 1
+  %v20 = bitcast [2 x i8]* %v254 to i8*
+  %v21 = getelementptr i8, i8* %v19, i64 0
+  %v22 = call i64 @cuda_device____internal__index_1d(i8* %v21) #0
+  br label %bb1
+bb1:
+  %v23 = zext i32 %v16 to i64
+  %v24 = icmp uge i64 %v22, %v23
+  %v25 = xor i1 %v24, 1
+  br i1 %v25, label %bb3, label %bb2
+bb2:
+  br label %bb35
+bb3:
+  %v26 = mul i32 %v17, 210
+  %v27 = zext i32 %v26 to i64
+  %v28 = mul i64 %v22, %v27
+  br label %bb4
+bb4:
+  %v29 = phi float [ 0.0, %bb3 ], [ %v55, %bb30 ]
+  %v30 = phi i32 [ 0, %bb3 ], [ %v235, %bb30 ]
+  %v31 = icmp ult i32 %v30, %v17
+  %v32 = xor i1 %v31, 1
+  br i1 %v32, label %bb31, label %bb5
+bb5:
+  %v33 = zext i32 %v30 to i64
+  %v34 = mul i64 %v33, 210
+  %v35 = add i64 %v28, %v34
+  %v36 = add i64 %v35, 208
+  %v37 = extractvalue { i8*, i64 } %v14, 1
+  %v38 = icmp ult i64 %v36, %v37
+  br i1 %v38, label %bb6, label %bb41
+bb6:
+  %v39 = extractvalue { i8*, i64 } %v14, 0
+  %v40 = getelementptr inbounds i8, i8* %v39, i64 %v36
+  %v41 = load i8, i8* %v40, align 1
+  %v42 = add i64 %v35, 209
+  %v43 = icmp ult i64 %v42, %v37
+  br i1 %v43, label %bb7, label %bb42
+bb7:
+  %v44 = extractvalue { i8*, i64 } %v14, 0
+  %v45 = getelementptr inbounds i8, i8* %v44, i64 %v42
+  %v46 = load i8, i8* %v45, align 1
+  %v255 = bitcast i8* %v20 to [2 x i8]*
+  %v47 = getelementptr inbounds [2 x i8], [2 x i8]* %v255, i32 0, i64 0
+  store i8 %v41, i8* %v47, align 1
+  %v256 = bitcast i8* %v20 to [2 x i8]*
+  %v48 = getelementptr inbounds [2 x i8], [2 x i8]* %v256, i32 0, i64 1
+  store i8 %v46, i8* %v48, align 1
+  %v257 = bitcast i8* %v20 to [2 x i8]*
+  %v49 = load [2 x i8], [2 x i8]* %v257, align 1
+  %v258 = alloca [2 x i8], align 2
+  %v50 = bitcast [2 x i8]* %v258 to i8*
+  %v259 = bitcast i8* %v50 to [2 x i8]*
+  store [2 x i8] %v49, [2 x i8]* %v259, align 2
+  %v260 = bitcast i8* %v50 to i16*
+  %v51 = load i16, i16* %v260, align 2
+  %v52 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v51) #0
+  br label %bb8
+bb8:
+  %v53 = zext i32 %v30 to i64
+  %v54 = mul i64 %v53, 256
+  br label %bb9
+bb9:
+  %v55 = phi float [ %v29, %bb8 ], [ %v69, %bb29 ]
+  %v56 = phi i64 [ 0, %bb8 ], [ %v234, %bb29 ]
+  %v57 = icmp ult i64 %v56, 2
+  %v58 = xor i1 %v57, 1
+  br i1 %v58, label %bb30, label %bb10
+bb10:
+  %v59 = mul i64 %v56, 64
+  %v60 = add i64 %v35, %v59
+  %v61 = add i64 %v35, 128
+  %v62 = mul i64 %v56, 32
+  %v63 = add i64 %v61, %v62
+  %v64 = add i64 %v35, 192
+  %v65 = mul i64 %v56, 8
+  %v66 = add i64 %v64, %v65
+  %v67 = mul i64 %v56, 128
+  %v68 = add i64 %v54, %v67
+  br label %bb11
+bb11:
+  %v69 = phi float [ %v55, %bb10 ], [ %v232, %bb28 ]
+  %v70 = phi i64 [ 0, %bb10 ], [ %v233, %bb28 ]
+  %v71 = icmp ult i64 %v70, 32
+  %v72 = xor i1 %v71, 1
+  br i1 %v72, label %bb29, label %bb12
+bb12:
+  %v73 = udiv i64 %v70, 16
+  %v74 = add i64 %v60, %v70
+  %v75 = icmp ult i64 %v74, %v37
+  br i1 %v75, label %bb13, label %bb43
+bb13:
+  %v76 = extractvalue { i8*, i64 } %v14, 0
+  %v77 = getelementptr inbounds i8, i8* %v76, i64 %v74
+  %v78 = load i8, i8* %v77, align 1
+  %v79 = and i8 %v78, 15
+  %v80 = zext i8 %v79 to i32
+  %v81 = add i64 %v63, %v70
+  %v82 = icmp ult i64 %v81, %v37
+  br i1 %v82, label %bb14, label %bb44
+bb14:
+  %v83 = extractvalue { i8*, i64 } %v14, 0
+  %v84 = getelementptr inbounds i8, i8* %v83, i64 %v81
+  %v85 = load i8, i8* %v84, align 1
+  %v86 = and i8 %v85, 3
+  %v87 = zext i8 %v86 to i32
+  %v88 = and i32 4, 31
+  %v89 = shl i32 %v87, %v88
+  %v90 = or i32 %v80, %v89
+  %v91 = sub i32 %v90, 32
+  %v92 = add i64 %v60, %v70
+  %v93 = add i64 %v92, 32
+  %v94 = icmp ult i64 %v93, %v37
+  br i1 %v94, label %bb15, label %bb45
+bb15:
+  %v95 = extractvalue { i8*, i64 } %v14, 0
+  %v96 = getelementptr inbounds i8, i8* %v95, i64 %v93
+  %v97 = load i8, i8* %v96, align 1
+  %v98 = and i8 %v97, 15
+  %v99 = zext i8 %v98 to i32
+  %v100 = add i64 %v63, %v70
+  %v101 = icmp ult i64 %v100, %v37
+  br i1 %v101, label %bb16, label %bb46
+bb16:
+  %v102 = extractvalue { i8*, i64 } %v14, 0
+  %v103 = getelementptr inbounds i8, i8* %v102, i64 %v100
+  %v104 = load i8, i8* %v103, align 1
+  %v105 = trunc i32 2 to i8
+  %v106 = and i8 %v105, 7
+  %v107 = lshr i8 %v104, %v106
+  %v108 = and i8 %v107, 3
+  %v109 = zext i8 %v108 to i32
+  %v110 = and i32 4, 31
+  %v111 = shl i32 %v109, %v110
+  %v112 = or i32 %v99, %v111
+  %v113 = sub i32 %v112, 32
+  %v114 = add i64 %v60, %v70
+  %v115 = icmp ult i64 %v114, %v37
+  br i1 %v115, label %bb17, label %bb47
+bb17:
+  %v116 = extractvalue { i8*, i64 } %v14, 0
+  %v117 = getelementptr inbounds i8, i8* %v116, i64 %v114
+  %v118 = load i8, i8* %v117, align 1
+  %v119 = trunc i32 4 to i8
+  %v120 = and i8 %v119, 7
+  %v121 = lshr i8 %v118, %v120
+  %v122 = zext i8 %v121 to i32
+  %v123 = add i64 %v63, %v70
+  %v124 = icmp ult i64 %v123, %v37
+  br i1 %v124, label %bb18, label %bb48
+bb18:
+  %v125 = extractvalue { i8*, i64 } %v14, 0
+  %v126 = getelementptr inbounds i8, i8* %v125, i64 %v123
+  %v127 = load i8, i8* %v126, align 1
+  %v128 = trunc i32 4 to i8
+  %v129 = and i8 %v128, 7
+  %v130 = lshr i8 %v127, %v129
+  %v131 = and i8 %v130, 3
+  %v132 = zext i8 %v131 to i32
+  %v133 = and i32 4, 31
+  %v134 = shl i32 %v132, %v133
+  %v135 = or i32 %v122, %v134
+  %v136 = sub i32 %v135, 32
+  %v137 = add i64 %v60, %v70
+  %v138 = add i64 %v137, 32
+  %v139 = icmp ult i64 %v138, %v37
+  br i1 %v139, label %bb19, label %bb49
+bb19:
+  %v140 = extractvalue { i8*, i64 } %v14, 0
+  %v141 = getelementptr inbounds i8, i8* %v140, i64 %v138
+  %v142 = load i8, i8* %v141, align 1
+  %v143 = trunc i32 4 to i8
+  %v144 = and i8 %v143, 7
+  %v145 = lshr i8 %v142, %v144
+  %v146 = zext i8 %v145 to i32
+  %v147 = add i64 %v63, %v70
+  %v148 = icmp ult i64 %v147, %v37
+  br i1 %v148, label %bb20, label %bb50
+bb20:
+  %v149 = extractvalue { i8*, i64 } %v14, 0
+  %v150 = getelementptr inbounds i8, i8* %v149, i64 %v147
+  %v151 = load i8, i8* %v150, align 1
+  %v152 = trunc i32 6 to i8
+  %v153 = and i8 %v152, 7
+  %v154 = lshr i8 %v151, %v153
+  %v155 = and i8 %v154, 3
+  %v156 = zext i8 %v155 to i32
+  %v157 = and i32 4, 31
+  %v158 = shl i32 %v156, %v157
+  %v159 = or i32 %v146, %v158
+  %v160 = sub i32 %v159, 32
+  %v161 = add i64 %v66, %v73
+  %v162 = icmp ult i64 %v161, %v37
+  br i1 %v162, label %bb21, label %bb51
+bb21:
+  %v163 = extractvalue { i8*, i64 } %v14, 0
+  %v164 = getelementptr inbounds i8, i8* %v163, i64 %v161
+  %v165 = load i8, i8* %v164, align 1
+  %v166 = bitcast i8 %v165 to i8
+  %v167 = sitofp i8 %v166 to float
+  %v168 = add i64 %v161, 2
+  %v169 = icmp ult i64 %v168, %v37
+  br i1 %v169, label %bb22, label %bb52
+bb22:
+  %v170 = extractvalue { i8*, i64 } %v14, 0
+  %v171 = getelementptr inbounds i8, i8* %v170, i64 %v168
+  %v172 = load i8, i8* %v171, align 1
+  %v173 = bitcast i8 %v172 to i8
+  %v174 = sitofp i8 %v173 to float
+  %v175 = add i64 %v161, 4
+  %v176 = icmp ult i64 %v175, %v37
+  br i1 %v176, label %bb23, label %bb53
+bb23:
+  %v177 = extractvalue { i8*, i64 } %v14, 0
+  %v178 = getelementptr inbounds i8, i8* %v177, i64 %v175
+  %v179 = load i8, i8* %v178, align 1
+  %v180 = bitcast i8 %v179 to i8
+  %v181 = sitofp i8 %v180 to float
+  %v182 = add i64 %v161, 6
+  %v183 = icmp ult i64 %v182, %v37
+  br i1 %v183, label %bb24, label %bb54
+bb24:
+  %v184 = extractvalue { i8*, i64 } %v14, 0
+  %v185 = getelementptr inbounds i8, i8* %v184, i64 %v182
+  %v186 = load i8, i8* %v185, align 1
+  %v187 = bitcast i8 %v186 to i8
+  %v188 = sitofp i8 %v187 to float
+  %v189 = fmul contract float %v52, %v167
+  %v190 = sitofp i32 %v91 to float
+  %v191 = fmul contract float %v189, %v190
+  %v192 = add i64 %v68, %v70
+  %v193 = extractvalue { i8*, i64 } %v15, 1
+  %v194 = icmp ult i64 %v192, %v193
+  br i1 %v194, label %bb25, label %bb55
+bb25:
+  %v195 = extractvalue { i8*, i64 } %v15, 0
+  %v261 = bitcast i8* %v195 to float*
+  %v262 = getelementptr inbounds float, float* %v261, i64 %v192
+  %v196 = bitcast float* %v262 to i8*
+  %v263 = bitcast i8* %v196 to float*
+  %v197 = load float, float* %v263, align 4
+  %v198 = fmul contract float %v191, %v197
+  %v199 = fadd contract float %v69, %v198
+  %v200 = fmul contract float %v52, %v174
+  %v201 = sitofp i32 %v113 to float
+  %v202 = fmul contract float %v200, %v201
+  %v203 = add i64 %v68, %v70
+  %v204 = add i64 %v203, 32
+  %v205 = icmp ult i64 %v204, %v193
+  br i1 %v205, label %bb26, label %bb56
+bb26:
+  %v206 = extractvalue { i8*, i64 } %v15, 0
+  %v264 = bitcast i8* %v206 to float*
+  %v265 = getelementptr inbounds float, float* %v264, i64 %v204
+  %v207 = bitcast float* %v265 to i8*
+  %v266 = bitcast i8* %v207 to float*
+  %v208 = load float, float* %v266, align 4
+  %v209 = fmul contract float %v202, %v208
+  %v210 = fadd contract float %v199, %v209
+  %v211 = fmul contract float %v52, %v181
+  %v212 = sitofp i32 %v136 to float
+  %v213 = fmul contract float %v211, %v212
+  %v214 = add i64 %v68, %v70
+  %v215 = add i64 %v214, 64
+  %v216 = icmp ult i64 %v215, %v193
+  br i1 %v216, label %bb27, label %bb57
+bb27:
+  %v217 = extractvalue { i8*, i64 } %v15, 0
+  %v267 = bitcast i8* %v217 to float*
+  %v268 = getelementptr inbounds float, float* %v267, i64 %v215
+  %v218 = bitcast float* %v268 to i8*
+  %v269 = bitcast i8* %v218 to float*
+  %v219 = load float, float* %v269, align 4
+  %v220 = fmul contract float %v213, %v219
+  %v221 = fadd contract float %v210, %v220
+  %v222 = fmul contract float %v52, %v188
+  %v223 = sitofp i32 %v160 to float
+  %v224 = fmul contract float %v222, %v223
+  %v225 = add i64 %v68, %v70
+  %v226 = add i64 %v225, 96
+  %v227 = icmp ult i64 %v226, %v193
+  br i1 %v227, label %bb28, label %bb58
+bb28:
+  %v228 = extractvalue { i8*, i64 } %v15, 0
+  %v270 = bitcast i8* %v228 to float*
+  %v271 = getelementptr inbounds float, float* %v270, i64 %v226
+  %v229 = bitcast float* %v271 to i8*
+  %v272 = bitcast i8* %v229 to float*
+  %v230 = load float, float* %v272, align 4
+  %v231 = fmul contract float %v224, %v230
+  %v232 = fadd contract float %v221, %v231
+  %v233 = add i64 %v70, 1
+  br label %bb11
+bb29:
+  %v234 = add i64 %v56, 1
+  br label %bb9
+bb30:
+  %v235 = add i32 %v30, 1
+  br label %bb4
+bb31:
+  %v236 = extractvalue { i8*, i64 } %v18, 1
+  %v237 = icmp ult i64 %v22, %v236
+  %v238 = xor i1 %v237, 1
+  br i1 %v238, label %bb37, label %bb36
+bb32:
+  %v239 = extractvalue { i8, i8* } %v245, 1
+  %v273 = bitcast i8* %v239 to float*
+  store float %v29, float* %v273, align 4
+  br label %bb34
+bb33:
+  br label %bb34
+bb34:
+  br label %bb35
+bb35:
+  ret void
+bb36:
+  %v240 = extractvalue { i8*, i64 } %v18, 0
+  %v274 = bitcast i8* %v240 to float*
+  %v275 = getelementptr inbounds float, float* %v274, i64 %v22
+  %v241 = bitcast float* %v275 to i8*
+  %v242 = insertvalue { i8, i8* } undef, i8 1, 0
+  %v243 = insertvalue { i8, i8* } %v242, i8* %v241, 1
+  br label %bb38
+bb37:
+  %v244 = insertvalue { i8, i8* } undef, i8 0, 0
+  br label %bb38
+bb38:
+  %v245 = phi { i8, i8* } [ %v243, %bb36 ], [ %v244, %bb37 ]
+  %v246 = extractvalue { i8, i8* } %v245, 0
+  %v247 = zext i8 %v246 to i64
+  %v248 = icmp eq i64 %v247, 1
+  br i1 %v248, label %bb32, label %bb39
+bb39:
+  %v249 = icmp eq i64 %v247, 0
+  br i1 %v249, label %bb33, label %bb40
+bb40:
+  unreachable
+bb41:
+  unreachable
+bb42:
+  unreachable
+bb43:
+  unreachable
+bb44:
+  unreachable
+bb45:
+  unreachable
+bb46:
+  unreachable
+bb47:
+  unreachable
+bb48:
+  unreachable
+bb49:
+  unreachable
+bb50:
+  unreachable
+bb51:
+  unreachable
+bb52:
+  unreachable
+bb53:
+  unreachable
+bb54:
+  unreachable
+bb55:
+  unreachable
+bb56:
+  unreachable
+bb57:
+  unreachable
+bb58:
+  unreachable
+}
+
 define void @embedding_q4k_row(i8* %v0, i64 %v1, i32 %v2, i32 %v3, i32 %v4, i8* %v5, i64 %v6) #0 {
 entry:
   %v7 = insertvalue { i8*, i64 } undef, i8* %v0, 0
@@ -1654,6 +2046,230 @@ bb27:
   unreachable
 }
 
+define void @embedding_q6k_row(i8* %v0, i64 %v1, i32 %v2, i32 %v3, i32 %v4, i8* %v5, i64 %v6) #0 {
+entry:
+  %v7 = insertvalue { i8*, i64 } undef, i8* %v0, 0
+  %v8 = insertvalue { i8*, i64 } %v7, i64 %v1, 1
+  %v9 = insertvalue { i8*, i64 } undef, i8* %v5, 0
+  %v10 = insertvalue { i8*, i64 } %v9, i64 %v6, 1
+  br label %bb0
+bb0:
+  %v11 = phi { i8*, i64 } [ %v8, %entry ]
+  %v12 = phi i32 [ %v2, %entry ]
+  %v13 = phi i32 [ %v3, %entry ]
+  %v14 = phi i32 [ %v4, %entry ]
+  %v15 = phi { i8*, i64 } [ %v10, %entry ]
+  %v131 = alloca {  }, align 1
+  %v16 = bitcast {  }* %v131 to i8*
+  %v132 = alloca [2 x i8], align 1
+  %v17 = bitcast [2 x i8]* %v132 to i8*
+  %v18 = getelementptr i8, i8* %v16, i64 0
+  %v19 = call i64 @cuda_device____internal__index_1d(i8* %v18) #0
+  br label %bb1
+bb1:
+  %v20 = zext i32 %v13 to i64
+  %v21 = icmp uge i64 %v19, %v20
+  %v22 = xor i1 %v21, 1
+  br i1 %v22, label %bb3, label %bb2
+bb2:
+  br label %bb29
+bb3:
+  %v23 = mul i32 %v14, 210
+  %v24 = zext i32 %v23 to i64
+  %v25 = zext i32 %v12 to i64
+  %v26 = mul i64 %v25, %v24
+  %v27 = udiv i64 %v19, 256
+  %v28 = urem i64 %v19, 256
+  %v29 = mul i64 %v27, 210
+  %v30 = add i64 %v26, %v29
+  %v31 = add i64 %v30, 208
+  %v32 = extractvalue { i8*, i64 } %v11, 1
+  %v33 = icmp ult i64 %v31, %v32
+  br i1 %v33, label %bb4, label %bb35
+bb4:
+  %v34 = extractvalue { i8*, i64 } %v11, 0
+  %v35 = getelementptr inbounds i8, i8* %v34, i64 %v31
+  %v36 = load i8, i8* %v35, align 1
+  %v37 = add i64 %v30, 209
+  %v38 = icmp ult i64 %v37, %v32
+  br i1 %v38, label %bb5, label %bb36
+bb5:
+  %v39 = extractvalue { i8*, i64 } %v11, 0
+  %v40 = getelementptr inbounds i8, i8* %v39, i64 %v37
+  %v41 = load i8, i8* %v40, align 1
+  %v133 = bitcast i8* %v17 to [2 x i8]*
+  %v42 = getelementptr inbounds [2 x i8], [2 x i8]* %v133, i32 0, i64 0
+  store i8 %v36, i8* %v42, align 1
+  %v134 = bitcast i8* %v17 to [2 x i8]*
+  %v43 = getelementptr inbounds [2 x i8], [2 x i8]* %v134, i32 0, i64 1
+  store i8 %v41, i8* %v43, align 1
+  %v135 = bitcast i8* %v17 to [2 x i8]*
+  %v44 = load [2 x i8], [2 x i8]* %v135, align 1
+  %v136 = alloca [2 x i8], align 2
+  %v45 = bitcast [2 x i8]* %v136 to i8*
+  %v137 = bitcast i8* %v45 to [2 x i8]*
+  store [2 x i8] %v44, [2 x i8]* %v137, align 2
+  %v138 = bitcast i8* %v45 to i16*
+  %v46 = load i16, i16* %v138, align 2
+  %v47 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v46) #0
+  br label %bb6
+bb6:
+  %v48 = udiv i64 %v28, 128
+  %v49 = urem i64 %v28, 128
+  %v50 = mul i64 %v48, 64
+  %v51 = add i64 %v30, %v50
+  %v52 = add i64 %v30, 128
+  %v53 = mul i64 %v48, 32
+  %v54 = add i64 %v52, %v53
+  %v55 = add i64 %v30, 192
+  %v56 = mul i64 %v48, 8
+  %v57 = add i64 %v55, %v56
+  %v58 = urem i64 %v49, 32
+  %v59 = udiv i64 %v49, 32
+  %v60 = udiv i64 %v58, 16
+  %v61 = icmp eq i64 %v59, 0
+  br i1 %v61, label %bb12, label %bb7
+bb7:
+  %v62 = icmp eq i64 %v59, 1
+  br i1 %v62, label %bb11, label %bb8
+bb8:
+  %v63 = icmp eq i64 %v59, 2
+  br i1 %v63, label %bb10, label %bb9
+bb9:
+  br label %bb13
+bb10:
+  br label %bb13
+bb11:
+  br label %bb13
+bb12:
+  br label %bb13
+bb13:
+  %v64 = phi i32 [ 6, %bb9 ], [ 4, %bb10 ], [ 2, %bb11 ], [ 0, %bb12 ]
+  %v65 = icmp eq i64 %v59, 0
+  %v66 = icmp eq i64 %v59, 0
+  br i1 %v66, label %bb15, label %bb14
+bb14:
+  %v67 = icmp eq i64 %v59, 2
+  br i1 %v67, label %bb15, label %bb16
+bb15:
+  br label %bb17
+bb16:
+  %v68 = add i64 %v58, 32
+  br label %bb17
+bb17:
+  %v69 = phi i64 [ %v58, %bb15 ], [ %v68, %bb16 ]
+  %v70 = xor i1 %v65, 1
+  br i1 %v70, label %bb18, label %bb19
+bb18:
+  %v71 = icmp eq i64 %v59, 1
+  br i1 %v71, label %bb19, label %bb21
+bb19:
+  %v72 = add i64 %v51, %v69
+  %v73 = icmp ult i64 %v72, %v32
+  br i1 %v73, label %bb20, label %bb37
+bb20:
+  %v74 = extractvalue { i8*, i64 } %v11, 0
+  %v75 = getelementptr inbounds i8, i8* %v74, i64 %v72
+  %v76 = load i8, i8* %v75, align 1
+  %v77 = and i8 %v76, 15
+  %v78 = zext i8 %v77 to i32
+  br label %bb23
+bb21:
+  %v79 = add i64 %v51, %v69
+  %v80 = icmp ult i64 %v79, %v32
+  br i1 %v80, label %bb22, label %bb38
+bb22:
+  %v81 = extractvalue { i8*, i64 } %v11, 0
+  %v82 = getelementptr inbounds i8, i8* %v81, i64 %v79
+  %v83 = load i8, i8* %v82, align 1
+  %v84 = trunc i32 4 to i8
+  %v85 = and i8 %v84, 7
+  %v86 = lshr i8 %v83, %v85
+  %v87 = zext i8 %v86 to i32
+  br label %bb23
+bb23:
+  %v88 = phi i32 [ %v78, %bb20 ], [ %v87, %bb22 ]
+  %v89 = add i64 %v54, %v58
+  %v90 = icmp ult i64 %v89, %v32
+  br i1 %v90, label %bb24, label %bb39
+bb24:
+  %v91 = extractvalue { i8*, i64 } %v11, 0
+  %v92 = getelementptr inbounds i8, i8* %v91, i64 %v89
+  %v93 = load i8, i8* %v92, align 1
+  %v94 = trunc i32 %v64 to i8
+  %v95 = and i8 %v94, 7
+  %v96 = lshr i8 %v93, %v95
+  %v97 = and i8 %v96, 3
+  %v98 = zext i8 %v97 to i32
+  %v99 = and i32 4, 31
+  %v100 = shl i32 %v98, %v99
+  %v101 = or i32 %v88, %v100
+  %v102 = sub i32 %v101, 32
+  %v103 = add i64 %v57, %v60
+  %v104 = mul i64 %v59, 2
+  %v105 = add i64 %v103, %v104
+  %v106 = icmp ult i64 %v105, %v32
+  br i1 %v106, label %bb25, label %bb40
+bb25:
+  %v107 = extractvalue { i8*, i64 } %v11, 0
+  %v108 = getelementptr inbounds i8, i8* %v107, i64 %v105
+  %v109 = load i8, i8* %v108, align 1
+  %v110 = bitcast i8 %v109 to i8
+  %v111 = sitofp i8 %v110 to float
+  %v112 = extractvalue { i8*, i64 } %v15, 1
+  %v113 = icmp ult i64 %v19, %v112
+  %v114 = xor i1 %v113, 1
+  br i1 %v114, label %bb31, label %bb30
+bb26:
+  %v115 = extractvalue { i8, i8* } %v124, 1
+  %v116 = fmul contract float %v47, %v111
+  %v117 = sitofp i32 %v102 to float
+  %v118 = fmul contract float %v116, %v117
+  %v139 = bitcast i8* %v115 to float*
+  store float %v118, float* %v139, align 4
+  br label %bb28
+bb27:
+  br label %bb28
+bb28:
+  br label %bb29
+bb29:
+  ret void
+bb30:
+  %v119 = extractvalue { i8*, i64 } %v15, 0
+  %v140 = bitcast i8* %v119 to float*
+  %v141 = getelementptr inbounds float, float* %v140, i64 %v19
+  %v120 = bitcast float* %v141 to i8*
+  %v121 = insertvalue { i8, i8* } undef, i8 1, 0
+  %v122 = insertvalue { i8, i8* } %v121, i8* %v120, 1
+  br label %bb32
+bb31:
+  %v123 = insertvalue { i8, i8* } undef, i8 0, 0
+  br label %bb32
+bb32:
+  %v124 = phi { i8, i8* } [ %v122, %bb30 ], [ %v123, %bb31 ]
+  %v125 = extractvalue { i8, i8* } %v124, 0
+  %v126 = zext i8 %v125 to i64
+  %v127 = icmp eq i64 %v126, 1
+  br i1 %v127, label %bb26, label %bb33
+bb33:
+  %v128 = icmp eq i64 %v126, 0
+  br i1 %v128, label %bb27, label %bb34
+bb34:
+  unreachable
+bb35:
+  unreachable
+bb36:
+  unreachable
+bb37:
+  unreachable
+bb38:
+  unreachable
+bb39:
+  unreachable
+bb40:
+  unreachable
+}
+
 define void @add_f32(i8* %v0, i64 %v1, i8* %v2, i64 %v3, i8* %v4, i64 %v5) #0 {
 entry:
   %v6 = insertvalue { i8*, i64 } undef, i8* %v0, 0
@@ -3184,23 +3800,25 @@ bb0:
 }
 
 
-@llvm.used = appending global [12 x i8*] [i8* bitcast (void (i8*, i64, i32, i32, i32, i8*, i64)* @embedding_q4k_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i32, float, i8*, i64)* @rope to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, i32, i32, i32)* @kv_write_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i8*, i64)* @attention_heads to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row_tiled to i8*), i8* bitcast (void (i8*, i64, i32, i32, i8*, i64)* @embedding_f32 to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64)* @silu_gate to i8*), i8* bitcast (void (i8*, i64, i8*, i64, float, i32, i32, i8*, i64)* @rmsnorm_group to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64)* @add_f32 to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i32, i32, i32, i32, i32, i8*, i64)* @attention_paged_heads to i8*), i8* bitcast (void (float, i8*, i64, i8*, i64)* @scale_f32 to i8*)], section "llvm.metadata"
+@llvm.used = appending global [14 x i8*] [i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q6k_gemv_row to i8*), i8* bitcast (void (i8*, i64, i32, i32, i32, i8*, i64)* @embedding_q4k_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i32, float, i8*, i64)* @rope to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, i32, i32, i32)* @kv_write_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i8*, i64)* @attention_heads to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row_tiled to i8*), i8* bitcast (void (i8*, i64, i32, i32, i8*, i64)* @embedding_f32 to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64)* @silu_gate to i8*), i8* bitcast (void (i8*, i64, i8*, i64, float, i32, i32, i8*, i64)* @rmsnorm_group to i8*), i8* bitcast (void (i8*, i64, i32, i32, i32, i8*, i64)* @embedding_q6k_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64)* @add_f32 to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row to i8*), i8* bitcast (void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i32, i32, i32, i32, i32, i8*, i64)* @attention_paged_heads to i8*), i8* bitcast (void (float, i8*, i64, i8*, i64)* @scale_f32 to i8*)], section "llvm.metadata"
 
 attributes #0 = { convergent }
 
-!0 = !{void (i8*, i64, i32, i32, i32, i8*, i64)* @embedding_q4k_row, !"kernel", i32 1}
-!1 = !{void (i8*, i64, i8*, i64, i32, i32, i32, float, i8*, i64)* @rope, !"kernel", i32 1}
-!2 = !{void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, i32, i32, i32)* @kv_write_row, !"kernel", i32 1}
-!3 = !{void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i8*, i64)* @attention_heads, !"kernel", i32 1}
-!4 = !{void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row_tiled, !"kernel", i32 1}
-!5 = !{void (i8*, i64, i32, i32, i8*, i64)* @embedding_f32, !"kernel", i32 1}
-!6 = !{void (i8*, i64, i8*, i64, i8*, i64)* @silu_gate, !"kernel", i32 1}
-!7 = !{void (i8*, i64, i8*, i64, float, i32, i32, i8*, i64)* @rmsnorm_group, !"kernel", i32 1}
-!8 = !{void (i8*, i64, i8*, i64, i8*, i64)* @add_f32, !"kernel", i32 1}
-!9 = !{void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row, !"kernel", i32 1}
-!10 = !{void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i32, i32, i32, i32, i32, i8*, i64)* @attention_paged_heads, !"kernel", i32 1}
-!11 = !{void (float, i8*, i64, i8*, i64)* @scale_f32, !"kernel", i32 1}
-!nvvm.annotations = !{!0, !1, !2, !3, !4, !5, !6, !7, !8, !9, !10, !11}
+!0 = !{void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q6k_gemv_row, !"kernel", i32 1}
+!1 = !{void (i8*, i64, i32, i32, i32, i8*, i64)* @embedding_q4k_row, !"kernel", i32 1}
+!2 = !{void (i8*, i64, i8*, i64, i32, i32, i32, float, i8*, i64)* @rope, !"kernel", i32 1}
+!3 = !{void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, i32, i32, i32)* @kv_write_row, !"kernel", i32 1}
+!4 = !{void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i8*, i64)* @attention_heads, !"kernel", i32 1}
+!5 = !{void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row_tiled, !"kernel", i32 1}
+!6 = !{void (i8*, i64, i32, i32, i8*, i64)* @embedding_f32, !"kernel", i32 1}
+!7 = !{void (i8*, i64, i8*, i64, i8*, i64)* @silu_gate, !"kernel", i32 1}
+!8 = !{void (i8*, i64, i8*, i64, float, i32, i32, i8*, i64)* @rmsnorm_group, !"kernel", i32 1}
+!9 = !{void (i8*, i64, i32, i32, i32, i8*, i64)* @embedding_q6k_row, !"kernel", i32 1}
+!10 = !{void (i8*, i64, i8*, i64, i8*, i64)* @add_f32, !"kernel", i32 1}
+!11 = !{void (i8*, i64, i8*, i64, i32, i32, i8*, i64)* @q4k_gemv_row, !"kernel", i32 1}
+!12 = !{void (i8*, i64, i8*, i64, i8*, i64, i32, i32, i32, i32, float, i32, i32, i32, i32, i32, i8*, i64)* @attention_paged_heads, !"kernel", i32 1}
+!13 = !{void (float, i8*, i64, i8*, i64)* @scale_f32, !"kernel", i32 1}
+!nvvm.annotations = !{!0, !1, !2, !3, !4, !5, !6, !7, !8, !9, !10, !11, !12, !13}
 
-!nvvmir.version = !{!12}
-!12 = !{i32 2, i32 0, i32 3, i32 1}
+!nvvmir.version = !{!14}
+!14 = !{i32 2, i32 0, i32 3, i32 1}

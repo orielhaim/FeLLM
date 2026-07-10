@@ -56,7 +56,12 @@ impl CudaBackend {
             Some(PathBuf::from("plugins/dist")),
             Some(PathBuf::from("plugins")),
         ];
+        let mut seen = std::collections::HashSet::new();
         for dir in dirs.into_iter().flatten() {
+            let canon = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+            if !seen.insert(canon) {
+                continue;
+            }
             if dir.is_dir() {
                 let _ = plugins.load_dir(Some(&dir), &ctx);
             }
@@ -64,14 +69,12 @@ impl CudaBackend {
         let cpu = CpuBackend::new();
         let caps = cpu.capabilities();
         let plugin_ops = plugins.registry().len();
-        // Default OFF until oxide kernels are numerically validated against CPU.
-        // Opt-in: FELLM_PLUGIN_KERNELS=1. CUDA still benefits from no full-KV H2D
-        // even when ops run on the embedded CPU backend.
+        // Default ON when registry non-empty. Opt-out: FELLM_PLUGIN_KERNELS=0.
         let use_plugins = Self::resolve_use_plugins(plugin_ops);
         tracing::info!(
             plugin_ops,
             use_plugins,
-            "CUDA device up (set FELLM_PLUGIN_KERNELS=1 to enable oxide ops when registered)"
+            "CUDA device up (set FELLM_PLUGIN_KERNELS=0 to disable oxide ops)"
         );
         Ok(Self {
             device,
@@ -86,12 +89,12 @@ impl CudaBackend {
         })
     }
 
-    /// `FELLM_PLUGIN_KERNELS`: unset/`0`/`false`/`off` → off; any other value → on when ops exist.
+    /// `FELLM_PLUGIN_KERNELS`: `0`/`false`/`off` → off; unset or any other value → on when ops exist.
     fn resolve_use_plugins(plugin_ops: usize) -> bool {
         match std::env::var_os("FELLM_PLUGIN_KERNELS") {
             Some(v) if v == "0" || v == "false" || v == "off" => false,
             Some(_) => plugin_ops > 0,
-            None => false,
+            None => plugin_ops > 0, // default ON
         }
     }
 
@@ -375,7 +378,12 @@ impl Backend for CudaBackend {
         }
         if handle.0 & CPU_FALLBACK_BIT != 0 {
             let cpu_handle = KernelHandle(handle.0 & (CPU_FALLBACK_BIT - 1));
-            return self.cpu.launch(cpu_handle, attrs, inputs, outputs, 0);
+            let result = self.cpu.launch(cpu_handle, attrs, inputs, outputs, 0);
+            if result.is_ok() && self.use_plugins {
+                // CPU wrote host activations; drop stale device_valid mirrors.
+                self.plugins.invalidate_f32_outputs(outputs);
+            }
+            return result;
         }
         Err(FellmError::other(format!(
             "unknown cuda handle {:#x}",
