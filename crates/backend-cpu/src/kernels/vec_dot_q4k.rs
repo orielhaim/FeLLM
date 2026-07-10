@@ -85,6 +85,14 @@ pub fn vec_dot_q4_k_q8_k_row(row: &[u8], xq: &[Q8KBlock]) -> f32 {
     debug_assert_eq!(row.len(), n_blocks * Q4_K_BLOCK_BYTES);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            // SAFETY: feature gate above.
+            return unsafe { vec_dot_q4_k_q8_k_row_avx512(row, xq) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: feature gate above.
             return unsafe { vec_dot_q4_k_q8_k_row_avx2(row, xq) };
@@ -159,7 +167,7 @@ mod x86_avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
+    pub(crate) unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
         #[cfg(target_arch = "x86")]
         use core::arch::x86::*;
         #[cfg(target_arch = "x86_64")]
@@ -170,7 +178,7 @@ mod x86_avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    pub(super) unsafe fn hsum_float_8(v: __m256) -> f32 {
+    pub(crate) unsafe fn hsum_float_8(v: __m256) -> f32 {
         #[cfg(target_arch = "x86")]
         use core::arch::x86::*;
         #[cfg(target_arch = "x86_64")]
@@ -340,6 +348,106 @@ mod x86_avx2 {
 use x86_avx2::{
     vec_dot_q4_k_q8_k_avx2, vec_dot_q4_k_q8_k_row_avx2, vec_dot_q4_k_q8_k_row_avx2_nofma,
 };
+
+/// AVX-512 path: same numerics as AVX2, but processes 128 weights per inner step
+/// with 512-bit loads (maddubs still on 256-bit halves — no `_mm512_maddubs_epi16`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86_avx512 {
+    use super::x86_avx2::{get_scale_shuffle_k4, hsum_float_8};
+    use super::*;
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn vec_dot_q4_k_q8_k_row_avx512(row: &[u8], xq: &[Q8KBlock]) -> f32 {
+        unsafe {
+            let n_blocks = xq.len();
+            let m4 = _mm256_set1_epi8(0x0F_u8 as i8);
+            let mut acc = _mm256_setzero_ps();
+            let mut acc_m = _mm_setzero_ps();
+
+            for i in 0..n_blocks {
+                let blk = row.as_ptr().add(i * Q4_K_BLOCK_BYTES);
+                let d = xq[i].d * f16::from_bits(u16::from_le_bytes([*blk, *blk.add(1)])).to_f32();
+                let dmin = -xq[i].d
+                    * f16::from_bits(u16::from_le_bytes([*blk.add(2), *blk.add(3)])).to_f32();
+
+                let utmp = decode_utmp(core::slice::from_raw_parts(blk.add(4), 12));
+                let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
+                    utmp[3] as i32,
+                    utmp[2] as i32,
+                    utmp[1] as i32,
+                    utmp[0] as i32,
+                ));
+
+                let q8sums = _mm256_loadu_si256(xq[i].bsums.as_ptr().cast());
+                let q8s = _mm_hadd_epi16(
+                    _mm256_extracti128_si256(q8sums, 0),
+                    _mm256_extracti128_si256(q8sums, 1),
+                );
+                let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+                acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+                let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+                let scales = _mm256_insertf128_si256(_mm256_castsi128_si256(sc128), sc128, 1);
+
+                let mut q4 = blk.add(16);
+                let mut q8p = xq[i].qs.as_ptr();
+                let mut sumi = _mm256_setzero_si256();
+
+                // Two 64-weight chunks per iteration via 512-bit loads → 256-bit halves.
+                for j in 0..QK_K / 128 {
+                    let q4_512 = _mm512_loadu_si512(q4 as *const __m512i);
+                    q4 = q4.add(64);
+                    let q8a_512 = _mm512_loadu_si512(q8p as *const __m512i);
+                    q8p = q8p.add(64);
+                    let q8b_512 = _mm512_loadu_si512(q8p as *const __m512i);
+                    q8p = q8p.add(64);
+
+                    let q4_lo = _mm512_castsi512_si256(q4_512);
+                    let q4_hi = _mm512_extracti64x4_epi64(q4_512, 1);
+                    let q8a_lo = _mm512_castsi512_si256(q8a_512);
+                    let q8a_hi = _mm512_extracti64x4_epi64(q8a_512, 1);
+                    let q8b_lo = _mm512_castsi512_si256(q8b_512);
+                    let q8b_hi = _mm512_extracti64x4_epi64(q8b_512, 1);
+
+                    // Chunk 0 (weights 0..63): q8a = [q8lo0 | q8hi0].
+                    let scale_l0 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(4 * j));
+                    let scale_h0 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(4 * j + 1));
+                    let q4l0 = _mm256_and_si256(q4_lo, m4);
+                    let q4h0 = _mm256_and_si256(_mm256_srli_epi16(q4_lo, 4), m4);
+                    let p0 = _mm256_add_epi32(
+                        _mm256_madd_epi16(scale_l0, _mm256_maddubs_epi16(q4l0, q8a_lo)),
+                        _mm256_madd_epi16(scale_h0, _mm256_maddubs_epi16(q4h0, q8a_hi)),
+                    );
+
+                    // Chunk 1 (weights 64..127): q8b = [q8lo1 | q8hi1].
+                    let scale_l1 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(4 * j + 2));
+                    let scale_h1 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(4 * j + 3));
+                    let q4l1 = _mm256_and_si256(q4_hi, m4);
+                    let q4h1 = _mm256_and_si256(_mm256_srli_epi16(q4_hi, 4), m4);
+                    let p1 = _mm256_add_epi32(
+                        _mm256_madd_epi16(scale_l1, _mm256_maddubs_epi16(q4l1, q8b_lo)),
+                        _mm256_madd_epi16(scale_h1, _mm256_maddubs_epi16(q4h1, q8b_hi)),
+                    );
+
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p1));
+                }
+
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+
+            acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+            acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+            hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use x86_avx512::vec_dot_q4_k_q8_k_row_avx512;
 
 #[cfg(test)]
 mod tests {

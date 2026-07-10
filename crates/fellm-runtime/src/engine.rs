@@ -619,10 +619,23 @@ impl Engine {
 
     /// Attach radix-prefix blocks for `ids` onto `seq_cache`. Returns matched token count.
     pub fn attach_prefix(&mut self, ids: &[u32], seq_cache: &mut SequenceCache) -> usize {
-        self.model
+        let matched = self
+            .model
             .cache
             .prefix
-            .attach_match(&mut self.model.cache.pool, seq_cache, ids)
+            .attach_match(&mut self.model.cache.pool, seq_cache, ids);
+        #[cfg(feature = "backend-cuda")]
+        if matched > 0 {
+            if let Some(cuda) = self
+                .backend
+                .as_any()
+                .downcast_ref::<backend_cuda::CudaBackend>()
+            {
+                // Prefix reuses host-resident physical blocks; mirror once before decode.
+                cuda.mark_kv_host_dirty();
+            }
+        }
+        matched
     }
 
     /// Insert a completed prompt into the prefix tree.
@@ -689,6 +702,14 @@ impl Engine {
             }
         }
         seq_cache.swapped = false;
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cuda::CudaBackend>()
+        {
+            cuda.mark_kv_host_dirty();
+        }
         Ok(())
     }
 
@@ -842,13 +863,18 @@ impl LoadedModel {
             #[cfg(feature = "backend-cuda")]
             {
                 if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
-                    // Mirror host arena into VRAM so prefix / CPU writes are visible.
+                    // One-shot H2D only when host KV was mutated outside GPU KvWrite
+                    // (prefix attach / swap-in). Never re-upload the full arena every token.
                     let host = self.cache.pool.arena_bytes();
-                    if let Err(e) = cuda.sync_kv_host_to_device(host) {
+                    if let Err(e) = cuda.sync_kv_if_dirty(host) {
                         tracing::warn!(error = %e, "KV H2D sync failed");
                     }
-                    cuda.device_kv_ptr()
-                        .unwrap_or((std::ptr::null_mut(), 0))
+                    if cuda.plugins_enabled() {
+                        cuda.device_kv_ptr()
+                            .unwrap_or((std::ptr::null_mut(), 0))
+                    } else {
+                        (std::ptr::null_mut(), 0)
+                    }
                 } else {
                     (std::ptr::null_mut(), 0)
                 }
@@ -875,6 +901,8 @@ impl LoadedModel {
         }));
 
         let result = self.step_inner(backend, tok, pos, compute_logits);
+        // Plugin D2H of logits already drains the stream; synchronize is a no-op
+        // when plugins are disabled (see CudaBackend::synchronize).
         let _ = backend.synchronize();
         set_paged_context(None);
         result

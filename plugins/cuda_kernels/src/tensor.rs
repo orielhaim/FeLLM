@@ -30,6 +30,16 @@ pub fn bytes_slice(t: &TensorRef) -> &[u8] {
 }
 
 #[inline]
+pub fn u32_slice(t: &TensorRef) -> Result<&[u32], i32> {
+    if t.dtype != DType::U32 as u32 {
+        return Err(-10);
+    }
+    let n = (t.byte_len as usize) / 4;
+    // SAFETY: host owns the buffer for the launch duration.
+    Ok(unsafe { core::slice::from_raw_parts(t.data.cast::<u32>(), n) })
+}
+
+#[inline]
 pub fn dims(t: &TensorRef) -> &[u64] {
     &t.dims[..t.rank as usize]
 }

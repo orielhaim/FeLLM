@@ -13,6 +13,7 @@ use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use fellm_plugin_host::PluginHost;
 use std::any::Any;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Bit set on handles that route to the embedded CPU backend.
@@ -33,6 +34,10 @@ pub struct CudaBackend {
     /// Bucketed CUDA graphs for decode.
     graphs: Mutex<GraphCache>,
     caps: BackendCaps,
+    /// Whether oxide plugin kernels are used (default on when registry non-empty).
+    use_plugins: bool,
+    /// Host KV arena has writes that are not yet mirrored to VRAM (prefix / swap-in).
+    kv_host_dirty: AtomicBool,
 }
 
 impl CudaBackend {
@@ -59,12 +64,14 @@ impl CudaBackend {
         let cpu = CpuBackend::new();
         let caps = cpu.capabilities();
         let plugin_ops = plugins.registry().len();
-        let use_plugins = std::env::var_os("FELLM_PLUGIN_KERNELS")
-            .is_some_and(|v| v != "0" && v != "false" && v != "off");
+        // Default OFF until oxide kernels are numerically validated against CPU.
+        // Opt-in: FELLM_PLUGIN_KERNELS=1. CUDA still benefits from no full-KV H2D
+        // even when ops run on the embedded CPU backend.
+        let use_plugins = Self::resolve_use_plugins(plugin_ops);
         tracing::info!(
             plugin_ops,
             use_plugins,
-            "CUDA device up (ops run on CPU unless FELLM_PLUGIN_KERNELS=1 and oxide kernels are registered)"
+            "CUDA device up (set FELLM_PLUGIN_KERNELS=1 to enable oxide ops when registered)"
         );
         Ok(Self {
             device,
@@ -74,7 +81,45 @@ impl CudaBackend {
             swap: Mutex::new(None),
             graphs: Mutex::new(GraphCache::new()),
             caps,
+            use_plugins,
+            kv_host_dirty: AtomicBool::new(false),
         })
+    }
+
+    /// `FELLM_PLUGIN_KERNELS`: unset/`0`/`false`/`off` → off; any other value → on when ops exist.
+    fn resolve_use_plugins(plugin_ops: usize) -> bool {
+        match std::env::var_os("FELLM_PLUGIN_KERNELS") {
+            Some(v) if v == "0" || v == "false" || v == "off" => false,
+            Some(_) => plugin_ops > 0,
+            None => false,
+        }
+    }
+
+    /// Whether oxide plugin kernels are active for this backend.
+    #[must_use]
+    pub fn plugins_enabled(&self) -> bool {
+        self.use_plugins
+    }
+
+    /// Mark host KV as needing a one-shot H2D (prefix attach / swap-in).
+    pub fn mark_kv_host_dirty(&self) {
+        self.kv_host_dirty.store(true, Ordering::Release);
+    }
+
+    /// One-shot full-arena H2D if host KV is dirty and plugins are active.
+    ///
+    /// Decode does not call this every token — plugin `KvWrite` dual-writes keep
+    /// device KV coherent. Only prefix / swap-in / cold host writes set dirty.
+    pub fn sync_kv_if_dirty(&self, host: &[u8]) -> Result<()> {
+        if !self.use_plugins {
+            return Ok(());
+        }
+        if !self.kv_host_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.sync_kv_host_to_device(host)?;
+        self.kv_host_dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Device state.
@@ -265,6 +310,10 @@ impl Backend for CudaBackend {
     }
 
     fn synchronize(&self) -> Result<()> {
+        // No GPU work when plugins are off — skip driver sync.
+        if !self.use_plugins {
+            return Ok(());
+        }
         #[cfg(feature = "cuda")]
         {
             self.device
@@ -281,12 +330,7 @@ impl Backend for CudaBackend {
         input_dtypes: &[DType],
         output_dtype: DType,
     ) -> Option<KernelDescriptor> {
-        // Plugin kernels only when explicitly enabled. A stale/broken
-        // libcuda_kernels.so must never override correct CPU Q4_K / attention.
-        // Set FELLM_PLUGIN_KERNELS=1 after oxide kernels are validated.
-        let use_plugins = std::env::var_os("FELLM_PLUGIN_KERNELS")
-            .is_some_and(|v| v != "0" && v != "false" && v != "off");
-        if use_plugins {
+        if self.use_plugins {
             if let Some((h, _)) = self
                 .plugins
                 .registry()

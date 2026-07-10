@@ -29,9 +29,10 @@ fn load_cuda_kernels_registers_b1_ops() {
     host.load_path(&path, &ctx).expect("load cuda_kernels");
     let n = host.registry().len();
     // B2: RmsNorm, SiluGate, Rope, MatMul(Q4K), Attention, KvWrite.
+    // Add/Embedding intentionally CPU until oxide numerics match.
     assert!(
         n >= 6,
-        "expected ≥6 B2 oxide ops, got {n} from {}",
+        "expected ≥6 oxide ops, got {n} from {}",
         path.display()
     );
     assert!(

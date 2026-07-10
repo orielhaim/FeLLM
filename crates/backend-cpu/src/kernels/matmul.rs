@@ -52,6 +52,18 @@ thread_local! {
 pub fn quantize_row_q8_k(x: &[f32], out: &mut [Q8KBlock]) {
     debug_assert_eq!(x.len() % QK_K, 0);
     debug_assert_eq!(out.len(), x.len() / QK_K);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: feature gate above.
+            unsafe { quantize_row_q8_k_avx2(x, out) };
+            return;
+        }
+    }
+    quantize_row_q8_k_scalar(x, out);
+}
+
+fn quantize_row_q8_k_scalar(x: &[f32], out: &mut [Q8KBlock]) {
     for (b, blk) in out.iter_mut().enumerate() {
         let xb = &x[b * QK_K..(b + 1) * QK_K];
         let amax = xb.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -74,6 +86,68 @@ pub fn quantize_row_q8_k(x: &[f32], out: &mut [Q8KBlock]) {
             blk.bsums[g] = s as i16;
         }
         blk.d = amax / 127.0;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_row_q8_k_avx2(x: &[f32], out: &mut [Q8KBlock]) {
+    // SAFETY: caller gated on AVX2; Rust 2024 requires unsafe ops in unsafe fn bodies.
+    unsafe {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+
+        let n_blocks = out.len();
+        for b in 0..n_blocks {
+            let xb = &x[b * QK_K..(b + 1) * QK_K];
+            let blk = &mut out[b];
+
+            let mut vmax = _mm256_setzero_ps();
+            let sign = _mm256_set1_ps(-0.0);
+            let mut i = 0usize;
+            while i + 8 <= QK_K {
+                let v = _mm256_loadu_ps(xb.as_ptr().add(i));
+                let a = _mm256_andnot_ps(sign, v);
+                vmax = _mm256_max_ps(vmax, a);
+                i += 8;
+            }
+            let mut tmp = [0.0f32; 8];
+            _mm256_storeu_ps(tmp.as_mut_ptr(), vmax);
+            let amax = tmp.iter().copied().fold(0.0f32, f32::max);
+            if amax == 0.0 {
+                blk.d = 0.0;
+                blk.qs = [0i8; QK_K];
+                blk.bsums = [0i16; QK_K / 16];
+                continue;
+            }
+            let iscale = 127.0 / amax;
+            let vscale = _mm256_set1_ps(iscale);
+            i = 0;
+            while i + 8 <= QK_K {
+                let v = _mm256_mul_ps(_mm256_loadu_ps(xb.as_ptr().add(i)), vscale);
+                let vi = _mm256_cvtps_epi32(_mm256_round_ps(v, _MM_FROUND_TO_NEAREST_INT));
+                let lo = _mm256_castsi256_si128(vi);
+                let hi = _mm256_extracti128_si256(vi, 1);
+                let packed16 = _mm_packs_epi32(lo, hi);
+                let packed8 = _mm_packs_epi16(packed16, packed16);
+                let mut bytes = [0i8; 16];
+                _mm_storeu_si128(bytes.as_mut_ptr().cast(), packed8);
+                for k in 0..8 {
+                    blk.qs[i + k] = bytes[k];
+                }
+                i += 8;
+            }
+            for g in 0..QK_K / 16 {
+                let mut s = 0i32;
+                for l in 0..16 {
+                    s += blk.qs[g * 16 + l] as i32;
+                }
+                blk.bsums[g] = s as i16;
+            }
+            blk.d = amax / 127.0;
+        }
     }
 }
 
@@ -341,10 +415,40 @@ fn matvec_q4_k(
         .enumerate()
         .for_each(|(ci, y_chunk)| {
             let row0 = ci * chunk;
-            for (j, yi) in y_chunk.iter_mut().enumerate() {
+            let n = y_chunk.len();
+            for j in 0..n {
                 let i = row0 + j;
                 let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
-                *yi = vec_dot_q4_k_q8_k_row(row, xq);
+                // Prefetch next weight row into L2 while computing current.
+                if j + 1 < n {
+                    let next = w_bytes
+                        .as_ptr()
+                        .wrapping_add((i + 1) * bytes_per_row);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        // SAFETY: prefetch is a hint; address need not be dereferenceable.
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                next as *const i8,
+                                core::arch::x86_64::_MM_HINT_T1,
+                            );
+                        }
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        unsafe {
+                            core::arch::x86::_mm_prefetch(
+                                next as *const i8,
+                                core::arch::x86::_MM_HINT_T1,
+                            );
+                        }
+                    }
+                    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+                    {
+                        let _ = next;
+                    }
+                }
+                y_chunk[j] = vec_dot_q4_k_q8_k_row(row, xq);
             }
         });
 }

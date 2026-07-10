@@ -261,6 +261,211 @@ pub mod kernels {
         }
     }
 
+    /// Tiled Q4_K × f32 GEMV: 32 threads per output row, shared-memory reduce.
+    ///
+    /// Launch: `grid = (out_dim, 1, 1)`, `block = (32, 1, 1)`.
+    #[kernel]
+    pub fn q4k_gemv_row_tiled(
+        w: &[u8],
+        x: &[f32],
+        out_dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut PARTIAL: SharedArray<f32, 32> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let row = thread::blockIdx_x();
+        if row >= out_dim {
+            return;
+        }
+        let row_usz = row as usize;
+        let row_bytes = (n_blocks * Q4K_BLOCK_BYTES) as usize;
+        let row_off = row_usz * row_bytes;
+        let mut acc = 0.0f32;
+
+        let mut b = tid;
+        while b < n_blocks {
+            let blk = row_off + (b as usize) * Q4K_BLOCK_BYTES as usize;
+            let d_bits = u16::from_le_bytes([w[blk], w[blk + 1]]);
+            let dm_bits = u16::from_le_bytes([w[blk + 2], w[blk + 3]]);
+            let d = f16_to_f32(d_bits);
+            let dmin = f16_to_f32(dm_bits);
+
+            let (scales, mins) = decode_scales_mins(
+                w[blk + 4],
+                w[blk + 5],
+                w[blk + 6],
+                w[blk + 7],
+                w[blk + 8],
+                w[blk + 9],
+                w[blk + 10],
+                w[blk + 11],
+                w[blk + 12],
+                w[blk + 13],
+                w[blk + 14],
+                w[blk + 15],
+            );
+
+            let qs = blk + 16;
+            let x_off = (b as usize) * Q4K_BLOCK_ELEMS as usize;
+
+            let mut sum_min = 0.0f32;
+            let mut j = 0usize;
+            while j < 8 {
+                let mut s = 0.0f32;
+                let mut t = 0usize;
+                while t < 32 {
+                    s += x[x_off + j * 32 + t];
+                    t += 1;
+                }
+                sum_min += mins[j] as f32 * s;
+                j += 1;
+            }
+            acc -= dmin * sum_min;
+
+            let mut is = 0usize;
+            let mut off = 0usize;
+            let mut chunk = 0usize;
+            while chunk < 4 {
+                let qbase = qs + chunk * 32;
+                let scale_lo = scales[is] as f32;
+                is += 1;
+                let mut dot = 0.0f32;
+                let mut l = 0usize;
+                while l < 32 {
+                    let q = (w[qbase + l] & 0x0F) as f32;
+                    dot += q * x[x_off + off + l];
+                    l += 1;
+                }
+                acc += d * scale_lo * dot;
+                off += 32;
+
+                let scale_hi = scales[is] as f32;
+                is += 1;
+                let mut dot = 0.0f32;
+                let mut l = 0usize;
+                while l < 32 {
+                    let q = (w[qbase + l] >> 4) as f32;
+                    dot += q * x[x_off + off + l];
+                    l += 1;
+                }
+                acc += d * scale_hi * dot;
+                off += 32;
+                chunk += 1;
+            }
+            b += 32;
+        }
+
+        unsafe {
+            PARTIAL[tid as usize] = acc;
+        }
+        thread::sync_threads();
+
+        let mut stride = 16u32;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIAL[tid as usize] += PARTIAL[(tid + stride) as usize];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        if tid == 0 {
+            unsafe {
+                *out.get_unchecked_mut(row_usz) = PARTIAL[0];
+            }
+        }
+    }
+
+    /// Elementwise add: `out[i] = a[i] + b[i]`.
+    #[kernel]
+    pub fn add_f32(a: &[f32], b: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = a[i] + b[i];
+        }
+    }
+
+    /// Copy embedding row `token_id` from an f32 `[vocab, dim]` table.
+    #[kernel]
+    pub fn embedding_f32(table: &[f32], token_id: u32, dim: u32, mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= dim as usize {
+            return;
+        }
+        let src = (token_id as usize) * (dim as usize) + i;
+        if let Some(o) = out.get_mut(idx) {
+            *o = table[src];
+        }
+    }
+
+    /// Dequantize one Q4_K embedding row into f32.
+    ///
+    /// `w` is the full `[vocab, dim]` Q4_K matrix. Launch with `for_num_elems(dim)`.
+    #[kernel]
+    pub fn embedding_q4k_row(
+        w: &[u8],
+        token_id: u32,
+        dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= dim as usize {
+            return;
+        }
+        let row_bytes = (n_blocks * Q4K_BLOCK_BYTES) as usize;
+        let row_off = (token_id as usize) * row_bytes;
+        let b = i / Q4K_BLOCK_ELEMS as usize;
+        let j = i % Q4K_BLOCK_ELEMS as usize;
+        let blk = row_off + b * Q4K_BLOCK_BYTES as usize;
+
+        let d_bits = u16::from_le_bytes([w[blk], w[blk + 1]]);
+        let dm_bits = u16::from_le_bytes([w[blk + 2], w[blk + 3]]);
+        let d = f16_to_f32(d_bits);
+        let dmin = f16_to_f32(dm_bits);
+
+        let (scales, mins) = decode_scales_mins(
+            w[blk + 4],
+            w[blk + 5],
+            w[blk + 6],
+            w[blk + 7],
+            w[blk + 8],
+            w[blk + 9],
+            w[blk + 10],
+            w[blk + 11],
+            w[blk + 12],
+            w[blk + 13],
+            w[blk + 14],
+            w[blk + 15],
+        );
+
+        // j in 0..256: four chunks of 64 (lo32 + hi32), scale/min index = j/32.
+        let group = j / 32;
+        let lane = j % 32;
+        let scale = scales[group] as f32;
+        let min_v = mins[group] as f32;
+        let qs = blk + 16;
+        // chunk 0: j 0..63, chunk 1: 64..127, ...
+        let chunk = j / 64;
+        let within = j % 64;
+        let qbase = qs + chunk * 32;
+        let q = if within < 32 {
+            (w[qbase + lane] & 0x0F) as f32
+        } else {
+            (w[qbase + lane] >> 4) as f32
+        };
+        if let Some(o) = out.get_mut(idx) {
+            *o = d * scale * q - dmin * min_v;
+        }
+    }
+
     /// Contiguous multi-head attention (online softmax).
     ///
     /// Launch with `for_num_elems(n_heads)` — one thread per head.

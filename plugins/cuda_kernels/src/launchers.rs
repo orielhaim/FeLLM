@@ -1,7 +1,7 @@
-//! FFI launch wrappers: H2D → oxide kernel → D2H for host-resident tensors.
+//! FFI launch wrappers: activation-cached H2D → oxide kernel → D2H.
 
 use crate::buffers;
-use crate::tensor::{bytes_slice, dims, f32_slice, f32_slice_mut};
+use crate::tensor::{bytes_slice, dims, f32_slice, f32_slice_mut, u32_slice};
 use crate::{host_paged_snapshot, oxide_ctx, oxide_module, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS};
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use fellm_core::dtype::DType;
@@ -21,6 +21,20 @@ fn run(body: impl FnOnce() -> LaunchResult) -> i32 {
         Ok(Err(c)) => c,
         Err(_) => -99,
     }
+}
+
+/// Finish a launch: mark output valid and always D2H for numerical parity with
+/// the host graph (sampling + any CPU fallback). Allocation reuse still avoids
+/// per-op `cudaMalloc`; skip-H2D when `device_valid` cuts redundant uploads.
+fn finish_out(
+    stream: &cuda_core::CudaStream,
+    out_key: usize,
+    out: &mut [f32],
+    _sync_host: bool,
+) -> LaunchResult {
+    buffers::mark_valid(out_key)?;
+    buffers::download_to(stream, out_key, out)?;
+    Ok(())
 }
 
 /// `out = silu(gate) * up`
@@ -48,18 +62,23 @@ pub unsafe extern "C" fn launch_silu_gate(
         let n = gate.len();
         let ctx = oxide_ctx();
         let stream = ctx.default_stream();
-        let g = DeviceBuffer::from_host(&stream, gate).map_err(|_| -3)?;
-        let u = DeviceBuffer::from_host(&stream, up).map_err(|_| -3)?;
-        let mut o = DeviceBuffer::<f32>::zeroed(&stream, n).map_err(|_| -3)?;
+        let g_key = buffers::ensure_f32(&stream, gate, false)?;
+        let u_key = buffers::ensure_f32(&stream, up, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (g, _) = buffers::take_f32(g_key)?;
+        let (u, _) = buffers::take_f32(u_key)?;
+        let (mut o, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
-        unsafe {
+        let rc = unsafe {
             module
                 .silu_gate(&stream, cfg_1d(n as u32), &g, &u, &mut o)
-                .map_err(|_| -4)?;
-        }
-        let host = o.to_host_vec(&stream).map_err(|_| -5)?;
-        out.copy_from_slice(&host);
-        Ok(())
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(g_key, g, true)?;
+        buffers::put_f32(u_key, u, true)?;
+        buffers::put_f32(o_key, o, false)?;
+        rc?;
+        finish_out(&stream, o_key, out, false)
     })
 }
 
@@ -101,16 +120,19 @@ pub unsafe extern "C" fn launch_rmsnorm(
 
         let ctx = oxide_ctx();
         let stream = ctx.default_stream();
-        let xd = DeviceBuffer::from_host(&stream, x).map_err(|_| -3)?;
-        let wd = DeviceBuffer::from_host(&stream, w).map_err(|_| -3)?;
-        let mut od = DeviceBuffer::<f32>::zeroed(&stream, x.len()).map_err(|_| -3)?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let w_key = buffers::ensure_f32(&stream, w, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (wd, _) = buffers::take_f32(w_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
         let launch = LaunchConfig {
             grid_dim: (n_groups, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe {
+        let rc = unsafe {
             module
                 .rmsnorm_group(
                     &stream,
@@ -122,11 +144,13 @@ pub unsafe extern "C" fn launch_rmsnorm(
                     group_stride,
                     &mut od,
                 )
-                .map_err(|_| -4)?;
-        }
-        let host = od.to_host_vec(&stream).map_err(|_| -5)?;
-        out.copy_from_slice(&host);
-        Ok(())
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(x_key, xd, true)?;
+        buffers::put_f32(w_key, wd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc?;
+        finish_out(&stream, o_key, out, false)
     })
 }
 
@@ -157,11 +181,14 @@ pub unsafe extern "C" fn launch_rope(
         let n = x.len();
         let ctx = oxide_ctx();
         let stream = ctx.default_stream();
-        let xd = DeviceBuffer::from_host(&stream, x).map_err(|_| -3)?;
-        let fd = DeviceBuffer::from_host(&stream, inv).map_err(|_| -3)?;
-        let mut od = DeviceBuffer::<f32>::zeroed(&stream, n).map_err(|_| -3)?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let f_key = buffers::ensure_f32(&stream, inv, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (fd, _) = buffers::take_f32(f_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
-        unsafe {
+        let rc = unsafe {
             module
                 .rope(
                     &stream,
@@ -174,11 +201,185 @@ pub unsafe extern "C" fn launch_rope(
                     attrs.position as f32,
                     &mut od,
                 )
-                .map_err(|_| -4)?;
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(x_key, xd, true)?;
+        buffers::put_f32(f_key, fd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc?;
+        finish_out(&stream, o_key, out, false)
+    })
+}
+
+/// Elementwise add: `out = a + b`.
+pub unsafe extern "C" fn launch_add(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
         }
-        let host = od.to_host_vec(&stream).map_err(|_| -5)?;
-        out.copy_from_slice(&host);
-        Ok(())
+        let a_t = unsafe { &*inputs };
+        let b_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        let a = f32_slice(a_t)?;
+        let b = f32_slice(b_t)?;
+        let out = f32_slice_mut(out_t)?;
+        if a.len() != b.len() || a.len() != out.len() {
+            return Err(-2);
+        }
+        let n = a.len();
+        let ctx = oxide_ctx();
+        let stream = ctx.default_stream();
+        let a_key = buffers::ensure_f32(&stream, a, false)?;
+        let b_key = buffers::ensure_f32(&stream, b, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (ad, _) = buffers::take_f32(a_key)?;
+        let (bd, _) = buffers::take_f32(b_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let module = oxide_module();
+        let rc = unsafe {
+            module
+                .add_f32(&stream, cfg_1d(n as u32), &ad, &bd, &mut od)
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(a_key, ad, true)?;
+        buffers::put_f32(b_key, bd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc?;
+        finish_out(&stream, o_key, out, false)
+    })
+}
+
+/// F32 embedding: weight `[vocab, dim]` × token id → row.
+pub unsafe extern "C" fn launch_embedding_f32(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let tok_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        let wdims = dims(w_t);
+        if wdims.len() < 2 {
+            return Err(-2);
+        }
+        let dim = wdims[1] as usize;
+        let table = f32_slice(w_t)?;
+        let ids = u32_slice(tok_t)?;
+        if ids.is_empty() {
+            return Err(-2);
+        }
+        let token_id = ids[0];
+        let out = f32_slice_mut(out_t)?;
+        if out.len() != dim || table.len() < (token_id as usize + 1) * dim {
+            return Err(-2);
+        }
+        let ctx = oxide_ctx();
+        let stream = ctx.default_stream();
+        // Weight table: cache via ensure_f32 (stable host ptr).
+        let w_key = buffers::ensure_f32(&stream, table, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (wd, _) = buffers::take_f32(w_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let module = oxide_module();
+        let rc = unsafe {
+            module
+                .embedding_f32(
+                    &stream,
+                    cfg_1d(dim as u32),
+                    &wd,
+                    token_id,
+                    dim as u32,
+                    &mut od,
+                )
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(w_key, wd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc?;
+        finish_out(&stream, o_key, out, false)
+    })
+}
+
+/// Q4_K embedding: dequantize one weight row on device.
+pub unsafe extern "C" fn launch_embedding_q4k(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let tok_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        if w_t.dtype != DType::Q4K as u32 {
+            return Err(-10);
+        }
+        let wdims = dims(w_t);
+        if wdims.len() < 2 {
+            return Err(-2);
+        }
+        let dim = wdims[1] as usize;
+        if dim % (Q4K_BLOCK_ELEMS as usize) != 0 {
+            return Err(-2);
+        }
+        let n_blocks = (dim / Q4K_BLOCK_ELEMS as usize) as u32;
+        let wb = bytes_slice(w_t);
+        let ids = u32_slice(tok_t)?;
+        if ids.is_empty() {
+            return Err(-2);
+        }
+        let token_id = ids[0];
+        let out = f32_slice_mut(out_t)?;
+        if out.len() != dim {
+            return Err(-2);
+        }
+        let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
+        let need = (token_id as usize + 1) * row_bytes;
+        if wb.len() < need {
+            return Err(-2);
+        }
+
+        let ctx = oxide_ctx();
+        let stream = ctx.default_stream();
+        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let module = oxide_module();
+        let rc = buffers::with_weight(w_key, |wd| unsafe {
+            module
+                .embedding_q4k_row(
+                    &stream,
+                    cfg_1d(dim as u32),
+                    wd,
+                    token_id,
+                    dim as u32,
+                    n_blocks,
+                    &mut od,
+                )
+                .map_err(|_| -4)
+        });
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, false)
     })
 }
 
@@ -224,28 +425,21 @@ pub unsafe extern "C" fn launch_q4k_matmul(
 
         let ctx = oxide_ctx();
         let stream = ctx.default_stream();
-        let wkey = buffers::ensure_weight(&stream, wb)?;
-        let xd = DeviceBuffer::from_host(&stream, x).map_err(|_| -3)?;
-        let mut od = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize).map_err(|_| -3)?;
+        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
-        buffers::with_weight(wkey, |wd| {
-            unsafe {
-                module
-                    .q4k_gemv_row(
-                        &stream,
-                        cfg_1d(out_dim),
-                        wd,
-                        &xd,
-                        out_dim,
-                        n_blocks,
-                        &mut od,
-                    )
-                    .map_err(|_| -4)
-            }
-        })??;
-        let host = od.to_host_vec(&stream).map_err(|_| -5)?;
-        out.copy_from_slice(&host);
-        Ok(())
+        let rc = buffers::with_weight(w_key, |wd| unsafe {
+            module
+                .q4k_gemv_row(&stream, cfg_1d(out_dim), wd, &xd, out_dim, n_blocks, &mut od)
+                .map_err(|_| -4)
+        });
+        buffers::put_f32(x_key, xd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, true)
     })
 }
 
@@ -293,10 +487,12 @@ pub unsafe extern "C" fn launch_attention(
                 let table = unsafe {
                     std::slice::from_raw_parts(snap.block_table, snap.n_block_table)
                 };
-                let qd = DeviceBuffer::from_host(&stream, q).map_err(|_| -3)?;
-                let td = DeviceBuffer::from_host(&stream, table).map_err(|_| -3)?;
-                let mut od =
-                    DeviceBuffer::<f32>::zeroed(&stream, out.len()).map_err(|_| -3)?;
+                let q_key = buffers::ensure_f32(&stream, q, false)?;
+                let t_key = buffers::ensure_block_table(&stream, table)?;
+                let o_key = buffers::ensure_f32_out(&stream, out)?;
+                let (qd, _) = buffers::take_f32(q_key)?;
+                let td = buffers::take_u32(t_key)?;
+                let (mut od, _) = buffers::take_f32(o_key)?;
                 // SAFETY: host DeviceKvArena lives for the step; we release without free.
                 let arena = unsafe {
                     buffers::wrap_device_bytes(
@@ -326,10 +522,11 @@ pub unsafe extern "C" fn launch_attention(
                     )
                 };
                 buffers::release_wrap(arena);
+                buffers::put_f32(q_key, qd, true)?;
+                buffers::put_u32(t_key, td)?;
+                buffers::put_f32(o_key, od, false)?;
                 launch_rc.map_err(|_| -4)?;
-                let host = od.to_host_vec(&stream).map_err(|_| -5)?;
-                out.copy_from_slice(&host);
-                return Ok(());
+                return finish_out(&stream, o_key, out, false);
             }
 
             // Host-gather fallback (no VRAM arena).
@@ -349,11 +546,14 @@ pub unsafe extern "C" fn launch_attention(
                     *d = s.to_f32();
                 }
             }
-            let qd = DeviceBuffer::from_host(&stream, q).map_err(|_| -3)?;
+            let q_key = buffers::ensure_f32(&stream, q, false)?;
+            // Gathered K/V are ephemeral — upload once without long-lived cache key reuse.
             let kd = DeviceBuffer::from_host(&stream, &k).map_err(|_| -3)?;
             let vd = DeviceBuffer::from_host(&stream, &v).map_err(|_| -3)?;
-            let mut od = DeviceBuffer::<f32>::zeroed(&stream, out.len()).map_err(|_| -3)?;
-            unsafe {
+            let o_key = buffers::ensure_f32_out(&stream, out)?;
+            let (qd, _) = buffers::take_f32(q_key)?;
+            let (mut od, _) = buffers::take_f32(o_key)?;
+            let rc = unsafe {
                 module
                     .attention_heads(
                         &stream,
@@ -368,11 +568,12 @@ pub unsafe extern "C" fn launch_attention(
                         scale,
                         &mut od,
                     )
-                    .map_err(|_| -4)?;
-            }
-            let host = od.to_host_vec(&stream).map_err(|_| -5)?;
-            out.copy_from_slice(&host);
-            return Ok(());
+                    .map_err(|_| -4)
+            };
+            buffers::put_f32(q_key, qd, true)?;
+            buffers::put_f32(o_key, od, false)?;
+            rc?;
+            return finish_out(&stream, o_key, out, false);
         }
 
         if n_inputs < 3 {
@@ -386,11 +587,15 @@ pub unsafe extern "C" fn launch_attention(
         if k.len() < kv_elems || v.len() < kv_elems {
             return Err(-2);
         }
-        let qd = DeviceBuffer::from_host(&stream, q).map_err(|_| -3)?;
-        let kd = DeviceBuffer::from_host(&stream, &k[..kv_elems]).map_err(|_| -3)?;
-        let vd = DeviceBuffer::from_host(&stream, &v[..kv_elems]).map_err(|_| -3)?;
-        let mut od = DeviceBuffer::<f32>::zeroed(&stream, out.len()).map_err(|_| -3)?;
-        unsafe {
+        let q_key = buffers::ensure_f32(&stream, q, false)?;
+        let k_key = buffers::ensure_f32(&stream, &k[..kv_elems], false)?;
+        let v_key = buffers::ensure_f32(&stream, &v[..kv_elems], false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (qd, _) = buffers::take_f32(q_key)?;
+        let (kd, _) = buffers::take_f32(k_key)?;
+        let (vd, _) = buffers::take_f32(v_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let rc = unsafe {
             module
                 .attention_heads(
                     &stream,
@@ -405,11 +610,14 @@ pub unsafe extern "C" fn launch_attention(
                     scale,
                     &mut od,
                 )
-                .map_err(|_| -4)?;
-        }
-        let host = od.to_host_vec(&stream).map_err(|_| -5)?;
-        out.copy_from_slice(&host);
-        Ok(())
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(q_key, qd, true)?;
+        buffers::put_f32(k_key, kd, true)?;
+        buffers::put_f32(v_key, vd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc?;
+        finish_out(&stream, o_key, out, false)
     })
 }
 
@@ -475,8 +683,10 @@ pub unsafe extern "C" fn launch_kv_write(
             let table = unsafe {
                 std::slice::from_raw_parts(snap.block_table, snap.n_block_table)
             };
-            let rd = DeviceBuffer::from_host(&stream, row).map_err(|_| -3)?;
-            let td = DeviceBuffer::from_host(&stream, table).map_err(|_| -3)?;
+            let r_key = buffers::ensure_f32(&stream, row, false)?;
+            let t_key = buffers::ensure_block_table(&stream, table)?;
+            let (rd, _) = buffers::take_f32(r_key)?;
+            let td = buffers::take_u32(t_key)?;
             let arena = unsafe {
                 buffers::wrap_device_bytes(
                     snap.device_arena,
@@ -502,6 +712,8 @@ pub unsafe extern "C" fn launch_kv_write(
                 )
             };
             buffers::release_wrap(arena_mut);
+            buffers::put_f32(r_key, rd, true)?;
+            buffers::put_u32(t_key, td)?;
             launch_rc.map_err(|_| -4)?;
         }
         Ok(())

@@ -248,6 +248,8 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         {
             return -7;
         }
+        // Add / Embedding stay on CPU until oxide kernels match CPU numerics.
+        // Residual + embed are cheap vs matmul; hybrid is correct with per-op D2H.
         0
     }))
     .unwrap_or(-99)
