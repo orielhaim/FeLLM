@@ -46,6 +46,13 @@ pub type HostSnapshotPagedFn = unsafe extern "C" fn(out: *mut PagedKvSnapshot) -
 /// C ABI entry the host passes to plugins via [`crate::c_abi::HostContext`].
 ///
 /// Lives in the host binary so plugins share the same `PAGED_CTX` static.
+///
+/// # Safety
+///
+/// `out` must be non-null and point to writable storage for one
+/// [`PagedKvSnapshot`]. Any pointers written into the snapshot are borrowed
+/// from the currently installed context and must not be retained after that
+/// context is removed.
 pub unsafe extern "C" fn host_snapshot_paged_kv(out: *mut PagedKvSnapshot) -> c_int {
     if out.is_null() {
         return -1;
@@ -189,6 +196,12 @@ pub fn with_paged_context<R>(f: impl FnOnce(Option<&PagedKvContext>) -> R) -> R 
     f(guard.as_ref())
 }
 
+/// Run `f` with an exclusive reference to the active paged context, if any.
+pub fn with_paged_context_mut<R>(f: impl FnOnce(Option<&mut PagedKvContext>) -> R) -> R {
+    let mut guard = PAGED_CTX.lock().expect("paged ctx lock");
+    f(guard.as_mut())
+}
+
 impl PagedKvContext {
     /// Physical block id for `(layer, logical_block)`.
     #[must_use]
@@ -249,7 +262,7 @@ impl PagedKvContext {
     ///
     /// # Safety
     /// Arena must be uniquely borrowed for mutation.
-    pub unsafe fn row_mut(&self, layer: usize, t: usize, is_v: bool) -> &mut [f16] {
+    pub unsafe fn row_mut(&mut self, layer: usize, t: usize, is_v: bool) -> &mut [f16] {
         let logical = t / self.block_size;
         let slot = t % self.block_size;
         let phys = self.physical(layer, logical);

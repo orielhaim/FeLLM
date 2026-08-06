@@ -209,6 +209,14 @@ impl Backend for CpuBackend {
             OpKind::MoE => launch_moe(attrs, inputs, outputs),
         }
     }
+
+    fn begin_step(&self) {
+        matmul::begin_q8k_step_cache();
+    }
+
+    fn end_step(&self) {
+        matmul::end_q8k_step_cache();
+    }
 }
 
 fn decode_handle(h: KernelHandle) -> Result<OpKind> {
@@ -631,7 +639,7 @@ fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorM
     if use_paged {
         let layer = attrs.layer_ord as usize;
         let is_v = attrs.kv_slot != 0;
-        return paged_ctx::with_paged_context(|ctx| {
+        return paged_ctx::with_paged_context_mut(|ctx| {
             let ctx = ctx.ok_or_else(|| FellmError::other("kv_write: missing paged ctx"))?;
             if row.len() != ctx.tokens_stride {
                 return Err(FellmError::other(format!(

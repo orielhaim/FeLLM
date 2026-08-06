@@ -12,6 +12,7 @@ pub use op::{OpAttrs, OpKind};
 pub use paged_ctx::{
     HostSnapshotPagedFn, PAGED_KV_ELEM_BYTES, PagedKvContext, PagedKvSnapshot, has_paged_context,
     host_snapshot_paged_kv, set_paged_context, snapshot_paged_context, with_paged_context,
+    with_paged_context_mut,
 };
 pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{Architecture, Backend, BackendCaps, KernelHandle};

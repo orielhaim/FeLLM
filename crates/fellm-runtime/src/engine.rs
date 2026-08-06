@@ -894,10 +894,12 @@ impl LoadedModel {
             device_arena_len,
         }));
 
+        backend.begin_step();
         let result = self.step_inner(backend, tok, pos, compute_logits);
         // Plugin D2H of logits already drains the stream; synchronize is a no-op
         // when plugins are disabled (see CudaBackend::synchronize).
         let _ = backend.synchronize();
+        backend.end_step();
         set_paged_context(None);
         result
     }

@@ -327,6 +327,14 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn begin_step(&self) {
+        self.cpu.begin_step();
+    }
+
+    fn end_step(&self) {
+        self.cpu.end_step();
+    }
+
     fn resolve_kernel(
         &self,
         op: OpKind,

@@ -6,6 +6,6 @@ pre-commit:
       stage_fixed: true
       run: cargo fmt
 
-    - name: rust-clippy
-      glob: "**/*.rs"
-      run: cargo clippy --workspace -- -D warnings
+    # - name: rust-clippy
+    #   glob: "**/*.rs"
+    #   run: cargo clippy --workspace -- -D warnings

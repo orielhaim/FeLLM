@@ -45,8 +45,81 @@ impl Default for Q80XBlock {
 thread_local! {
     /// Reused Q8_K activation scratch (avoids alloc-per-matmul).
     static Q8K_SCRATCH: RefCell<Vec<Q8KBlock>> = const { RefCell::new(Vec::new()) };
+    /// Q8_K activations reused by the q/k/v and gate/up matvecs in one step.
+    static Q8K_STEP_CACHE: RefCell<Q8KStepCache> = const { RefCell::new(Q8KStepCache::new()) };
     /// Reused Q8_0 activation scratch.
     static Q80_SCRATCH: RefCell<Vec<Q80XBlock>> = const { RefCell::new(Vec::new()) };
+}
+
+struct Q8KStepCache {
+    active: bool,
+    valid: bool,
+    source_ptr: usize,
+    source_len: usize,
+    blocks: Vec<Q8KBlock>,
+}
+
+impl Q8KStepCache {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            valid: false,
+            source_ptr: 0,
+            source_len: 0,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+/// Start the lifetime of the per-forward-step Q8_K activation cache.
+pub fn begin_q8k_step_cache() {
+    Q8K_STEP_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.active = true;
+        cache.valid = false;
+    });
+}
+
+/// End the lifetime of the per-forward-step Q8_K activation cache.
+pub fn end_q8k_step_cache() {
+    Q8K_STEP_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.active = false;
+        cache.valid = false;
+    });
+}
+
+fn with_q8k_activations<R>(x: &[f32], n: usize, f: impl FnOnce(&[Q8KBlock]) -> R) -> R {
+    let use_cache = Q8K_STEP_CACHE.with(|cache| cache.borrow().active);
+    if use_cache {
+        Q8K_STEP_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let same_source = cache.valid
+                && cache.source_ptr == x.as_ptr() as usize
+                && cache.source_len == x.len();
+            if !same_source {
+                if cache.blocks.len() < n {
+                    cache.blocks.resize(n, Q8KBlock::default());
+                }
+                quantize_row_q8_k(x, &mut cache.blocks[..n]);
+                cache.source_ptr = x.as_ptr() as usize;
+                cache.source_len = x.len();
+                cache.valid = true;
+            }
+            f(&cache.blocks[..n])
+        })
+    } else {
+        Q8K_SCRATCH.with(|scratch| {
+            let mut xq = scratch.replace(Vec::new());
+            if xq.len() < n {
+                xq.resize(n, Q8KBlock::default());
+            }
+            quantize_row_q8_k(x, &mut xq[..n]);
+            let result = f(&xq[..n]);
+            scratch.replace(xq);
+            result
+        })
+    }
 }
 
 pub fn quantize_row_q8_k(x: &[f32], out: &mut [Q8KBlock]) {
@@ -268,14 +341,8 @@ pub fn matvec_quant(
                 return Err(FellmError::other("Q4_K: in_dim not multiple of 256"));
             }
             let n = in_dim / QK_K;
-            let mut xq = Q8K_SCRATCH.with(|c| c.replace(Vec::new()));
-            if xq.len() < n {
-                xq.resize(n, Q8KBlock::default());
-            }
-            quantize_row_q8_k(x, &mut xq[..n]);
-            matvec_q4_k(w_bytes, &xq[..n], y, out_dim, in_dim, bytes_per_row);
-            Q8K_SCRATCH.with(|c| {
-                c.replace(xq);
+            with_q8k_activations(x, n, |xq| {
+                matvec_q4_k(w_bytes, xq, y, out_dim, in_dim, bytes_per_row);
             });
         }
         DType::Q6K => {
@@ -283,14 +350,8 @@ pub fn matvec_quant(
                 return Err(FellmError::other("Q6_K: in_dim not multiple of 256"));
             }
             let n = in_dim / QK_K;
-            let mut xq = Q8K_SCRATCH.with(|c| c.replace(Vec::new()));
-            if xq.len() < n {
-                xq.resize(n, Q8KBlock::default());
-            }
-            quantize_row_q8_k(x, &mut xq[..n]);
-            matvec_q6_k(w_bytes, &xq[..n], y, out_dim, in_dim, bytes_per_row);
-            Q8K_SCRATCH.with(|c| {
-                c.replace(xq);
+            with_q8k_activations(x, n, |xq| {
+                matvec_q6_k(w_bytes, xq, y, out_dim, in_dim, bytes_per_row);
             });
         }
         other => return Err(FellmError::UnsupportedDType(other)),
@@ -407,9 +468,13 @@ fn matvec_q4_k(
     debug_assert_eq!(xq.len(), n_blocks);
     // Chunk by physical-core count so each worker streams many rows over the
     // same quantized activation (llama.cpp / ggml style). Avoid oversubscription.
-    let n_threads = crate::cpu_profile::CpuHardwareProfile::get()
-        .physical_cores
-        .max(1);
+    let profile = crate::cpu_profile::CpuHardwareProfile::get();
+    let n_threads = if y.len() >= 16_384 {
+        profile.physical_cores.saturating_add(4)
+    } else {
+        profile.physical_cores
+    }
+    .max(1);
     let chunk = (y.len() / n_threads).max(16);
     y.par_chunks_mut(chunk)
         .enumerate()
@@ -419,7 +484,7 @@ fn matvec_q4_k(
             for j in 0..n {
                 let i = row0 + j;
                 let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
-                // Prefetch next weight row into L2 while computing current.
+                // Prefetch the next weight row into L2 while computing current.
                 if j + 1 < n {
                     let next = w_bytes.as_ptr().wrapping_add((i + 1) * bytes_per_row);
                     #[cfg(target_arch = "x86_64")]

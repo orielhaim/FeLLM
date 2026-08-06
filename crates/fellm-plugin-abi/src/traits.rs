@@ -71,6 +71,18 @@ pub trait Backend: Send + Sync + 'static {
         stream: StreamHandle,
     ) -> Result<()>;
 
+    /// Mark the beginning of one forward step.
+    ///
+    /// Backends may use this boundary to reuse immutable per-step activation
+    /// transforms. The default is a no-op for backends that do not need it.
+    fn begin_step(&self) {}
+
+    /// Mark the end of one forward step.
+    ///
+    /// The default is a no-op; CPU implementations use it to close any
+    /// per-step scratch-cache lifetime.
+    fn end_step(&self) {}
+
     /// Downcast to a concrete backend (CUDA graph / VRAM hooks).
     fn as_any(&self) -> &dyn Any;
 

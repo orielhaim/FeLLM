@@ -8,10 +8,12 @@ use fellm_graph::plan::ExecutionPlan;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::traits::{Backend, KernelHandle};
 use fellm_plugin_abi::{TensorMut, TensorRef};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::executor::MutableBinding;
 
@@ -306,18 +308,21 @@ impl CompiledStep {
         } else {
             self.body_end
         };
+        let profile_ops = std::env::var_os("FELLM_PROFILE_OPS").is_some();
+        let mut profile: HashMap<&'static str, (u32, u128)> = HashMap::new();
 
         for i in 0..end {
             let node = &self.nodes[i];
             let Some(rt) = &node.runtime else { continue };
 
-            let mut input_refs: Vec<TensorRef> = Vec::with_capacity(rt.input_ref_count);
+            let mut input_refs: SmallVec<[TensorRef; 6]> = SmallVec::new();
             for &iid in node.inputs.iter().take(rt.input_ref_count) {
                 input_refs.push(self.tensor_ref(iid)?);
             }
 
             let attrs = self.attr_patches.get(&i).copied().unwrap_or(rt.attrs);
             let out_mut = self.tensor_mut(i)?;
+            let started = profile_ops.then(Instant::now);
 
             if rt.op == OpKind::ShortConv {
                 let state_idx = *node
@@ -331,6 +336,22 @@ impl CompiledStep {
                 let mut outs = [out_mut];
                 backend.launch(rt.handle, &attrs, &input_refs, &mut outs, 0)?;
             }
+            if let Some(started) = started {
+                let entry = profile.entry(rt.op.name()).or_default();
+                entry.0 += 1;
+                entry.1 += started.elapsed().as_nanos();
+            }
+        }
+
+        if profile_ops {
+            let mut profile: Vec<_> = profile.into_iter().collect();
+            profile.sort_unstable_by_key(|(_, (_, nanos))| std::cmp::Reverse(*nanos));
+            tracing::info!(
+                ops = ?profile.iter().map(|(op, (count, nanos))| {
+                    format!("{op}:{count}={:.3}ms", *nanos as f64 / 1_000_000.0)
+                }).collect::<Vec<_>>(),
+                "forward op profile"
+            );
         }
 
         if !compute_logits {
@@ -368,11 +389,15 @@ impl CompiledStep {
         match &node.kind {
             SlotKind::Constant(t) => {
                 let bytes = t.as_bytes();
-                let dims = t.shape().dims().to_vec();
-                let strides = t.shape().row_major_strides().as_slice().to_vec();
                 // SAFETY: bytes valid for the tensor's lifetime (Arc-shared).
                 Ok(unsafe {
-                    TensorRef::from_raw(t.dtype(), &dims, &strides, bytes.as_ptr(), bytes.len())
+                    TensorRef::from_raw(
+                        t.dtype(),
+                        &node.dims,
+                        &node.strides,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                    )
                 })
             }
             SlotKind::Input(name) => {
