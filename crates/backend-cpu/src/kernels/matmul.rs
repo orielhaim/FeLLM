@@ -309,6 +309,104 @@ pub fn matvec_f32(w: &[f32], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: u
     });
 }
 
+/// One batched matvec descriptor.
+pub struct MatDesc<'a> {
+    /// Quantized weight bytes for this matrix.
+    pub w: &'a [u8],
+    /// Weight dtype (`Q4K` / `Q6K`).
+    pub dtype: DType,
+    /// Number of output rows.
+    pub out_dim: usize,
+    /// Number of input columns (must be a multiple of [`QK_K`]).
+    pub in_dim: usize,
+    /// Offset into the shared input buffer `x` where this matrix's input starts.
+    pub x_off: usize,
+}
+
+pub fn matvec_quant_multi(x: &[f32], mats: &[MatDesc<'_>], y: &mut [f32]) -> Result<()> {
+    let n_mats = mats.len();
+    let mut y_base = Vec::with_capacity(n_mats);
+    let mut total = 0usize;
+    for m in mats {
+        y_base.push(total);
+        total += m.out_dim;
+    }
+    if total != y.len() {
+        return Err(FellmError::other("matvec_multi: y length mismatch"));
+    }
+
+    let mut pool: Vec<Q8KBlock> = Vec::new();
+    let mut xq_base: Vec<usize> = Vec::with_capacity(n_mats);
+    for m in mats {
+        if m.in_dim % QK_K != 0 {
+            return Err(FellmError::other(format!(
+                "matvec_multi: in_dim {} not multiple of {QK_K}",
+                m.in_dim
+            )));
+        }
+        if m.x_off + m.in_dim > x.len() {
+            return Err(FellmError::other("matvec_multi: input slice out of bounds"));
+        }
+        let dup = mats
+            .iter()
+            .take(n_mats)
+            .enumerate()
+            .find(|(j, pm)| *j < xq_base.len() && pm.in_dim == m.in_dim && pm.x_off == m.x_off)
+            .map(|(j, _)| xq_base[j]);
+        let off = match dup {
+            Some(o) => o,
+            None => {
+                let o = pool.len();
+                let blocks = m.in_dim / QK_K;
+                pool.resize(o + blocks, Q8KBlock::default());
+                quantize_row_q8_k(&x[m.x_off..m.x_off + m.in_dim], &mut pool[o..o + blocks]);
+                o
+            }
+        };
+        xq_base.push(off);
+    }
+    let pool = &pool;
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk = (total / n_threads).max(16);
+    y.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(ci, y_chunk)| {
+            let row0 = ci * chunk;
+            // Find the matrix containing row0 by prefix-sum walk.
+            let mut mi = 0;
+            while mi + 1 < n_mats && y_base[mi + 1] <= row0 {
+                mi += 1;
+            }
+            let mut local = row0 - y_base[mi];
+            for yi in y_chunk.iter_mut() {
+                while mi + 1 < n_mats && local >= mats[mi].out_dim {
+                    mi += 1;
+                    local = 0;
+                }
+                let m = &mats[mi];
+                let row = &m.w[local * m.dtype.byte_size(m.in_dim)
+                    ..(local + 1) * m.dtype.byte_size(m.in_dim)];
+                let xq = &pool[xq_base[mi]..xq_base[mi] + m.in_dim / QK_K];
+                *yi = match m.dtype {
+                    DType::Q4K => vec_dot_q4_k_q8_k_row(row, xq),
+                    DType::Q6K => {
+                        let mut acc = 0.0f32;
+                        let block_bytes = DType::Q6K.bytes_per_block();
+                        for (b, xb) in xq.iter().enumerate() {
+                            let block = &row[b * block_bytes..(b + 1) * block_bytes];
+                            acc += fused_q6_k_block(block, xb);
+                        }
+                        acc
+                    }
+                    other => unreachable!("matvec_multi: unsupported dtype {other:?}"),
+                };
+                local += 1;
+            }
+        });
+    Ok(())
+}
+
 /// Quantized weight matvec with in-register fused dequant (no f32 row materialization).
 pub fn matvec_quant(
     w_bytes: &[u8],

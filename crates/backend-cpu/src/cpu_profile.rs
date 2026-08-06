@@ -167,21 +167,21 @@ fn detect_x86(logical: usize) -> CpuHardwareProfile {
 
     let ht = feat.as_ref().map(|f| f.has_htt()).unwrap_or(false);
     let has_avx = feat.as_ref().map(|f| f.has_avx()).unwrap_or(false);
-    let physical = if ht && logical > 1 {
-        (logical / 2).max(1)
-    } else {
-        logical.max(1)
-    };
 
-    // Prefer topology leaf when available.
-    let physical = cpuid
-        .get_processor_topology_info()
-        .map(|t| {
-            // x2APIC: cores often = logical / smt; keep conservative.
-            let _ = t;
-            physical
-        })
-        .unwrap_or(physical);
+    let smt_per_core = cpuid
+        .get_extended_topology_info_v2()
+        .or_else(|| cpuid.get_extended_topology_info())
+        .and_then(|mut iter| {
+            iter.find(|l| l.level_type() != raw_cpuid::TopologyType::Invalid)
+                .map(|l| l.processors().max(1) as usize)
+        });
+    let physical = match smt_per_core {
+        Some(per_core) => (logical / per_core).max(1),
+        None => {
+            let per_core = if ht && logical > 1 { 2 } else { 1 };
+            (logical / per_core).max(1)
+        }
+    };
 
     let simd_f32_lanes = if has_avx512 {
         16

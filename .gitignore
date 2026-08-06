@@ -3,3 +3,5 @@ models/
 *.gguf
 Cargo.lock.bak
 .DS_Store
+
+.*

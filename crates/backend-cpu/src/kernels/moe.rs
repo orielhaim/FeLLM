@@ -1,8 +1,23 @@
 //! Mixture-of-Experts decode kernel.
 
+use crate::dequant::QK_K;
 use crate::kernels::{matmul, swiglu::silu_gate};
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
+
+fn expert_slice(
+    w_bytes: &[u8],
+    w_dtype: DType,
+    expert: usize,
+    elements_per_expert: usize,
+) -> Result<&[u8]> {
+    let bytes_per_expert = w_dtype.byte_size(elements_per_expert);
+    let start = expert * bytes_per_expert;
+    let end = start + bytes_per_expert;
+    w_bytes
+        .get(start..end)
+        .ok_or_else(|| FellmError::other("moe: expert weight slice out of bounds"))
+}
 
 fn matvec_weight(
     w_bytes: &[u8],
@@ -24,20 +39,6 @@ fn matvec_weight(
         }
         other => Err(FellmError::UnsupportedDType(other)),
     }
-}
-
-fn expert_slice(
-    w_bytes: &[u8],
-    w_dtype: DType,
-    expert: usize,
-    elements_per_expert: usize,
-) -> Result<&[u8]> {
-    let bytes_per_expert = w_dtype.byte_size(elements_per_expert);
-    let start = expert * bytes_per_expert;
-    let end = start + bytes_per_expert;
-    w_bytes
-        .get(start..end)
-        .ok_or_else(|| FellmError::other("moe: expert weight slice out of bounds"))
 }
 
 /// Run one-token MoE.
@@ -137,32 +138,86 @@ pub fn moe_decode(
     };
 
     y.fill(0.0);
-    let mut gate = vec![0.0f32; n_ff];
-    let mut up = vec![0.0f32; n_ff];
-    let mut hidden = vec![0.0f32; n_ff];
-    let mut expert_out = vec![0.0f32; n_embd];
+    let mut hidden = vec![0.0f32; k * n_ff];
+    let mut expert_out = vec![0.0f32; k * n_embd];
     let ffn_elems = n_ff * n_embd;
 
-    for &(expert, score) in selected.iter() {
-        let gate_w = expert_slice(gate_exps_bytes, gate_exps_dtype, expert, ffn_elems)?;
-        let up_w = expert_slice(up_exps_bytes, up_exps_dtype, expert, ffn_elems)?;
-        let down_w = expert_slice(down_exps_bytes, down_exps_dtype, expert, ffn_elems)?;
+    let can_batch = n_embd % QK_K == 0 && n_ff % QK_K == 0;
+    if !can_batch {
+        let mut gate = vec![0.0f32; n_ff];
+        let mut up = vec![0.0f32; n_ff];
+        for &(expert, score) in selected.iter() {
+            let gate_w = expert_slice(gate_exps_bytes, gate_exps_dtype, expert, ffn_elems)?;
+            let up_w = expert_slice(up_exps_bytes, up_exps_dtype, expert, ffn_elems)?;
+            let down_w = expert_slice(down_exps_bytes, down_exps_dtype, expert, ffn_elems)?;
+            matvec_weight(gate_w, gate_exps_dtype, x, &mut gate, n_ff, n_embd)?;
+            matvec_weight(up_w, up_exps_dtype, x, &mut up, n_ff, n_embd)?;
+            silu_gate(&gate, &up, &mut hidden[..n_ff]);
+            matvec_weight(
+                down_w,
+                down_exps_dtype,
+                &hidden[..n_ff],
+                &mut expert_out[..n_embd],
+                n_embd,
+                n_ff,
+            )?;
+            let weight = score * scale;
+            for i in 0..n_embd {
+                y[i] += weight * expert_out[i];
+            }
+        }
+        return Ok(());
+    }
 
-        matvec_weight(gate_w, gate_exps_dtype, x, &mut gate, n_ff, n_embd)?;
-        matvec_weight(up_w, up_exps_dtype, x, &mut up, n_ff, n_embd)?;
-        silu_gate(&gate, &up, &mut hidden);
-        matvec_weight(
-            down_w,
-            down_exps_dtype,
-            &hidden,
-            &mut expert_out,
-            n_embd,
-            n_ff,
-        )?;
+    let mut y_gu = vec![0.0f32; k * 2 * n_ff];
+    {
+        let mut mats: Vec<matmul::MatDesc> = Vec::with_capacity(2 * k);
+        for &(expert, _) in selected.iter() {
+            let gate_w = expert_slice(gate_exps_bytes, gate_exps_dtype, expert, ffn_elems)?;
+            let up_w = expert_slice(up_exps_bytes, up_exps_dtype, expert, ffn_elems)?;
+            mats.push(matmul::MatDesc {
+                w: gate_w,
+                dtype: gate_exps_dtype,
+                out_dim: n_ff,
+                in_dim: n_embd,
+                x_off: 0,
+            });
+            mats.push(matmul::MatDesc {
+                w: up_w,
+                dtype: up_exps_dtype,
+                out_dim: n_ff,
+                in_dim: n_embd,
+                x_off: 0,
+            });
+        }
+        matmul::matvec_quant_multi(x, &mats, &mut y_gu)?;
+        for e in 0..k {
+            let g = &y_gu[e * 2 * n_ff..e * 2 * n_ff + n_ff];
+            let u = &y_gu[e * 2 * n_ff + n_ff..e * 2 * n_ff + 2 * n_ff];
+            let hid = &mut hidden[e * n_ff..(e + 1) * n_ff];
+            silu_gate(g, u, hid);
+        }
+    }
 
+    {
+        let mut mats: Vec<matmul::MatDesc> = Vec::with_capacity(k);
+        for (e, &(expert, _)) in selected.iter().enumerate() {
+            let down_w = expert_slice(down_exps_bytes, down_exps_dtype, expert, ffn_elems)?;
+            mats.push(matmul::MatDesc {
+                w: down_w,
+                dtype: down_exps_dtype,
+                out_dim: n_embd,
+                in_dim: n_ff,
+                x_off: e * n_ff,
+            });
+        }
+        matmul::matvec_quant_multi(&hidden, &mats, &mut expert_out)?;
+    }
+
+    for (e, &(_, score)) in selected.iter().enumerate() {
         let weight = score * scale;
         for i in 0..n_embd {
-            y[i] += weight * expert_out[i];
+            y[i] += weight * expert_out[e * n_embd + i];
         }
     }
 
