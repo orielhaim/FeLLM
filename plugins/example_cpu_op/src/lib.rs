@@ -43,7 +43,7 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         }
         let vt = unsafe { &*registry };
         let mut reg = PluginOpRegistration {
-            op_kind: OpKind::Cast as u32,
+            op_kind: OpKind::Cast.raw(),
             n_input_dtypes: 1,
             input_dtypes: [0; fellm_plugin_abi::PLUGIN_MAX_INPUT_DTYPES],
             output_dtype: DType::F32 as u32,

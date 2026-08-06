@@ -1,10 +1,12 @@
 //! `fellm` CLI.
 
 use clap::{Parser, Subcommand};
+use fellm_architecture_diffusion_gemma::DiffusionGemmaPlugin;
 use fellm_gguf::GgufFile;
 use fellm_runtime::{BackendPreference, BackendSelect, Engine, EngineSettings, GenParams};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "fellm", version, about = "FeLLM inference engine (Phase 1)")]
@@ -39,11 +41,11 @@ struct RunArgs {
     /// Max tokens to generate.
     #[arg(long, default_value_t = 128)]
     max_tokens: u32,
-    /// Sampling temperature (0.0 = greedy).
-    #[arg(long, default_value_t = 0.0)]
+    /// Sampling temperature.
+    #[arg(long, default_value_t = 0.2)]
     temperature: f32,
     /// top-k (0 disables).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 80)]
     top_k: u32,
     /// top-p (>= 1.0 disables).
     #[arg(long, default_value_t = 1.0)]
@@ -51,6 +53,9 @@ struct RunArgs {
     /// RNG seed.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Repetition penalty (1.0 disables).
+    #[arg(long, default_value_t = 1.05)]
+    repetition_penalty: f32,
     /// Context size (`n_ctx`). Default 8192, clamped to the model maximum.
     /// Pass `0` to use the model's GGUF-reported maximum context length.
     #[arg(long = "ctx-size", short = 'c', default_value_t = 8192)]
@@ -101,6 +106,18 @@ fn main() {
 fn init_tracing(filter: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
+
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_target(false).with_filter(filter))
+            .with(tracing_tracy::TracyLayer::default())
+            .init();
+        return;
+    }
+
+    #[cfg(not(feature = "tracy"))]
     fmt().with_env_filter(filter).with_target(false).init();
 }
 
@@ -119,13 +136,18 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
         settings.ctx_size(ctx)
     };
 
-    let mut engine = Engine::open_with(&args.model, settings)?;
+    let mut engine = Engine::open_with_architecture(
+        &args.model,
+        settings,
+        Some(Arc::new(DiffusionGemmaPlugin)),
+    )?;
     let params = GenParams {
         max_tokens: args.max_tokens,
         temperature: args.temperature,
         top_k: args.top_k,
         top_p: args.top_p,
         seed: args.seed,
+        repetition_penalty: args.repetition_penalty,
     };
 
     let use_chat = !args.completion && engine.tokenizer().chat_template().is_some();

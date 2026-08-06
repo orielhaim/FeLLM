@@ -9,6 +9,33 @@ const KMASK3: u32 = 0x0303_0303;
 /// Q4_K super-block size in bytes.
 pub const Q4_K_BLOCK_BYTES: usize = 144;
 
+/// A Q4_K block decoded once for reuse across multiple activation rows.
+///
+/// The packed GGUF representation is intentionally kept out of the inner
+/// batch loop.  `weights` contains the unsigned nibbles as signed bytes so
+/// the existing AVX2 int8 dot helper can be reused; the per-group scales and
+/// minima retain the exact Q4_K arithmetic.
+#[derive(Clone, Copy)]
+pub(crate) struct Q4KBlockCache {
+    pub(crate) weights: [i8; QK_K],
+    pub(crate) scales: [u8; QK_K / 32],
+    pub(crate) mins: [u8; QK_K / 32],
+    pub(crate) d: f32,
+    pub(crate) dmin: f32,
+}
+
+impl Default for Q4KBlockCache {
+    fn default() -> Self {
+        Self {
+            weights: [0; QK_K],
+            scales: [0; QK_K / 32],
+            mins: [0; QK_K / 32],
+            d: 0.0,
+            dmin: 0.0,
+        }
+    }
+}
+
 /// Decode the 12-byte packed Q4_K scales+mins into 8 scale and 8 min bytes.
 #[inline]
 fn decode_scales_mins(scales12: &[u8]) -> ([u8; 8], [u8; 8]) {
@@ -61,6 +88,93 @@ fn unpack_q4_k_aux8(qs: &[u8], aux8: &mut [u8; QK_K]) {
             lo[l] = q[l] & 0x0F;
             hi[l] = q[l] >> 4;
         }
+    }
+}
+
+/// Decode one Q4_K block into a reusable cache entry.
+#[inline]
+pub(crate) fn decode_q4_k_block_cached(block: &[u8]) -> Q4KBlockCache {
+    debug_assert!(block.len() >= Q4_K_BLOCK_BYTES);
+    let d = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+    let dmin = f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
+    let (scales, mins) = decode_scales_mins(&block[4..16]);
+    let mut aux8 = [0u8; QK_K];
+    unpack_q4_k_aux8(&block[16..144], &mut aux8);
+    let mut weights = [0i8; QK_K];
+    for (dst, src) in weights.iter_mut().zip(aux8) {
+        *dst = src as i8;
+    }
+    Q4KBlockCache {
+        weights,
+        scales,
+        mins,
+        d,
+        dmin,
+    }
+}
+
+/// Dot a cached Q4_K block against one Q8_K activation block.
+#[inline]
+pub(crate) fn dot_q4_k_cached(block: &Q4KBlockCache, x: &Q8KBlock) -> f32 {
+    let mut scaled = 0i32;
+    for group in 0..QK_K / 32 {
+        let start = group * 32;
+        scaled += dot_u4_i8_scaled(
+            &block.weights[start..start + 32],
+            &x.qs[start..start + 32],
+            block.scales[group],
+        );
+    }
+    let mut minimum = 0i32;
+    for group in 0..QK_K / 16 {
+        minimum += x.bsums[group] as i32 * block.mins[group / 2] as i32;
+    }
+    block.d * x.d * scaled as f32 - block.dmin * x.d * minimum as f32
+}
+
+/// Dot 32 unsigned Q4 values with signed Q8 values and apply the Q4 scale.
+///
+/// Q4_K nibbles are in `[0, 15]`, so AVX2's unsigned-byte × signed-byte
+/// multiply-add is exactly the packed arithmetic needed here.  This avoids
+/// the signed-byte widening path and matches the hot loop in ggml's Q4_K
+/// kernel while still allowing the decoded nibbles to be reused by every
+/// canvas row.
+#[inline]
+fn dot_u4_i8_scaled(a: &[i8], b: &[i8], scale: u8) -> i32 {
+    debug_assert_eq!(a.len(), 32);
+    debug_assert_eq!(b.len(), 32);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime feature check gates the AVX2 implementation;
+        // both slices contain at least 32 bytes.
+        return unsafe { dot_u4_i8_scaled_avx2(a, b, scale) };
+    }
+    let mut sum = 0i32;
+    for i in 0..32 {
+        sum += a[i] as i32 * b[i] as i32 * scale as i32;
+    }
+    sum
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_u4_i8_scaled_avx2(a: &[i8], b: &[i8], scale: u8) -> i32 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller is gated on AVX2 and both slices have 32 bytes.
+    unsafe {
+        let av = _mm256_loadu_si256(a.as_ptr().cast());
+        let bv = _mm256_loadu_si256(b.as_ptr().cast());
+        let products = _mm256_maddubs_epi16(av, bv);
+        let scaled = _mm256_madd_epi16(products, _mm256_set1_epi16(scale as i16));
+        let lo = _mm256_castsi256_si128(scaled);
+        let hi = _mm256_extracti128_si256(scaled, 1);
+        let sum = _mm_add_epi32(lo, hi);
+        let sum = _mm_hadd_epi32(sum, sum);
+        _mm_cvtsi128_si32(_mm_hadd_epi32(sum, sum))
     }
 }
 

@@ -3,13 +3,15 @@
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::c_abi::{
-    KernelRegistryVtable, PLUGIN_MAX_INPUT_DTYPES, PluginLaunchFn, PluginOpRegistration,
+    ArchitecturePluginRegistration, ArchitectureRegistryVtable, KernelRegistryVtable,
+    PLUGIN_MAX_INPUT_DTYPES, PluginLaunchFn, PluginOpRegistration,
 };
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
-use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
+use fellm_plugin_abi::{ArchitectureProvider, StreamHandle, TensorMut, TensorRef};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_int;
+use std::sync::Arc;
 
 /// Key for a registered plugin kernel.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -27,6 +29,96 @@ pub struct KernelKey {
 pub struct RegisteredKernel {
     /// C launch function.
     pub launch: PluginLaunchFn,
+}
+
+/// One dynamically registered architecture provider.
+pub struct RegisteredArchitecture {
+    /// Stable architecture id.
+    pub architecture_id: String,
+    /// Exact current C ABI callback set.
+    pub registration: ArchitecturePluginRegistration,
+}
+
+/// Host-side architecture provider registry, separate from kernels.
+#[derive(Default)]
+pub struct ArchitectureRegistry {
+    entries: HashMap<String, RegisteredArchitecture>,
+    providers: HashMap<String, Arc<dyn ArchitectureProvider>>,
+}
+
+impl ArchitectureRegistry {
+    /// Empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of registered providers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len() + self.providers.len()
+    }
+
+    /// Register a statically linked provider.
+    pub fn register_provider(&mut self, provider: Arc<dyn ArchitectureProvider>) -> Result<()> {
+        let id = provider.architecture_id().trim();
+        if id.is_empty() {
+            return Err(FellmError::other("architecture provider id is empty"));
+        }
+        if self.entries.contains_key(id) || self.providers.contains_key(id) {
+            return Err(FellmError::other(format!(
+                "duplicate architecture provider {id}"
+            )));
+        }
+        self.providers.insert(id.to_owned(), provider);
+        Ok(())
+    }
+
+    /// Register an exact C ABI provider record; incomplete providers fail.
+    pub fn register(&mut self, registration: &ArchitecturePluginRegistration) -> c_int {
+        let id = c_name_to_string(&registration.architecture_id);
+        if id.is_empty() {
+            return -1;
+        }
+        if registration.probe.is_none()
+            || registration.compile.is_none()
+            || registration.create_generation_driver.is_none()
+        {
+            return -2;
+        }
+        if self.entries.contains_key(&id) || self.providers.contains_key(&id) {
+            return -3;
+        }
+        self.entries.insert(
+            id.clone(),
+            RegisteredArchitecture {
+                architecture_id: id,
+                registration: *registration,
+            },
+        );
+        0
+    }
+
+    /// Find a statically linked provider.
+    #[must_use]
+    pub fn provider(&self, id: &str) -> Option<Arc<dyn ArchitectureProvider>> {
+        self.providers.get(id).cloned()
+    }
+
+    /// Find a dynamic provider record.
+    #[must_use]
+    pub fn dynamic(&self, id: &str) -> Option<&RegisteredArchitecture> {
+        self.entries.get(id)
+    }
+
+    /// Build the registration vtable.
+    #[must_use]
+    pub fn vtable(&mut self) -> ArchitectureRegistryVtable {
+        ArchitectureRegistryVtable {
+            registry: std::ptr::from_mut::<ArchitectureRegistry>(self).cast::<c_void>(),
+            register_architecture: architecture_register,
+        }
+    }
 }
 
 /// Host-side registry of plugin kernels.
@@ -160,4 +252,77 @@ unsafe extern "C" fn registry_register_op(
     let reg_ref = unsafe { &*reg };
     let host = unsafe { &mut *registry.cast::<KernelRegistry>() };
     host.register(reg_ref)
+}
+
+unsafe extern "C" fn architecture_register(
+    registry: *mut c_void,
+    registration: *const ArchitecturePluginRegistration,
+) -> c_int {
+    if registry.is_null() || registration.is_null() {
+        return -100;
+    }
+    // SAFETY: the host owns both pointers for the duration of registration.
+    let host = unsafe { &mut *registry.cast::<ArchitectureRegistry>() };
+    let record = unsafe { &*registration };
+    host.register(record)
+}
+
+fn c_name_to_string(
+    buf: &[std::ffi::c_char; fellm_plugin_abi::c_abi::ARCHITECTURE_ID_MAX],
+) -> String {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fellm_plugin_abi::c_abi::ARCHITECTURE_ID_MAX;
+
+    unsafe extern "C" fn probe(_source: *const c_void, _config: *mut c_void) -> c_int {
+        0
+    }
+    unsafe extern "C" fn compile(
+        _source: *const c_void,
+        _config: *const c_void,
+        _backend: *const c_void,
+        _program: *mut c_void,
+    ) -> c_int {
+        0
+    }
+    unsafe extern "C" fn driver(
+        _program: *const c_void,
+        _request: *const c_void,
+        _driver: *mut c_void,
+    ) -> c_int {
+        0
+    }
+
+    fn registration(id: &str) -> ArchitecturePluginRegistration {
+        let mut architecture_id = [0i8; ARCHITECTURE_ID_MAX];
+        for (dst, byte) in architecture_id.iter_mut().zip(id.bytes()) {
+            *dst = byte as i8;
+        }
+        ArchitecturePluginRegistration {
+            architecture_id,
+            probe: Some(probe),
+            compile: Some(compile),
+            create_generation_driver: Some(driver),
+        }
+    }
+
+    #[test]
+    fn architecture_registration_requires_complete_current_contract() {
+        let mut registry = ArchitectureRegistry::new();
+        let mut incomplete = registration("test-arch");
+        incomplete.compile = None;
+        assert_eq!(registry.register(&incomplete), -2);
+        assert_eq!(registry.register(&registration("test-arch")), 0);
+        assert_eq!(registry.register(&registration("test-arch")), -3);
+        assert!(registry.dynamic("test-arch").is_some());
+    }
 }

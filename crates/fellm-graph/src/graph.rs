@@ -6,7 +6,6 @@ use fellm_core::tensor::Tensor;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use petgraph::Directed;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
-use petgraph::visit::EdgeRef;
 
 /// Node id in the graph.
 pub type NodeId = NodeIndex;
@@ -66,6 +65,12 @@ pub struct Graph {
     pub(crate) inner: StableGraph<OpNode, EdgeInfo, Directed>,
     pub(crate) inputs: Vec<NodeId>,
     pub(crate) outputs: Vec<NodeId>,
+    /// Incoming node ids in input-slot order, materialized once at build time.
+    ///
+    /// Execution must not walk and sort petgraph edges for every forward. The
+    /// graph is immutable after construction, so this is a cheap read-only
+    /// adjacency cache for compiled executors.
+    pub(crate) inputs_by_node: Vec<Vec<NodeId>>,
 }
 
 impl Graph {
@@ -101,13 +106,16 @@ impl Graph {
     /// Incoming edges sorted by input slot.
     #[must_use]
     pub fn inputs_of(&self, id: NodeId) -> Vec<NodeId> {
-        let mut edges: Vec<_> = self
-            .inner
-            .edges_directed(id, petgraph::Direction::Incoming)
-            .map(|e| (e.weight().input_slot, e.source()))
-            .collect();
-        edges.sort_by_key(|(slot, _)| *slot);
-        edges.into_iter().map(|(_, s)| s).collect()
+        self.inputs_slice(id).to_vec()
+    }
+
+    /// Incoming node ids in input-slot order without allocating.
+    #[must_use]
+    pub fn inputs_slice(&self, id: NodeId) -> &[NodeId] {
+        self.inputs_by_node
+            .get(id.index())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Iterate all nodes.

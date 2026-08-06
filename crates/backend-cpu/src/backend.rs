@@ -1,13 +1,15 @@
 use crate::cpu_profile::CpuHardwareProfile;
 use crate::kernels::{
     attention::{attention_step, attention_step_paged},
-    embedding::embedding_row,
+    embedding::{embedding_row, weighted_embedding},
     matmul,
     norm::{rmsnorm_groups, rmsnorm_row},
     sampling::sample,
+    simd_f32::PulpDispatch,
     softmax::softmax_rows_inplace,
     swiglu::silu_gate,
 };
+use crossbeam_utils::CachePadded;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi as paged_ctx;
@@ -15,13 +17,22 @@ use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::traits::{Backend, BackendCaps, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use rayon::ThreadPool;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use thread_local::ThreadLocal;
 
 /// The CPU backend.
 pub struct CpuBackend {
     caps: BackendCaps,
     profile: CpuHardwareProfile,
+    simd: PulpDispatch,
     /// Rayon pool sized to physical cores (avoids HT L2 thrash in attention).
     pool: ThreadPool,
+    /// Cheap backend-wide launch counter, padded to avoid false sharing with
+    /// adjacent backend state.
+    launches: CachePadded<AtomicU64>,
+    /// Per-worker launch counters for diagnosing scheduler imbalance.
+    worker_launches: ThreadLocal<AtomicU64>,
 }
 
 impl CpuBackend {
@@ -30,12 +41,29 @@ impl CpuBackend {
         let profile = *CpuHardwareProfile::get();
         let physical = profile.physical_cores.max(1);
         let logical = profile.logical_threads.max(physical);
+        let requested_threads =
+            std::env::var("FELLM_CPU_THREADS").ok().and_then(|value| {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "physical" | "p" => Some(physical),
+                    "logical" | "all" => Some(logical),
+                    value => value.parse::<usize>().ok().filter(|&n| n > 0),
+                }
+            });
+        let threads = requested_threads.unwrap_or(physical).clamp(1, logical);
+        tracing::info!(
+            target = "fellm::cpu",
+            physical,
+            logical,
+            threads,
+            requested = requested_threads,
+            "CPU execution pool configured"
+        );
         let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(logical)
+            .num_threads(threads)
             .thread_name(|i| format!("fellm-matmul-{i}"))
             .build_global();
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(physical)
+            .num_threads(threads)
             .thread_name(|i| format!("fellm-attn-{i}"))
             .build()
             .unwrap_or_else(|_| {
@@ -54,12 +82,15 @@ impl CpuBackend {
                 logical_threads: profile.logical_threads as u32,
             },
             profile,
+            simd: PulpDispatch::new(),
             pool,
+            launches: CachePadded::new(AtomicU64::new(0)),
+            worker_launches: ThreadLocal::new(),
         }
     }
 
     fn make_handle(op: OpKind) -> KernelHandle {
-        KernelHandle(op as u64)
+        KernelHandle(u64::from(op.raw()))
     }
 }
 
@@ -72,7 +103,7 @@ impl Default for CpuBackend {
 fn is_supported_matvec_weight_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::F32 | DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K
+        DType::F32 | DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K
     )
 }
 
@@ -104,6 +135,7 @@ impl Backend for CpuBackend {
                             | DType::F16
                             | DType::BF16
                             | DType::Q4_0
+                            | DType::Q5_0
                             | DType::Q8_0
                             | DType::Q4K
                             | DType::Q6K
@@ -126,6 +158,11 @@ impl Backend for CpuBackend {
                     )
                 })
                 .unwrap_or(false),
+            OpKind::WeightedEmbedding => matches!(
+                (input_dtypes.first(), input_dtypes.get(1), output_dtype),
+                (Some(weight), Some(DType::F32), DType::F32)
+                    if is_supported_matvec_weight_dtype(*weight)
+            ),
             OpKind::ShortConv => matches!(
                 (
                     input_dtypes.first(),
@@ -138,6 +175,24 @@ impl Backend for CpuBackend {
                         && is_supported_matvec_weight_dtype(*w1)
             ),
             OpKind::MoE => {
+                if input_dtypes.len() >= 7 {
+                    let activations_ok = input_dtypes.first() == Some(&DType::F32)
+                        && input_dtypes.get(1) == Some(&DType::F32);
+                    let weights_ok = input_dtypes[2..7]
+                        .iter()
+                        .all(|dtype| is_supported_matvec_weight_dtype(*dtype));
+                    let bias_ok = input_dtypes.get(7).is_none_or(|dtype| *dtype == DType::F32);
+                    return if activations_ok && weights_ok && bias_ok {
+                        Some(KernelDescriptor {
+                            op,
+                            input_dtypes: input_dtypes.to_vec(),
+                            output_dtype,
+                            handle: Self::make_handle(op),
+                        })
+                    } else {
+                        None
+                    };
+                }
                 let base_ok = matches!(
                     (
                         input_dtypes.first(),
@@ -169,6 +224,7 @@ impl Backend for CpuBackend {
             | OpKind::Concat
             | OpKind::Sample
             | OpKind::KvWrite => true,
+            _ => false,
         };
         if !ok {
             return None;
@@ -189,17 +245,21 @@ impl Backend for CpuBackend {
         outputs: &mut [TensorMut],
         _stream: StreamHandle,
     ) -> Result<()> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
+        self.worker_launches
+            .get_or(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
         let op = decode_handle(handle)?;
         match op {
-            OpKind::MatMul => launch_matmul(inputs, outputs),
+            OpKind::MatMul => launch_matmul(attrs, inputs, outputs),
             OpKind::Embedding => launch_embedding(inputs, outputs),
             OpKind::RmsNorm => launch_rmsnorm(attrs, inputs, outputs),
             OpKind::Rope => launch_rope(attrs, inputs, outputs),
             OpKind::SiluGate => launch_silu_gate(inputs, outputs),
             OpKind::Softmax => launch_softmax(attrs, inputs, outputs),
             OpKind::Attention => launch_attention(self, attrs, inputs, outputs),
-            OpKind::Add => launch_add(inputs, outputs, &self.profile),
-            OpKind::Mul => launch_mul(inputs, outputs, &self.profile),
+            OpKind::Add => launch_add(inputs, outputs, self.simd),
+            OpKind::Mul => launch_mul(inputs, outputs, self.simd),
             OpKind::Reshape => launch_reshape(inputs, outputs),
             OpKind::Cast => launch_cast(attrs, inputs, outputs),
             OpKind::Concat => launch_concat(inputs, outputs),
@@ -207,6 +267,10 @@ impl Backend for CpuBackend {
             OpKind::KvWrite => launch_kv_write(attrs, inputs, outputs),
             OpKind::ShortConv => launch_shortconv(attrs, inputs, outputs),
             OpKind::MoE => launch_moe(attrs, inputs, outputs),
+            OpKind::WeightedEmbedding => launch_weighted_embedding(inputs, outputs),
+            _ => Err(FellmError::other(
+                "custom operation is not implemented by CPU backend",
+            )),
         }
     }
 
@@ -221,22 +285,23 @@ impl Backend for CpuBackend {
 
 fn decode_handle(h: KernelHandle) -> Result<OpKind> {
     match h.0 {
-        x if x == OpKind::Add as u64 => Ok(OpKind::Add),
-        x if x == OpKind::Mul as u64 => Ok(OpKind::Mul),
-        x if x == OpKind::MatMul as u64 => Ok(OpKind::MatMul),
-        x if x == OpKind::RmsNorm as u64 => Ok(OpKind::RmsNorm),
-        x if x == OpKind::Rope as u64 => Ok(OpKind::Rope),
-        x if x == OpKind::SiluGate as u64 => Ok(OpKind::SiluGate),
-        x if x == OpKind::Softmax as u64 => Ok(OpKind::Softmax),
-        x if x == OpKind::Attention as u64 => Ok(OpKind::Attention),
-        x if x == OpKind::Embedding as u64 => Ok(OpKind::Embedding),
-        x if x == OpKind::Concat as u64 => Ok(OpKind::Concat),
-        x if x == OpKind::Reshape as u64 => Ok(OpKind::Reshape),
-        x if x == OpKind::Cast as u64 => Ok(OpKind::Cast),
-        x if x == OpKind::Sample as u64 => Ok(OpKind::Sample),
-        x if x == OpKind::KvWrite as u64 => Ok(OpKind::KvWrite),
-        x if x == OpKind::ShortConv as u64 => Ok(OpKind::ShortConv),
-        x if x == OpKind::MoE as u64 => Ok(OpKind::MoE),
+        x if x == u64::from(OpKind::Add.raw()) => Ok(OpKind::Add),
+        x if x == u64::from(OpKind::Mul.raw()) => Ok(OpKind::Mul),
+        x if x == u64::from(OpKind::MatMul.raw()) => Ok(OpKind::MatMul),
+        x if x == u64::from(OpKind::RmsNorm.raw()) => Ok(OpKind::RmsNorm),
+        x if x == u64::from(OpKind::Rope.raw()) => Ok(OpKind::Rope),
+        x if x == u64::from(OpKind::SiluGate.raw()) => Ok(OpKind::SiluGate),
+        x if x == u64::from(OpKind::Softmax.raw()) => Ok(OpKind::Softmax),
+        x if x == u64::from(OpKind::Attention.raw()) => Ok(OpKind::Attention),
+        x if x == u64::from(OpKind::Embedding.raw()) => Ok(OpKind::Embedding),
+        x if x == u64::from(OpKind::Concat.raw()) => Ok(OpKind::Concat),
+        x if x == u64::from(OpKind::Reshape.raw()) => Ok(OpKind::Reshape),
+        x if x == u64::from(OpKind::Cast.raw()) => Ok(OpKind::Cast),
+        x if x == u64::from(OpKind::Sample.raw()) => Ok(OpKind::Sample),
+        x if x == u64::from(OpKind::KvWrite.raw()) => Ok(OpKind::KvWrite),
+        x if x == u64::from(OpKind::ShortConv.raw()) => Ok(OpKind::ShortConv),
+        x if x == u64::from(OpKind::MoE.raw()) => Ok(OpKind::MoE),
+        x if x == u64::from(OpKind::WeightedEmbedding.raw()) => Ok(OpKind::WeightedEmbedding),
         _ => Err(FellmError::other(format!("bad kernel handle {h:?}"))),
     }
 }
@@ -271,7 +336,7 @@ fn as_u32_slice(t: &TensorRef) -> Result<&[u32]> {
     bytemuck::try_cast_slice(bytes).map_err(|e| FellmError::other(format!("u32 cast: {e:?}")))
 }
 
-fn launch_matmul(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+fn launch_matmul(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
     // inputs[0] = weight [out_dim, in_dim], inputs[1] = x [in_dim]
     // outputs[0] = y [out_dim]
     if inputs.len() < 2 || outputs.is_empty() {
@@ -286,16 +351,47 @@ fn launch_matmul(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> 
     let in_dim = w.dims_slice()[1] as usize;
     let x_slice = as_f32_slice(x)?;
     let y_slice = as_f32_slice_mut(y_out)?;
+    // A rank-1 activation is the scalar decode form; higher-rank activations
+    // flatten every dimension before the final feature dimension into rows.
+    let rows = if x.dims_slice().len() <= 1 {
+        1
+    } else {
+        x.dims_slice()[..x.dims_slice().len() - 1]
+            .iter()
+            .product::<u64>() as usize
+    };
+    if rows == 0 || x_slice.len() != rows * in_dim || y_slice.len() != rows * out_dim {
+        return Err(FellmError::other(format!(
+            "matmul: batched shape mismatch x_dims={:?} x_len={} w_dims={:?} y_len={} rows={} in_dim={} out_dim={}",
+            x.dims_slice(),
+            x_slice.len(),
+            w.dims_slice(),
+            y_slice.len(),
+            rows,
+            in_dim,
+            out_dim
+        )));
+    }
     match w_dtype {
         DType::F32 => {
             let ws = as_f32_slice(w)?;
-            matmul::matvec_f32(ws, x_slice, y_slice, out_dim, in_dim);
+            matmul::matmul_f32_batch(ws, x_slice, y_slice, rows, out_dim, in_dim)?;
         }
-        DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
             let wb = as_bytes_slice(w);
-            matmul::matvec_quant(wb, w_dtype, x_slice, y_slice, out_dim, in_dim)?;
+            if rows > 1 {
+                matmul::matmul_quant_batch(wb, w_dtype, x_slice, y_slice, rows, out_dim, in_dim)?;
+            } else {
+                matmul::matvec_quant(wb, w_dtype, x_slice, y_slice, out_dim, in_dim)?;
+            }
         }
         other => return Err(FellmError::UnsupportedDType(other)),
+    }
+    if attrs.softcap > 0.0 {
+        let cap = attrs.softcap;
+        for value in y_slice {
+            *value = cap * (*value / cap).tanh();
+        }
     }
     Ok(())
 }
@@ -311,10 +407,71 @@ fn launch_embedding(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<(
     let vocab = w.dims_slice()[0] as usize;
     let dim = w.dims_slice()[1] as usize;
     let ids = as_u32_slice(tok)?;
-    let tok_id = ids[0];
     let y_slice = as_f32_slice_mut(y_out)?;
+    if ids.is_empty() || y_slice.len() != ids.len() * dim {
+        return Err(FellmError::other("embedding: batched shape mismatch"));
+    }
     let wb = as_bytes_slice(w);
-    embedding_row(wb, w_dtype, vocab, dim, tok_id, y_slice)
+    for (tok_id, row) in ids.iter().copied().zip(y_slice.chunks_exact_mut(dim)) {
+        embedding_row(wb, w_dtype, vocab, dim, tok_id, row)?;
+    }
+    Ok(())
+}
+
+fn launch_weighted_embedding(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+    if inputs.len() < 2 || outputs.is_empty() {
+        return Err(FellmError::other("weighted embedding: bad arity"));
+    }
+    let weight = &inputs[0];
+    let logits = as_f32_slice(&inputs[1])?;
+    let output = as_f32_slice_mut(outputs.first_mut().unwrap())?;
+    let weight_dtype = weight
+        .dtype()
+        .ok_or_else(|| FellmError::other("weighted embedding: weight dtype"))?;
+    let dims = weight.dims_slice();
+    if dims.len() != 2 {
+        return Err(FellmError::other(
+            "weighted embedding: weight must be rank 2",
+        ));
+    }
+    let vocab = dims[0] as usize;
+    let dim = dims[1] as usize;
+    if vocab == 0 || dim == 0 {
+        return Err(FellmError::other(format!(
+            "weighted embedding: invalid weight shape dims={dims:?}"
+        )));
+    }
+    let logit_dims = inputs[1].dims_slice();
+    if logit_dims.len() == 2 && logit_dims[1] as usize != vocab {
+        let slots = logit_dims[1] as usize;
+        if !slots.is_multiple_of(2) {
+            return Err(FellmError::other(
+                "weighted embedding: packed top-k input must contain pairs",
+            ));
+        }
+        return crate::kernels::embedding::weighted_embedding_topk(
+            as_bytes_slice(weight),
+            weight_dtype,
+            logits,
+            output,
+            logit_dims[0] as usize,
+            slots / 2,
+            vocab,
+            dim,
+        );
+    }
+    if !logits.len().is_multiple_of(vocab) {
+        return Err(FellmError::other("weighted embedding: invalid dense shape"));
+    }
+    weighted_embedding(
+        as_bytes_slice(weight),
+        weight_dtype,
+        logits,
+        output,
+        logits.len() / vocab,
+        vocab,
+        dim,
+    )
 }
 
 fn launch_rmsnorm(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
@@ -327,8 +484,21 @@ fn launch_rmsnorm(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMu
     let y = as_f32_slice_mut(y_out)?;
     let head_dim = attrs.head_dim as usize;
     let n_heads = attrs.n_heads as usize;
-    if head_dim > 0 && n_heads > 0 && x.len() == n_heads * head_dim && w.len() == head_dim {
-        rmsnorm_groups(x, w, attrs.eps, head_dim, y);
+    if head_dim > 0
+        && n_heads > 0
+        && w.len() == head_dim
+        && x.len().is_multiple_of(n_heads * head_dim)
+    {
+        for (x_row, y_row) in x
+            .chunks_exact(n_heads * head_dim)
+            .zip(y.chunks_exact_mut(n_heads * head_dim))
+        {
+            rmsnorm_groups(x_row, w, attrs.eps, head_dim, y_row);
+        }
+    } else if !w.is_empty() && x.len().is_multiple_of(w.len()) {
+        for (x_row, y_row) in x.chunks_exact(w.len()).zip(y.chunks_exact_mut(w.len())) {
+            rmsnorm_row(x_row, w, attrs.eps, y_row);
+        }
     } else {
         rmsnorm_row(x, w, attrs.eps, y);
     }
@@ -344,14 +514,19 @@ fn launch_rope(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut])
     let inv_freqs = as_f32_slice(&inputs[1])?;
     let x_out = as_f32_slice_mut(y_out)?;
     x_out.copy_from_slice(x_in);
-    crate::kernels::rope::rope_inplace_with_freqs(
-        x_out,
-        attrs.n_heads as usize,
-        attrs.head_dim as usize,
-        attrs.rope_dim as usize,
-        attrs.position,
-        inv_freqs,
-    );
+    let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
+    if row_width == 0 || x_in.len().is_multiple_of(row_width) {
+        for (row, values) in x_out.chunks_exact_mut(row_width).enumerate() {
+            crate::kernels::rope::rope_inplace_with_freqs(
+                values,
+                attrs.n_heads as usize,
+                attrs.head_dim as usize,
+                attrs.rope_dim as usize,
+                attrs.position.saturating_add(row as u32),
+                inv_freqs,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -397,6 +572,9 @@ fn launch_attention(
     if inputs.len() < 3 || outputs.is_empty() {
         return Err(FellmError::other("attention: bad arity"));
     }
+    if attrs.attention_mode == 1 && inputs.len() >= 5 {
+        return launch_canvas_attention(backend, attrs, inputs, outputs);
+    }
     let (y_out, _) = outputs.split_first_mut().unwrap();
     let q = as_f32_slice(&inputs[0])?;
     let out = as_f32_slice_mut(y_out)?;
@@ -426,6 +604,7 @@ fn launch_attention(
             scale,
             layer,
             &backend.profile,
+            backend.simd,
         );
         // Re-run the contiguous kernel under the pool for parallel heads.
         // attention_step_paged already calls attention_step which uses the pool.
@@ -457,16 +636,144 @@ fn launch_attention(
             past,
             scale,
             &backend.profile,
+            backend.simd,
         );
     });
     Ok(())
 }
 
-fn launch_add(
+fn launch_canvas_attention(
+    backend: &CpuBackend,
+    attrs: &OpAttrs,
     inputs: &[TensorRef],
     outputs: &mut [TensorMut],
-    profile: &CpuHardwareProfile,
 ) -> Result<()> {
+    let q = as_f32_slice(&inputs[0])?;
+    let k_canvas = as_f32_slice(&inputs[3])?;
+    let v_canvas = as_f32_slice(&inputs[4])?;
+    let out = as_f32_slice_mut(
+        outputs
+            .first_mut()
+            .ok_or_else(|| FellmError::other("canvas attention: no output"))?,
+    )?;
+    let n_heads = attrs.n_heads.max(1) as usize;
+    let n_kv = attrs.n_kv_heads.max(1) as usize;
+    let head_dim = attrs.head_dim.max(1) as usize;
+    let row_width = n_heads * head_dim;
+    let kv_width = n_kv * head_dim;
+    let rows = attrs.query_len.max(1) as usize;
+    let prefix_len = attrs.past_len as usize;
+    if q.len() != rows * row_width
+        || out.len() != rows * row_width
+        || k_canvas.len() < rows * kv_width
+        || v_canvas.len() < rows * kv_width
+    {
+        return Err(FellmError::other("canvas attention: shape mismatch"));
+    }
+    let heads_per_kv = n_heads / n_kv;
+    let window = attrs.attention_window as usize;
+    let prefix_start = if window == 0 {
+        0
+    } else {
+        prefix_len.saturating_sub(window)
+    };
+    let prefix_ctx = if attrs.block_size > 0 {
+        paged_ctx::snapshot_paged_context()
+    } else {
+        None
+    };
+    let prefix_k = as_f32_slice(&inputs[1]).ok();
+    let prefix_v = as_f32_slice(&inputs[2]).ok();
+    backend.pool.install(|| {
+        q.par_chunks_exact(row_width)
+            .zip(out.par_chunks_exact_mut(row_width))
+            .for_each(|(q_row, out_row)| {
+                for h in 0..n_heads {
+                    let kv_h = h / heads_per_kv;
+                    let q_head = &q_row[h * head_dim..(h + 1) * head_dim];
+                    let mut scores =
+                        Vec::with_capacity(prefix_len.saturating_sub(prefix_start) + rows);
+                    for t in prefix_start..prefix_len {
+                        let mut score = 0.0f32;
+                        if let Some(ref ctx) = prefix_ctx {
+                            // SAFETY: the active paged context remains valid for the graph step.
+                            let k_row = unsafe { ctx.k_row(attrs.layer_ord as usize, t) };
+                            let k_head = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+                            for i in 0..head_dim {
+                                score += q_head[i] * k_head[i].to_f32();
+                            }
+                        } else if let Some(prefix_k) = prefix_k {
+                            let k_row = &prefix_k[t * kv_width + kv_h * head_dim
+                                ..t * kv_width + (kv_h + 1) * head_dim];
+                            for i in 0..head_dim {
+                                score += q_head[i] * k_row[i];
+                            }
+                        }
+                        scores.push(
+                            score
+                                * if attrs.scale > 0.0 {
+                                    attrs.scale
+                                } else {
+                                    1.0 / (head_dim as f32).sqrt()
+                                },
+                        );
+                    }
+                    for canvas_row in 0..rows {
+                        let k_row = &k_canvas[canvas_row * kv_width + kv_h * head_dim
+                            ..canvas_row * kv_width + (kv_h + 1) * head_dim];
+                        let mut score = 0.0f32;
+                        for i in 0..head_dim {
+                            score += q_head[i] * k_row[i];
+                        }
+                        scores.push(
+                            score
+                                * if attrs.scale > 0.0 {
+                                    attrs.scale
+                                } else {
+                                    1.0 / (head_dim as f32).sqrt()
+                                },
+                        );
+                    }
+                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let denom = scores.iter().map(|s| (*s - max).exp()).sum::<f32>();
+                    let out_head = &mut out_row[h * head_dim..(h + 1) * head_dim];
+                    out_head.fill(0.0);
+                    if denom > 0.0 {
+                        for (index, score) in scores.iter().copied().enumerate() {
+                            let weight = (score - max).exp() / denom;
+                            if index < prefix_len.saturating_sub(prefix_start) {
+                                let t = prefix_start + index;
+                                if let Some(ref ctx) = prefix_ctx {
+                                    // SAFETY: the active paged context remains valid for the graph step.
+                                    let v_row = unsafe { ctx.v_row(attrs.layer_ord as usize, t) };
+                                    let v_head = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+                                    for i in 0..head_dim {
+                                        out_head[i] += weight * v_head[i].to_f32();
+                                    }
+                                } else if let Some(prefix_v) = prefix_v {
+                                    let v_row = &prefix_v[t * kv_width + kv_h * head_dim
+                                        ..t * kv_width + (kv_h + 1) * head_dim];
+                                    for i in 0..head_dim {
+                                        out_head[i] += weight * v_row[i];
+                                    }
+                                }
+                            } else {
+                                let canvas_row = index - prefix_len.saturating_sub(prefix_start);
+                                let v_row = &v_canvas[canvas_row * kv_width + kv_h * head_dim
+                                    ..canvas_row * kv_width + (kv_h + 1) * head_dim];
+                                for i in 0..head_dim {
+                                    out_head[i] += weight * v_row[i];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+    });
+    Ok(())
+}
+
+fn launch_add(inputs: &[TensorRef], outputs: &mut [TensorMut], simd: PulpDispatch) -> Result<()> {
     if inputs.len() < 2 || outputs.is_empty() {
         return Err(FellmError::other("add: bad arity"));
     }
@@ -474,15 +781,11 @@ fn launch_add(
     let a = as_f32_slice(&inputs[0])?;
     let b = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
-    crate::kernels::simd_f32::add_f32(a, b, y, profile);
+    crate::kernels::simd_f32::add_f32(a, b, y, simd);
     Ok(())
 }
 
-fn launch_mul(
-    inputs: &[TensorRef],
-    outputs: &mut [TensorMut],
-    profile: &CpuHardwareProfile,
-) -> Result<()> {
+fn launch_mul(inputs: &[TensorRef], outputs: &mut [TensorMut], simd: PulpDispatch) -> Result<()> {
     if inputs.len() < 2 || outputs.is_empty() {
         return Err(FellmError::other("mul: bad arity"));
     }
@@ -490,7 +793,7 @@ fn launch_mul(
     let a = as_f32_slice(&inputs[0])?;
     let b = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
-    crate::kernels::simd_f32::mul_f32(a, b, y, profile);
+    crate::kernels::simd_f32::mul_f32(a, b, y, simd);
     Ok(())
 }
 
@@ -641,9 +944,9 @@ fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorM
         let is_v = attrs.kv_slot != 0;
         return paged_ctx::with_paged_context_mut(|ctx| {
             let ctx = ctx.ok_or_else(|| FellmError::other("kv_write: missing paged ctx"))?;
-            if row.len() != ctx.tokens_stride {
+            if row.len() > ctx.tokens_stride {
                 return Err(FellmError::other(format!(
-                    "kv_write: row len {} != tokens_stride {}",
+                    "kv_write: row len {} > tokens_stride {}",
                     row.len(),
                     ctx.tokens_stride
                 )));
@@ -747,6 +1050,104 @@ fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) 
     let x = as_f32_slice(&inputs[0])?;
     let gate_inp = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
+
+    if inputs.len() >= 7 {
+        let packed_dims = inputs[2].dims_slice();
+        let down_dims = inputs[3].dims_slice();
+        let shared_dims = inputs[4].dims_slice();
+        if packed_dims.len() != 3 || down_dims.len() != 3 || shared_dims.len() != 2 {
+            return Err(FellmError::other(
+                "moe gemma: invalid packed/shared dimensions",
+            ));
+        }
+        let n_experts = attrs.n_experts.max(1) as usize;
+        let n_expert_used = attrs.n_expert_used.max(1) as usize;
+        let n_embd = attrs.n_embd.max(1) as usize;
+        let n_ff = packed_dims[1] as usize / 2;
+        let shared_ff = shared_dims[0] as usize;
+        let bias = if inputs.len() > 7 {
+            Some(as_f32_slice(&inputs[7])?)
+        } else {
+            None
+        };
+        let x_dims = inputs[0].dims_slice();
+        let tokens = if x_dims.len() <= 1 {
+            1
+        } else {
+            x_dims[..x_dims.len() - 1].iter().product::<u64>() as usize
+        };
+        if tokens > 1 {
+            return crate::kernels::moe::moe_decode_gemma_batch(
+                x,
+                gate_inp,
+                as_bytes_slice(&inputs[2]),
+                inputs[2]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe gemma: packed dtype"))?,
+                as_bytes_slice(&inputs[3]),
+                inputs[3]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe gemma: down dtype"))?,
+                as_bytes_slice(&inputs[4]),
+                inputs[4]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe gemma: shared gate dtype"))?,
+                as_bytes_slice(&inputs[5]),
+                inputs[5]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe gemma: shared up dtype"))?,
+                as_bytes_slice(&inputs[6]),
+                inputs[6]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe gemma: shared down dtype"))?,
+                bias,
+                y,
+                tokens,
+                n_experts,
+                n_expert_used,
+                n_ff,
+                shared_ff,
+                n_embd,
+                attrs.expert_gating_func,
+                attrs.routed_scaling_factor,
+                attrs.norm_topk_prob != 0,
+            );
+        }
+        return crate::kernels::moe::moe_decode_gemma(
+            x,
+            gate_inp,
+            as_bytes_slice(&inputs[2]),
+            inputs[2]
+                .dtype()
+                .ok_or_else(|| FellmError::other("moe gemma: packed dtype"))?,
+            as_bytes_slice(&inputs[3]),
+            inputs[3]
+                .dtype()
+                .ok_or_else(|| FellmError::other("moe gemma: down dtype"))?,
+            as_bytes_slice(&inputs[4]),
+            inputs[4]
+                .dtype()
+                .ok_or_else(|| FellmError::other("moe gemma: shared gate dtype"))?,
+            as_bytes_slice(&inputs[5]),
+            inputs[5]
+                .dtype()
+                .ok_or_else(|| FellmError::other("moe gemma: shared up dtype"))?,
+            as_bytes_slice(&inputs[6]),
+            inputs[6]
+                .dtype()
+                .ok_or_else(|| FellmError::other("moe gemma: shared down dtype"))?,
+            bias,
+            y,
+            n_experts,
+            n_expert_used,
+            n_ff,
+            shared_ff,
+            n_embd,
+            attrs.expert_gating_func,
+            attrs.routed_scaling_factor,
+            attrs.norm_topk_prob != 0,
+        );
+    }
 
     let gate_dims = inputs[1].dims_slice();
     let expert_dims = inputs[2].dims_slice();

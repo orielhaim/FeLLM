@@ -6,7 +6,16 @@ use rand_chacha::ChaCha8Rng;
 
 /// Sample one token id from `logits`. `logits` is modified in place.
 #[must_use]
-pub fn sample(logits: &mut [f32], temperature: f32, top_k: u32, top_p: f32, seed: u64) -> u32 {
+pub fn sample(
+    logits: &mut [f32],
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    seed: u64,
+    repetition_penalty: f32,
+    recent_tokens: &[u32],
+) -> u32 {
+    apply_repetition_penalty(logits, repetition_penalty, recent_tokens);
     if temperature <= 0.0 || top_k == 1 {
         return argmax(logits) as u32;
     }
@@ -71,6 +80,22 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: u32, top_p: f32, seed
         }
     }
     probs.last().map_or(0, |(i, _)| *i as u32)
+}
+
+fn apply_repetition_penalty(logits: &mut [f32], penalty: f32, recent_tokens: &[u32]) {
+    if penalty <= 1.0 || !penalty.is_finite() {
+        return;
+    }
+    for &token in recent_tokens {
+        let Some(logit) = logits.get_mut(token as usize) else {
+            continue;
+        };
+        *logit = if *logit < 0.0 {
+            *logit * penalty
+        } else {
+            *logit / penalty
+        };
+    }
 }
 
 fn splitmix64(mut x: u64) -> u64 {

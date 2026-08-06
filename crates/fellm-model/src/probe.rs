@@ -27,6 +27,14 @@ pub enum MixKind {
         n_kv_heads: usize,
         /// Whether `attn_q_norm` / `attn_k_norm` tensors exist.
         qk_norm: bool,
+        /// Per-layer head dimension.
+        head_dim: usize,
+        /// Per-layer rotary dimension.
+        rope_dim: usize,
+        /// Whether this layer uses sliding-window attention.
+        is_sliding: bool,
+        /// Whether value states reuse the K projection.
+        value_reuses_key: bool,
     },
     /// Short convolution recurrent mix.
     ShortConv,
@@ -113,6 +121,14 @@ pub struct ModelSpec {
     pub shortconv_l_cache: usize,
     /// Per-layer recipe.
     pub layers: Vec<LayerSpec>,
+    /// True for the DiffusionGemma encoder/decoder architecture.
+    pub is_diffusion: bool,
+    /// Diffusion canvas length.
+    pub canvas_length: usize,
+    /// Final-logit soft cap, or zero when disabled.
+    pub final_logit_softcapping: f32,
+    /// Sliding-window size, or zero for non-diffusion models.
+    pub sliding_window: usize,
 }
 
 impl ModelSpec {
@@ -128,7 +144,13 @@ impl ModelSpec {
         if n_heads == 0 {
             return Err(FellmError::other("attention.head_count is 0"));
         }
-        let head_dim = d_model / n_heads;
+        let is_diffusion = arch_id == "diffusion-gemma";
+        let head_dim = if is_diffusion {
+            m.get_u32(&format!("{p}.attention.key_length"))
+                .unwrap_or((d_model / n_heads) as u32) as usize
+        } else {
+            d_model / n_heads
+        };
 
         let kv_meta = read_kv_heads(m, p, n_layers, n_heads)?;
         let n_kv_heads = kv_meta.iter().copied().find(|&n| n > 0).unwrap_or(n_heads);
@@ -171,6 +193,27 @@ impl ModelSpec {
         let tied_embeddings = !gguf.has_tensor("output.weight");
         let shortconv_l_cache = m.get_u32(&format!("{p}.shortconv.l_cache")).unwrap_or(0) as usize;
 
+        let canvas_length = m.get_u32("diffusion.canvas_length").unwrap_or(256) as usize;
+        let final_logit_softcapping = m
+            .get_f32(&format!("{p}.final_logit_softcapping"))
+            .unwrap_or(0.0);
+        let sliding_window = m
+            .get_u32(&format!("{p}.attention.sliding_window"))
+            .unwrap_or(0) as usize;
+        let sliding_pattern = m
+            .get_bool_array(&format!("{p}.attention.sliding_window_pattern"))
+            .ok()
+            .map(<[bool]>::to_vec);
+        let key_length = m
+            .get_u32(&format!("{p}.attention.key_length"))
+            .unwrap_or(head_dim as u32) as usize;
+        let key_length_swa = m
+            .get_u32(&format!("{p}.attention.key_length_swa"))
+            .unwrap_or(key_length as u32) as usize;
+        let rope_dim_swa = m
+            .get_u32(&format!("{p}.rope.dimension_count_swa"))
+            .unwrap_or(rope_dim as u32) as usize;
+
         let (rope_scaling_type, rope_scaling_factor, rope_original_ctx, rope_low, rope_high) =
             read_rope_scaling(m, p);
 
@@ -183,16 +226,39 @@ impl ModelSpec {
             let has_shortconv = gguf.has_tensor(&format!("blk.{i}.shortconv.in_proj.weight"));
             let has_dense = gguf.has_tensor(&format!("blk.{i}.ffn_gate.weight"));
             let has_moe = gguf.has_tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
-                || gguf.has_tensor(&format!("blk.{i}.ffn_gate_exps.weight"));
+                || gguf.has_tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
+                || gguf.has_tensor(&format!("blk.{i}.ffn_gate_up_exps.weight"));
 
             let mix = if has_shortconv && !has_attn {
                 MixKind::ShortConv
             } else if has_attn {
                 let n_kv = kv_meta.get(i).copied().unwrap_or(n_kv_heads).max(1);
                 let qk_norm = gguf.has_tensor(&format!("blk.{i}.attn_q_norm.weight"));
+                let is_sliding = sliding_pattern
+                    .as_ref()
+                    .and_then(|pattern| pattern.get(i).copied())
+                    .unwrap_or(false);
+                let value_reuses_key = !gguf.has_tensor(&format!("blk.{i}.attn_v.weight"));
+                let layer_head_dim = if is_diffusion {
+                    if value_reuses_key || !is_sliding {
+                        key_length
+                    } else {
+                        key_length_swa
+                    }
+                } else {
+                    head_dim
+                };
                 MixKind::Attention {
                     n_kv_heads: n_kv,
                     qk_norm,
+                    head_dim: layer_head_dim,
+                    rope_dim: if is_diffusion && is_sliding {
+                        rope_dim_swa
+                    } else {
+                        rope_dim
+                    },
+                    is_sliding,
+                    value_reuses_key,
                 }
             } else if kv_meta.get(i).copied() == Some(0) && shortconv_l_cache > 0 {
                 // Metadata says recurrent but tensors missing — still error clearly.
@@ -276,6 +342,10 @@ impl ModelSpec {
             tied_embeddings,
             shortconv_l_cache,
             layers,
+            is_diffusion,
+            canvas_length,
+            final_logit_softcapping,
+            sliding_window,
         })
     }
 

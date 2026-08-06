@@ -146,7 +146,7 @@ fn register_one(
     launch: fellm_plugin_abi::c_abi::PluginLaunchFn,
 ) -> c_int {
     let mut reg = PluginOpRegistration {
-        op_kind: op as u32,
+        op_kind: op.raw(),
         n_input_dtypes: inputs.len() as u32,
         input_dtypes: [0; fellm_plugin_abi::PLUGIN_MAX_INPUT_DTYPES],
         output_dtype: output as u32,

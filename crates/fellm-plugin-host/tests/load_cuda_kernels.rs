@@ -10,11 +10,19 @@ fn candidate_paths() -> Vec<PathBuf> {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.pop();
     root.pop();
-    vec![
-        root.join("plugins/dist/libcuda_kernels.so"),
-        root.join("plugins/cuda_kernels/target/release/libcuda_kernels.so"),
-        root.join("plugins/cuda_kernels/target/debug/libcuda_kernels.so"),
-    ]
+    if cfg!(windows) {
+        vec![
+            root.join("plugins/dist/cuda_kernels.dll"),
+            root.join("plugins/cuda_kernels/target/release/cuda_kernels.dll"),
+            root.join("plugins/cuda_kernels/target/debug/cuda_kernels.dll"),
+        ]
+    } else {
+        vec![
+            root.join("plugins/dist/libcuda_kernels.so"),
+            root.join("plugins/cuda_kernels/target/release/libcuda_kernels.so"),
+            root.join("plugins/cuda_kernels/target/debug/libcuda_kernels.so"),
+        ]
+    }
 }
 
 #[test]

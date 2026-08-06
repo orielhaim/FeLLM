@@ -12,8 +12,10 @@ path = "src/main.rs"
 [features]
 default = []
 backend-cuda = ["fellm-runtime/backend-cuda"]
+tracy = ["dep:tracing-tracy"]
 
 [dependencies]
+fellm-architecture-diffusion-gemma = { path = "../../plugins/diffusion_gemma" }
 fellm-core.workspace = true
 fellm-gguf.workspace = true
 fellm-tokenizer.workspace = true
@@ -21,6 +23,7 @@ fellm-runtime.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-tracy = { workspace = true, optional = true }
 
 [lints]
 workspace = true

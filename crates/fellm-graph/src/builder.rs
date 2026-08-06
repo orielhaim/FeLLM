@@ -8,6 +8,7 @@ use fellm_core::tensor::Tensor;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use petgraph::Directed;
 use petgraph::stable_graph::StableGraph;
+use petgraph::visit::{EdgeRef, NodeIndexable};
 
 /// Builder for a [`Graph`].
 pub struct GraphBuilder {
@@ -144,10 +145,21 @@ impl GraphBuilder {
         if self.outputs.is_empty() {
             return Err(FellmError::InvalidGraph("graph has no outputs".into()));
         }
+        let mut inputs_by_node = vec![Vec::new(); self.inner.node_bound()];
+        for id in self.inner.node_indices() {
+            let mut edges: Vec<_> = self
+                .inner
+                .edges_directed(id, petgraph::Direction::Incoming)
+                .map(|e| (e.weight().input_slot, e.source()))
+                .collect();
+            edges.sort_unstable_by_key(|(slot, _)| *slot);
+            inputs_by_node[id.index()] = edges.into_iter().map(|(_, source)| source).collect();
+        }
         Ok(Graph {
             inner: self.inner,
             inputs: self.inputs,
             outputs: self.outputs,
+            inputs_by_node,
         })
     }
 }

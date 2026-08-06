@@ -102,7 +102,7 @@ impl CompiledStep {
 
         for &id in &plan.order {
             let node = graph.node(id);
-            let input_ids = graph.inputs_of(id);
+            let input_ids = graph.inputs_slice(id);
             let inputs: Vec<usize> = input_ids
                 .iter()
                 .map(|iid| {
@@ -246,7 +246,7 @@ impl CompiledStep {
             if name != "logits" {
                 continue;
             }
-            let preds = graph.inputs_of(oid);
+            let preds = graph.inputs_slice(oid);
             let src = preds
                 .first()
                 .copied()
@@ -309,7 +309,7 @@ impl CompiledStep {
             self.body_end
         };
         let profile_ops = std::env::var_os("FELLM_PROFILE_OPS").is_some();
-        let mut profile: HashMap<&'static str, (u32, u128)> = HashMap::new();
+        let mut profile: HashMap<String, (u32, u128)> = HashMap::new();
 
         for i in 0..end {
             let node = &self.nodes[i];
@@ -337,7 +337,14 @@ impl CompiledStep {
                 backend.launch(rt.handle, &attrs, &input_refs, &mut outs, 0)?;
             }
             if let Some(started) = started {
-                let entry = profile.entry(rt.op.name()).or_default();
+                let shape = node
+                    .dims
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join("x");
+                let key = format!("{}[{}]", rt.op.name(), shape);
+                let entry = profile.entry(key).or_default();
                 entry.0 += 1;
                 entry.1 += started.elapsed().as_nanos();
             }

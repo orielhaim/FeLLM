@@ -8,9 +8,14 @@ license.workspace = true
 [dependencies]
 fellm-core.workspace = true
 fellm-plugin-abi.workspace = true
-faer.workspace = true
+gemm.workspace = true
 pulp.workspace = true
-matrixmultiply.workspace = true
+dyn-stack.workspace = true
+aligned-vec.workspace = true
+thread_local.workspace = true
+crossbeam-utils.workspace = true
+multiversion.workspace = true
+zerocopy.workspace = true
 rayon.workspace = true
 half.workspace = true
 bytemuck.workspace = true
@@ -21,3 +26,13 @@ rand_chacha.workspace = true
 raw-cpuid = "11.6.0"
 
 [dev-dependencies]
+divan.workspace = true
+iai-callgrind.workspace = true
+
+[[bench]]
+name = "cpu_kernels"
+harness = false
+
+[[bench]]
+name = "iai_kernels"
+harness = false

@@ -1,7 +1,16 @@
 use crate::cpu_profile::CpuHardwareProfile;
-use crate::kernels::simd_f32;
+use crate::kernels::simd_f32::{self, PulpDispatch};
 use fellm_plugin_abi as paged_ctx;
 use rayon::prelude::*;
+use std::cell::RefCell;
+
+thread_local! {
+    /// One reusable score tile per Rayon worker. Attention is launched for
+    /// every head and every denoising pass; allocating this tile in each head
+    /// otherwise turns a small scratch buffer into steady-state allocator
+    /// traffic.
+    static SCORE_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn attention_step(
@@ -15,6 +24,7 @@ pub fn attention_step(
     past_len: usize,
     scale: f32,
     profile: &CpuHardwareProfile,
+    simd: PulpDispatch,
 ) {
     debug_assert_eq!(q.len(), n_heads * head_dim);
     debug_assert!(n_heads.is_multiple_of(n_kv_heads));
@@ -32,7 +42,7 @@ pub fn attention_step(
             let q_head = &q[h * head_dim..(h + 1) * head_dim];
             attention_head_tiled(
                 q_head, k_cache, v_cache, out_h, n_kv_heads, head_dim, seq, kv_h, scale, kv_tile,
-                profile,
+                simd,
             );
         });
 }
@@ -48,6 +58,7 @@ pub fn attention_step_paged(
     scale: f32,
     layer: usize,
     profile: &CpuHardwareProfile,
+    simd: PulpDispatch,
 ) {
     debug_assert_eq!(q.len(), n_heads * head_dim);
     debug_assert!(n_heads.is_multiple_of(n_kv_heads));
@@ -56,7 +67,9 @@ pub fn attention_step_paged(
     let heads_per_kv = n_heads / n_kv_heads;
     let kv_tile = profile.kv_tile_for(head_dim, seq);
     let ctx = paged_ctx::snapshot_paged_context().expect("paged attention requires PagedKvContext");
-    debug_assert_eq!(ctx.tokens_stride, n_kv_heads * head_dim);
+    // The shared paged arena is sized for the widest layer.  Gemma 4 mixes
+    // 256- and 512-wide attention heads; each layer consumes only its own
+    // prefix of a max-stride row.
 
     out.par_chunks_mut(head_dim)
         .enumerate()
@@ -64,7 +77,7 @@ pub fn attention_step_paged(
             let kv_h = h / heads_per_kv;
             let q_head = &q[h * head_dim..(h + 1) * head_dim];
             attention_head_paged(
-                q_head, &ctx, out_h, head_dim, seq, kv_h, scale, kv_tile, layer, profile,
+                q_head, &ctx, out_h, head_dim, seq, kv_h, scale, kv_tile, layer, simd,
             );
         });
 }
@@ -81,68 +94,71 @@ fn attention_head_tiled(
     kv_h: usize,
     scale: f32,
     kv_tile: usize,
-    profile: &CpuHardwareProfile,
+    simd: PulpDispatch,
 ) {
     let mut m = f32::NEG_INFINITY;
     let mut l = 0.0f32;
     out_h.fill(0.0);
 
-    let mut scores = vec![0.0f32; kv_tile];
-    let mut tile_start = 0usize;
-    while tile_start < seq {
-        let tile_end = (tile_start + kv_tile).min(seq);
-        let tile_len = tile_end - tile_start;
+    SCORE_SCRATCH.with(|cell| {
+        let mut scores = cell.borrow_mut();
+        scores.resize(kv_tile, 0.0);
+        let mut tile_start = 0usize;
+        while tile_start < seq {
+            let tile_end = (tile_start + kv_tile).min(seq);
+            let tile_len = tile_end - tile_start;
 
-        // Prefetch the next K/V tile while we compute this one.
-        let next_start = tile_end;
-        if next_start < seq {
-            let next_end = (next_start + kv_tile).min(seq);
-            prefetch_kv_tile(k_cache, n_kv_heads, head_dim, kv_h, next_start, next_end);
-            prefetch_kv_tile(v_cache, n_kv_heads, head_dim, kv_h, next_start, next_end);
-        }
-
-        // scores = Q · K_tile^T * scale
-        for (i, t) in (tile_start..tile_end).enumerate() {
-            let k_row = kv_row(k_cache, n_kv_heads, head_dim, t, kv_h);
-            scores[i] = simd_f32::dot_f32(q_head, k_row, profile) * scale;
-        }
-
-        // Online softmax update against this tile.
-        let mut m_tile = f32::NEG_INFINITY;
-        for i in 0..tile_len {
-            if scores[i] > m_tile {
-                m_tile = scores[i];
+            // Prefetch the next K/V tile while we compute this one.
+            let next_start = tile_end;
+            if next_start < seq {
+                let next_end = (next_start + kv_tile).min(seq);
+                prefetch_kv_tile(k_cache, n_kv_heads, head_dim, kv_h, next_start, next_end);
+                prefetch_kv_tile(v_cache, n_kv_heads, head_dim, kv_h, next_start, next_end);
             }
-        }
-        let m_new = if m_tile > m { m_tile } else { m };
-        let alpha = if m.is_finite() {
-            (m - m_new).exp()
-        } else {
-            0.0
-        };
 
-        if alpha != 1.0 {
-            simd_f32::scale_f32(out_h, alpha, profile);
-            l *= alpha;
+            // scores = Q · K_tile^T * scale
+            for (i, t) in (tile_start..tile_end).enumerate() {
+                let k_row = kv_row(k_cache, n_kv_heads, head_dim, t, kv_h);
+                scores[i] = simd_f32::dot_f32(q_head, k_row, simd) * scale;
+            }
+
+            // Online softmax update against this tile.
+            let mut m_tile = f32::NEG_INFINITY;
+            for i in 0..tile_len {
+                if scores[i] > m_tile {
+                    m_tile = scores[i];
+                }
+            }
+            let m_new = if m_tile > m { m_tile } else { m };
+            let alpha = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
+
+            if alpha != 1.0 {
+                simd_f32::scale_f32(out_h, alpha, simd);
+                l *= alpha;
+            }
+
+            let mut l_tile = 0.0f32;
+            for i in 0..tile_len {
+                let p = (scores[i] - m_new).exp();
+                scores[i] = p;
+                l_tile += p;
+                let t = tile_start + i;
+                let v_row = kv_row(v_cache, n_kv_heads, head_dim, t, kv_h);
+                simd_f32::axpy_f32(out_h, v_row, p, simd);
+            }
+            l += l_tile;
+            m = m_new;
+            tile_start = tile_end;
         }
 
-        let mut l_tile = 0.0f32;
-        for i in 0..tile_len {
-            let p = (scores[i] - m_new).exp();
-            scores[i] = p;
-            l_tile += p;
-            let t = tile_start + i;
-            let v_row = kv_row(v_cache, n_kv_heads, head_dim, t, kv_h);
-            simd_f32::axpy_f32(out_h, v_row, p, profile);
+        if l > 0.0 {
+            simd_f32::scale_f32(out_h, 1.0 / l, simd);
         }
-        l += l_tile;
-        m = m_new;
-        tile_start = tile_end;
-    }
-
-    if l > 0.0 {
-        simd_f32::scale_f32(out_h, 1.0 / l, profile);
-    }
+    });
 }
 
 /// Online-softmax tiled attention reading f16 K/V rows from the paged arena.
@@ -157,62 +173,65 @@ fn attention_head_paged(
     scale: f32,
     kv_tile: usize,
     layer: usize,
-    profile: &CpuHardwareProfile,
+    simd: PulpDispatch,
 ) {
     let mut m = f32::NEG_INFINITY;
     let mut l = 0.0f32;
     out_h.fill(0.0);
 
-    let mut scores = vec![0.0f32; kv_tile];
-    let mut tile_start = 0usize;
-    while tile_start < seq {
-        let tile_end = (tile_start + kv_tile).min(seq);
-        let tile_len = tile_end - tile_start;
+    SCORE_SCRATCH.with(|cell| {
+        let mut scores = cell.borrow_mut();
+        scores.resize(kv_tile, 0.0);
+        let mut tile_start = 0usize;
+        while tile_start < seq {
+            let tile_end = (tile_start + kv_tile).min(seq);
+            let tile_len = tile_end - tile_start;
 
-        for (i, t) in (tile_start..tile_end).enumerate() {
-            // SAFETY: arena valid for step; read-only during attention.
-            let k_full = unsafe { ctx.k_row(layer, t) };
-            let k_head = &k_full[kv_h * head_dim..(kv_h + 1) * head_dim];
-            scores[i] = simd_f32::dot_f32_f16(q_head, k_head, profile) * scale;
-        }
-
-        let mut m_tile = f32::NEG_INFINITY;
-        for i in 0..tile_len {
-            if scores[i] > m_tile {
-                m_tile = scores[i];
+            for (i, t) in (tile_start..tile_end).enumerate() {
+                // SAFETY: arena valid for step; read-only during attention.
+                let k_full = unsafe { ctx.k_row(layer, t) };
+                let k_head = &k_full[kv_h * head_dim..(kv_h + 1) * head_dim];
+                scores[i] = simd_f32::dot_f32_f16(q_head, k_head, simd) * scale;
             }
-        }
-        let m_new = if m_tile > m { m_tile } else { m };
-        let alpha = if m.is_finite() {
-            (m - m_new).exp()
-        } else {
-            0.0
-        };
 
-        if alpha != 1.0 {
-            simd_f32::scale_f32(out_h, alpha, profile);
-            l *= alpha;
+            let mut m_tile = f32::NEG_INFINITY;
+            for i in 0..tile_len {
+                if scores[i] > m_tile {
+                    m_tile = scores[i];
+                }
+            }
+            let m_new = if m_tile > m { m_tile } else { m };
+            let alpha = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
+
+            if alpha != 1.0 {
+                simd_f32::scale_f32(out_h, alpha, simd);
+                l *= alpha;
+            }
+
+            let mut l_tile = 0.0f32;
+            for i in 0..tile_len {
+                let p = (scores[i] - m_new).exp();
+                scores[i] = p;
+                l_tile += p;
+                let t = tile_start + i;
+                // SAFETY: same as K path.
+                let v_full = unsafe { ctx.v_row(layer, t) };
+                let v_head = &v_full[kv_h * head_dim..(kv_h + 1) * head_dim];
+                simd_f32::axpy_f32_f16(out_h, v_head, p, simd);
+            }
+            l += l_tile;
+            m = m_new;
+            tile_start = tile_end;
         }
 
-        let mut l_tile = 0.0f32;
-        for i in 0..tile_len {
-            let p = (scores[i] - m_new).exp();
-            scores[i] = p;
-            l_tile += p;
-            let t = tile_start + i;
-            // SAFETY: same as K path.
-            let v_full = unsafe { ctx.v_row(layer, t) };
-            let v_head = &v_full[kv_h * head_dim..(kv_h + 1) * head_dim];
-            simd_f32::axpy_f32_f16(out_h, v_head, p, profile);
+        if l > 0.0 {
+            simd_f32::scale_f32(out_h, 1.0 / l, simd);
         }
-        l += l_tile;
-        m = m_new;
-        tile_start = tile_end;
-    }
-
-    if l > 0.0 {
-        simd_f32::scale_f32(out_h, 1.0 / l, profile);
-    }
+    });
 }
 
 #[inline]
@@ -365,6 +384,7 @@ mod tests {
             past,
             scale,
             &profile,
+            PulpDispatch::new(),
         );
         attention_step_naive(
             &q,
@@ -455,6 +475,7 @@ mod tests {
             past,
             scale,
             &profile,
+            PulpDispatch::new(),
         );
 
         set_paged_context(Some(PagedKvContext {
@@ -482,6 +503,7 @@ mod tests {
             scale,
             0,
             &profile,
+            PulpDispatch::new(),
         );
         set_paged_context(None);
 
@@ -500,8 +522,7 @@ mod tests {
         for i in 0..a.len() {
             expected += a[i] * b[i].to_f32();
         }
-        let profile = CpuHardwareProfile::detect();
-        let got = simd_f32::dot_f32_f16(&a, &b, &profile);
+        let got = simd_f32::dot_f32_f16(&a, &b, PulpDispatch::new());
         assert!(
             (got - expected).abs() < 1e-5,
             "got {got} expected {expected}"

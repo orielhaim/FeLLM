@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/*",
   "plugins/example_cpu_op",
+  "plugins/diffusion_gemma",
 ]
 
 # cuda_kernels: build under WSL2 (see scripts/wsl-build-cuda.sh). Excluded so
@@ -38,15 +39,23 @@ memmap2 = "0.9"
 half = { version = "2.7", features = ["bytemuck", "num-traits"] }
 smallvec = { version = "1.15", features = ["const_generics", "union"] }
 rayon = "1.12"
-faer = "0.24"
-pulp = "0.22"
-matrixmultiply = { version = "0.3", features = ["threading"] }
+gemm = { version = "0.19", features = ["rayon"] }
+pulp = { version = "0.22", features = ["x86-v4"] }
+dyn-stack = "0.13"
+aligned-vec = "0.6"
+thread_local = "1.1"
+crossbeam-utils = "0.8"
+multiversion = "0.8"
+zerocopy = { version = "0.8", features = ["derive"] }
+divan = "0.1"
+iai-callgrind = "0.16"
 wide = "1.6"
 petgraph = "0.8"
 abi_stable = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-tracy = "0.11"
 rand = "0.10"
 rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }

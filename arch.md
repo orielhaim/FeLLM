@@ -123,9 +123,9 @@ Architecture plugins declare the ops they need. Operator plugins declare what th
 
 Rust's ABI is unstable across compiler versions. Rust dylibs cross-compiled with a different rustc than the host `fellm` binary will crash. FeLLM solves this with a two-layer approach:
 
-**Layer 1 - `abi_stable` for high-level Rust-to-Rust FFI.** The `fellm-plugin-abi` crate defines all cross-plugin types with `#[sabi_trait]` and `#[repr(C)]` via `abi_stable`. This includes the plugin's registration trait, the operator descriptor structs, tensor handles, and error types. `abi_stable` does load-time type-layout checking, so an ABI-incompatible plugin fails cleanly at load rather than segfaulting mid-inference.
+**Layer 1 - stable Rust-side provider traits.** The `fellm-plugin-abi` crate defines the statically linked architecture contract (`ArchitectureProvider`) and the generation-driver protocol (`GenerationDriver`). Dynamic plugins use the exact current C registration record below; there is no version negotiation or compatibility shim.
 
-**Layer 2 - a hard C ABI for kernel launch.** For the actual per-op hot path (launching a kernel, reading a tensor), the boundary drops to `extern "C"` with `#[repr(C)]` structs of fixed layout: shape as `[i64; 8]` with rank counter, strides likewise, `dtype: u32`, opaque `device_ptr: *mut c_void`, and a `stream_handle: u64`. This is what actually flows through `libloading`-resolved function pointers.
+**Layer 2 - a hard C ABI for registration and kernel launch.** For the actual per-op hot path (launching a kernel, reading a tensor), the boundary drops to `extern "C"` with `#[repr(C)]` structs of fixed layout. The loader requires the exact current `AbiVersion` and `abi_hash`; a plugin built against another patch level is rejected before initialization. Architecture registration is optional for kernel-only plugins, but when present it must provide probe, compile, and generation-driver callbacks as one complete record.
 
 The rationale for splitting the two: `abi_stable` gives us versioned, checked, ergonomic Rust registration APIs; the C-ABI kernel launch path gives us zero-overhead invocation at the frequency-sensitive point.
 

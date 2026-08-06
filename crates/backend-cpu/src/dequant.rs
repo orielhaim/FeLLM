@@ -2,7 +2,7 @@
 //!
 //! Correctness reference: `ggml-quants.c` from ggml-org/ggml.
 //!
-//! We support Q4_0, Q8_0, Q4_K, Q6_K in Phase 1. The rest return an error.
+//! We support the common legacy and K-quant rows used by the bundled models.
 
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
@@ -41,11 +41,41 @@ pub fn dequantize_row(dtype: DType, src: &[u8], dst: &mut [f32], n_elements: usi
             Ok(())
         }
         DType::Q4_0 => dequantize_q4_0(src, dst, n_elements),
+        DType::Q5_0 => dequantize_q5_0(src, dst, n_elements),
         DType::Q8_0 => dequantize_q8_0(src, dst, n_elements),
         DType::Q4K => dequantize_q4_k(src, dst, n_elements),
         DType::Q6K => dequantize_q6_k(src, dst, n_elements),
         other => Err(FellmError::UnsupportedDType(other)),
     }
+}
+
+// --- Q5_0 ---
+// Block layout: fp16 d (2), 4-byte high-bit mask, 16 low-nibble bytes.
+// Formula: w[i] = d * (((high_bit << 4) | low_nibble) - 16).
+fn dequantize_q5_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
+    if !n_elements.is_multiple_of(QK4_0) {
+        return Err(FellmError::other("Q5_0: n_elements not multiple of 32"));
+    }
+    let block_bytes = DType::Q5_0.bytes_per_block();
+    let n_blocks = n_elements / QK4_0;
+    if src.len() < n_blocks * block_bytes {
+        return Err(FellmError::other("Q5_0: src too small"));
+    }
+    for b in 0..n_blocks {
+        let base = b * block_bytes;
+        let d = f16::from_bits(u16::from_le_bytes([src[base], src[base + 1]])).to_f32();
+        let qh = u32::from_le_bytes([src[base + 2], src[base + 3], src[base + 4], src[base + 5]]);
+        let qs = &src[base + 6..base + 22];
+        let out = &mut dst[b * QK4_0..(b + 1) * QK4_0];
+        for i in 0..16 {
+            let byte = qs[i];
+            let hi0 = ((qh >> i) & 1) as i32;
+            let hi1 = ((qh >> (i + 16)) & 1) as i32;
+            out[i] = d * ((((hi0 << 4) | i32::from(byte & 0x0F)) - 16) as f32);
+            out[i + 16] = d * ((((hi1 << 4) | i32::from(byte >> 4)) - 16) as f32);
+        }
+    }
+    Ok(())
 }
 
 // --- Q4_0 ---

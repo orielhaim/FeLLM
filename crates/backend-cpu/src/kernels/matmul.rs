@@ -1,7 +1,12 @@
 use crate::dequant::{QK_K, QK4_0, QK8_0};
-use crate::kernels::vec_dot_q4k::vec_dot_q4_k_q8_k_row;
+use crate::kernels::vec_dot_q4k::{
+    Q4KBlockCache, decode_q4_k_block_cached, dot_q4_k_cached, vec_dot_q4_k_q8_k_row,
+};
+use aligned_vec::AVec;
+use dyn_stack::{PodBuffer, PodStack, StackReq};
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
+use gemm::Parallelism;
 use half::f16;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -15,6 +20,23 @@ pub struct Q8KBlock {
     pub qs: [i8; QK_K],
     /// Group sums: `bsums[g] = Σ qs[16*g .. 16*g+16]`.
     pub bsums: [i16; QK_K / 16],
+}
+
+#[derive(Clone, Copy)]
+struct Q6KBlockCache {
+    weights: [i8; QK_K],
+    scales: [i8; QK_K / 16],
+    d: f32,
+}
+
+impl Default for Q6KBlockCache {
+    fn default() -> Self {
+        Self {
+            weights: [0; QK_K],
+            scales: [0; QK_K / 16],
+            d: 0.0,
+        }
+    }
 }
 
 impl Default for Q8KBlock {
@@ -49,6 +71,25 @@ thread_local! {
     static Q8K_STEP_CACHE: RefCell<Q8KStepCache> = const { RefCell::new(Q8KStepCache::new()) };
     /// Reused Q8_0 activation scratch.
     static Q80_SCRATCH: RefCell<Vec<Q80XBlock>> = const { RefCell::new(Vec::new()) };
+    /// Scratch shared by the tiled batch GEMMs. The cache is per Rayon worker
+    /// because grouped MoE may execute several expert GEMMs concurrently.
+    static BATCH_SCRATCH: RefCell<BatchScratch> = const { RefCell::new(BatchScratch::new()) };
+}
+
+struct BatchScratch {
+    xq: Option<AVec<Q8KBlock>>,
+    tile: Option<PodBuffer>,
+    tile_capacity: usize,
+}
+
+impl BatchScratch {
+    const fn new() -> Self {
+        Self {
+            xq: None,
+            tile: None,
+            tile_capacity: 0,
+        }
+    }
 }
 
 struct Q8KStepCache {
@@ -226,16 +267,41 @@ unsafe fn quantize_row_q8_k_avx2(x: &[f32], out: &mut [Q8KBlock]) {
 
 /// int8·int8 dot with i32 accumulation over `n` elements.
 #[inline]
-fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx2") {
+            if a.len() == 16 {
+                // SAFETY: feature gate above and both slices have 16 bytes.
+                return unsafe { dot_i8_16_avx2(a, b) };
+            }
             // SAFETY: feature gate above.
             return unsafe { dot_i8_avx2(a, b) };
         }
     }
     dot_i8_scalar(a, b)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_16_avx2(a: &[i8], b: &[i8]) -> i32 {
+    unsafe {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+        let av = _mm_loadu_si128(a.as_ptr().cast());
+        let bv = _mm_loadu_si128(b.as_ptr().cast());
+        let a16 = _mm256_cvtepi8_epi16(av);
+        let b16 = _mm256_cvtepi8_epi16(bv);
+        let pairwise = _mm256_madd_epi16(a16, b16);
+        let lo = _mm256_castsi256_si128(pairwise);
+        let hi = _mm256_extracti128_si256(pairwise, 1);
+        let sum = _mm_add_epi32(lo, hi);
+        let sum = _mm_hadd_epi32(sum, sum);
+        _mm_cvtsi128_si32(_mm_hadd_epi32(sum, sum))
+    }
 }
 
 #[inline]
@@ -428,6 +494,12 @@ pub fn matvec_quant(
             }
             matvec_q4_0(w_bytes, x, y, out_dim, in_dim, bytes_per_row);
         }
+        DType::Q5_0 => {
+            if !in_dim.is_multiple_of(QK4_0) {
+                return Err(FellmError::other("Q5_0: in_dim not multiple of 32"));
+            }
+            matvec_q5_0(w_bytes, x, y, out_dim, in_dim, bytes_per_row);
+        }
         DType::Q8_0 => {
             if !in_dim.is_multiple_of(QK8_0) {
                 return Err(FellmError::other("Q8_0: in_dim not multiple of 32"));
@@ -455,6 +527,510 @@ pub fn matvec_quant(
         other => return Err(FellmError::UnsupportedDType(other)),
     }
     Ok(())
+}
+
+/// Row-major F32 matrix times a row-major activation batch.
+///
+/// The output is computed in output tiles, not by launching one matvec for
+/// every activation row.  Each weight row is therefore held while all batch
+/// rows are consumed, which is the cache behavior expected by a canvas GEMM.
+pub fn matmul_f32_batch(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<()> {
+    if w.len() != out_dim * in_dim || x.len() != rows * in_dim || y.len() != rows * out_dim {
+        return Err(FellmError::other("f32 matmul batch: shape mismatch"));
+    }
+    if rows < 8 {
+        for (x_row, y_row) in x.chunks_exact(in_dim).zip(y.chunks_exact_mut(out_dim)) {
+            matvec_f32(w, x_row, y_row, out_dim, in_dim);
+        }
+        return Ok(());
+    }
+    matmul_f32_gemm(w, x, y, rows, out_dim, in_dim, Parallelism::Rayon(0))
+}
+
+/// Serial inner-kernel variant used when an outer scheduler already runs
+/// independent expert groups in parallel. It keeps the same tiled weight
+/// reuse as [`matmul_f32_batch`] without nesting a second Rayon job tree.
+pub fn matmul_f32_batch_serial(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<()> {
+    if w.len() != out_dim * in_dim || x.len() != rows * in_dim || y.len() != rows * out_dim {
+        return Err(FellmError::other("f32 matmul batch: shape mismatch"));
+    }
+    if rows < 8 {
+        for (x_row, y_row) in x.chunks_exact(in_dim).zip(y.chunks_exact_mut(out_dim)) {
+            matvec_f32(w, x_row, y_row, out_dim, in_dim);
+        }
+        return Ok(());
+    }
+    matmul_f32_gemm(w, x, y, rows, out_dim, in_dim, Parallelism::None)
+}
+
+/// F32 GEMM using the `gemm` crate's packed microkernels. The weight matrix
+/// is exposed as a strided transpose, so no explicit `[in, out]` transpose is
+/// created. The library owns its bounded packing workspace through dyn-stack.
+fn matmul_f32_gemm(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+    parallelism: Parallelism,
+) -> Result<()> {
+    if w.len() != out_dim * in_dim || x.len() != rows * in_dim || y.len() != rows * out_dim {
+        return Err(FellmError::other("f32 gemm: shape mismatch"));
+    }
+    // C[rows, out] = X[rows, in] * W^T[in, out]. Strides are expressed in
+    // elements: (column stride, row stride).
+    // SAFETY: all slices are contiguous and the supplied strides address only
+    // their respective matrices; beta=0 means C is fully initialized.
+    unsafe {
+        gemm::gemm(
+            rows,
+            out_dim,
+            in_dim,
+            y.as_mut_ptr(),
+            1,
+            out_dim as isize,
+            false,
+            x.as_ptr(),
+            1,
+            in_dim as isize,
+            w.as_ptr(),
+            in_dim as isize,
+            1,
+            1.0f32,
+            0.0f32,
+            false,
+            false,
+            false,
+            parallelism,
+        );
+    }
+    Ok(())
+}
+
+/// Run one quantized matrix against a batch of row-major activations.
+///
+/// The existing scalar path parallelizes over output rows.  That is a poor
+/// fit for DiffusionGemma's 256-row canvas because it serializes the canvas
+/// and repeatedly enters the Rayon scheduler.  This entry point parallelizes
+/// over activation rows, keeping each row's quantized dot path contiguous.
+pub fn matmul_quant_batch(
+    w_bytes: &[u8],
+    w_dtype: DType,
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<()> {
+    if x.len() != rows * in_dim || y.len() != rows * out_dim {
+        return Err(FellmError::other("matmul batch: shape mismatch"));
+    }
+    if rows >= 8 {
+        match w_dtype {
+            DType::Q4K => return matmul_q4_k_batch(w_bytes, x, y, rows, out_dim, in_dim, true),
+            DType::Q6K => return matmul_q6_k_batch(w_bytes, x, y, rows, out_dim, in_dim, true),
+            _ => {}
+        }
+    }
+    if rows < 32 {
+        for (x_row, y_row) in x.chunks_exact(in_dim).zip(y.chunks_exact_mut(out_dim)) {
+            matvec_quant_small_batch(w_bytes, w_dtype, x_row, y_row, out_dim, in_dim)?;
+        }
+        return Ok(());
+    }
+    x.par_chunks_exact(in_dim)
+        .zip(y.par_chunks_exact_mut(out_dim))
+        .try_for_each(|(x_row, y_row)| {
+            matvec_quant(w_bytes, w_dtype, x_row, y_row, out_dim, in_dim)
+        })
+}
+
+/// Quantized batch variant for an outer grouped-MoE scheduler. Q4_K/Q6_K
+/// still use the tiled decode/reuse kernels, but their tiles are processed
+/// serially so Rayon is not nested inside the expert parallel loop.
+pub fn matmul_quant_batch_serial(
+    w_bytes: &[u8],
+    w_dtype: DType,
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<()> {
+    if x.len() != rows * in_dim || y.len() != rows * out_dim {
+        return Err(FellmError::other("matmul batch: shape mismatch"));
+    }
+    if rows >= 8 {
+        match w_dtype {
+            DType::Q4K => return matmul_q4_k_batch(w_bytes, x, y, rows, out_dim, in_dim, false),
+            DType::Q6K => return matmul_q6_k_batch(w_bytes, x, y, rows, out_dim, in_dim, false),
+            _ => {}
+        }
+    }
+    for (x_row, y_row) in x.chunks_exact(in_dim).zip(y.chunks_exact_mut(out_dim)) {
+        matvec_quant_small_batch(w_bytes, w_dtype, x_row, y_row, out_dim, in_dim)?;
+    }
+    Ok(())
+}
+
+/// Q4_K matrix times a batch of activation rows.
+///
+/// GGUF Q4_K weights are decoded once per output row and then reused for all
+/// activation rows in the tile.  The previous implementation called the
+/// scalar Q4_K matvec once per row, repeating nibble unpacking and weight
+/// scale decoding for every canvas position.
+fn matmul_q4_k_batch(
+    w_bytes: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+    parallel: bool,
+) -> Result<()> {
+    let blocks = in_dim / QK_K;
+    let bytes_per_row = DType::Q4K.byte_size(in_dim);
+    if in_dim % QK_K != 0 || w_bytes.len() != out_dim * bytes_per_row {
+        return Err(FellmError::other("Q4_K batch: invalid shape"));
+    }
+
+    const TILE: usize = 128;
+    BATCH_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.xq.is_none() {
+            scratch.xq = Some(AVec::new(64));
+        }
+        {
+            let xq = scratch.xq.as_mut().expect("Q8_K scratch initialized");
+            xq.resize(rows * blocks, Q8KBlock::default());
+            if parallel {
+                x.par_chunks_exact(in_dim)
+                    .zip(xq.par_chunks_exact_mut(blocks))
+                    .for_each(|(x_row, q_row)| quantize_row_q8_k(x_row, q_row));
+            } else {
+                x.chunks_exact(in_dim)
+                    .zip(xq.chunks_exact_mut(blocks))
+                    .for_each(|(x_row, q_row)| quantize_row_q8_k(x_row, q_row));
+            }
+        }
+
+        for tile_start in (0..out_dim).step_by(TILE) {
+            let tile_end = (tile_start + TILE).min(out_dim);
+            let tile_width = tile_end - tile_start;
+            let tile_len = tile_width * rows;
+            if scratch.tile_capacity < tile_len {
+                scratch.tile = Some(PodBuffer::new(StackReq::new::<f32>(tile_len)));
+                scratch.tile_capacity = tile_len;
+            }
+            let BatchScratch { xq, tile, .. } = &mut *scratch;
+            let xq: &[Q8KBlock] = xq.as_ref().expect("Q8_K scratch initialized");
+            let buffer = tile.as_mut().expect("batch tile buffer initialized");
+            let stack = PodStack::new(buffer);
+            let (tile, _) = stack.make_with(tile_len, |_| 0.0f32);
+            if parallel {
+                tile.par_chunks_exact_mut(rows)
+                    .enumerate()
+                    .for_each(|(local_row, out_row)| {
+                        q4_tile_row(
+                            out_row,
+                            local_row,
+                            tile_start,
+                            rows,
+                            blocks,
+                            bytes_per_row,
+                            w_bytes,
+                            xq,
+                        );
+                    });
+            } else {
+                tile.chunks_exact_mut(rows)
+                    .enumerate()
+                    .for_each(|(local_row, out_row)| {
+                        q4_tile_row(
+                            out_row,
+                            local_row,
+                            tile_start,
+                            rows,
+                            blocks,
+                            bytes_per_row,
+                            w_bytes,
+                            xq,
+                        );
+                    });
+            }
+            for token in 0..rows {
+                let dst = &mut y[token * out_dim + tile_start..token * out_dim + tile_end];
+                for local_row in 0..tile_width {
+                    dst[local_row] = tile[local_row * rows + token];
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[inline]
+fn q4_tile_row(
+    out_row: &mut [f32],
+    local_row: usize,
+    tile_start: usize,
+    rows: usize,
+    blocks: usize,
+    bytes_per_row: usize,
+    w_bytes: &[u8],
+    xq: &[Q8KBlock],
+) {
+    let row_index = tile_start + local_row;
+    let weight_row = &w_bytes[row_index * bytes_per_row..(row_index + 1) * bytes_per_row];
+    debug_assert!(blocks <= 32, "Q4_K batch expects at most 32 blocks");
+    let mut decoded = [Q4KBlockCache::default(); 32];
+    for block in 0..blocks {
+        decoded[block] = decode_q4_k_block_cached(
+            &weight_row
+                [block * DType::Q4K.bytes_per_block()..(block + 1) * DType::Q4K.bytes_per_block()],
+        );
+    }
+    for token in 0..rows {
+        let q_row = &xq[token * blocks..(token + 1) * blocks];
+        let mut acc = 0.0f32;
+        for block in 0..blocks {
+            acc += dot_q4_k_cached(&decoded[block], &q_row[block]);
+        }
+        out_row[token] = acc;
+    }
+}
+
+/// Small-group matmul path used by routed experts.  The regular matvec
+/// kernels parallelize over output rows, which is excellent for a large
+/// vocabulary head but causes nested Rayon scheduling when an expert owns
+/// only a handful of canvas rows.  Keep the outer batch parallel and make
+/// each individual row's projection serial.
+fn matvec_quant_small_batch(
+    w_bytes: &[u8],
+    w_dtype: DType,
+    x: &[f32],
+    y: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<()> {
+    match w_dtype {
+        DType::Q4K => {
+            let n = in_dim / QK_K;
+            with_q8k_activations(x, n, |xq| {
+                let bytes_per_row = w_dtype.byte_size(in_dim);
+                for i in 0..out_dim {
+                    let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+                    y[i] = vec_dot_q4_k_q8_k_row(row, xq);
+                }
+            });
+            Ok(())
+        }
+        DType::Q6K => {
+            let n = in_dim / QK_K;
+            with_q8k_activations(x, n, |xq| {
+                let bytes_per_row = w_dtype.byte_size(in_dim);
+                let block_bytes = DType::Q6K.bytes_per_block();
+                for i in 0..out_dim {
+                    let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+                    let mut acc = 0.0f32;
+                    for block in 0..n {
+                        acc += fused_q6_k_block(
+                            &row[block * block_bytes..(block + 1) * block_bytes],
+                            &xq[block],
+                        );
+                    }
+                    y[i] = acc;
+                }
+            });
+            Ok(())
+        }
+        _ => matvec_quant(w_bytes, w_dtype, x, y, out_dim, in_dim),
+    }
+}
+
+/// Q6_K matrix times a canvas batch.
+///
+/// The normal matvec formulation decodes every Q6 weight once per activation
+/// row.  A diffusion canvas has 256 activation rows, so that repeats the same
+/// 6-bit unpacking 256 times.  This tiled formulation decodes one weight row
+/// once, reuses it for every canvas row, and transposes only a small tile back
+/// into the row-major output.  It is intentionally specialized to Q6_K: the
+/// tied DiffusionGemma vocabulary matrix is the dominant CPU kernel.
+fn matmul_q6_k_batch(
+    w_bytes: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+    parallel: bool,
+) -> Result<()> {
+    let blocks = in_dim / QK_K;
+    let bytes_per_row = DType::Q6K.byte_size(in_dim);
+    if in_dim % QK_K != 0 || w_bytes.len() != out_dim * bytes_per_row {
+        return Err(FellmError::other("Q6_K batch: invalid shape"));
+    }
+
+    // Quantize each canvas row once.  The output head then reuses these
+    // activations while traversing each vocabulary row only once.
+    // 256 rows is small enough to keep the transpose tile in cache while
+    // avoiding a second full-vocabulary-sized allocation.
+    const TILE: usize = 256;
+    BATCH_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.xq.is_none() {
+            scratch.xq = Some(AVec::new(64));
+        }
+        {
+            let xq = scratch.xq.as_mut().expect("Q8_K scratch initialized");
+            xq.resize(rows * blocks, Q8KBlock::default());
+            if parallel {
+                x.par_chunks_exact(in_dim)
+                    .zip(xq.par_chunks_exact_mut(blocks))
+                    .for_each(|(x_row, q_row)| quantize_row_q8_k(x_row, q_row));
+            } else {
+                x.chunks_exact(in_dim)
+                    .zip(xq.chunks_exact_mut(blocks))
+                    .for_each(|(x_row, q_row)| quantize_row_q8_k(x_row, q_row));
+            }
+        }
+
+        for tile_start in (0..out_dim).step_by(TILE) {
+            let tile_end = (tile_start + TILE).min(out_dim);
+            let tile_width = tile_end - tile_start;
+            let tile_len = tile_width * rows;
+            if scratch.tile_capacity < tile_len {
+                scratch.tile = Some(PodBuffer::new(StackReq::new::<f32>(tile_len)));
+                scratch.tile_capacity = tile_len;
+            }
+            let BatchScratch { xq, tile, .. } = &mut *scratch;
+            let xq: &[Q8KBlock] = xq.as_ref().expect("Q8_K scratch initialized");
+            let stack = PodStack::new(tile.as_mut().expect("batch tile buffer initialized"));
+            let (tile, _) = stack.make_with(tile_len, |_| 0.0f32);
+            if parallel {
+                tile.par_chunks_exact_mut(rows)
+                    .enumerate()
+                    .for_each(|(local_row, out_row)| {
+                        q6_tile_row(
+                            out_row,
+                            local_row,
+                            tile_start,
+                            rows,
+                            blocks,
+                            bytes_per_row,
+                            w_bytes,
+                            xq,
+                        );
+                    });
+            } else {
+                tile.chunks_exact_mut(rows)
+                    .enumerate()
+                    .for_each(|(local_row, out_row)| {
+                        q6_tile_row(
+                            out_row,
+                            local_row,
+                            tile_start,
+                            rows,
+                            blocks,
+                            bytes_per_row,
+                            w_bytes,
+                            xq,
+                        );
+                    });
+            }
+            for token in 0..rows {
+                let dst = &mut y[token * out_dim + tile_start..token * out_dim + tile_end];
+                for local_row in 0..tile_width {
+                    dst[local_row] = tile[local_row * rows + token];
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[inline]
+fn q6_tile_row(
+    out_row: &mut [f32],
+    local_row: usize,
+    tile_start: usize,
+    rows: usize,
+    blocks: usize,
+    bytes_per_row: usize,
+    w_bytes: &[u8],
+    xq: &[Q8KBlock],
+) {
+    let row_index = tile_start + local_row;
+    let weight_row = &w_bytes[row_index * bytes_per_row..(row_index + 1) * bytes_per_row];
+    let mut decoded = [Q6KBlockCache::default(); 32];
+    for block in 0..blocks {
+        decoded[block] = decode_q6_k_block_cached(
+            &weight_row
+                [block * DType::Q6K.bytes_per_block()..(block + 1) * DType::Q6K.bytes_per_block()],
+        );
+    }
+    for token in 0..rows {
+        let mut acc = 0.0f32;
+        let q_row = &xq[token * blocks..(token + 1) * blocks];
+        for block in 0..blocks {
+            acc += dot_q6_k_cached(&decoded[block], &q_row[block]);
+        }
+        out_row[token] = acc;
+    }
+}
+
+#[inline]
+fn decode_q6_k_block_cached(block: &[u8]) -> Q6KBlockCache {
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let scales: &[i8] = bytemuck::cast_slice(&block[192..208]);
+    let mut out = Q6KBlockCache {
+        scales: scales.try_into().expect("Q6_K has 16 scales"),
+        d: f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32(),
+        ..Default::default()
+    };
+    for half in 0..2 {
+        let ql = &ql_all[half * 64..half * 64 + 64];
+        let qh = &qh_all[half * 32..half * 32 + 32];
+        for l in 0..32 {
+            out.weights[half * 128 + l] = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i8 - 32;
+            out.weights[half * 128 + l + 32] =
+                ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+            out.weights[half * 128 + l + 64] =
+                ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+            out.weights[half * 128 + l + 96] =
+                ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+        }
+    }
+    out
+}
+
+#[inline]
+fn dot_q6_k_cached(block: &Q6KBlockCache, xb: &Q8KBlock) -> f32 {
+    let mut acc = 0.0f32;
+    for group in 0..QK_K / 16 {
+        let dot = dot_i8(
+            &block.weights[group * 16..group * 16 + 16],
+            &xb.qs[group * 16..group * 16 + 16],
+        );
+        acc += block.d * block.scales[group] as f32 * dot as f32;
+    }
+    acc * xb.d
 }
 
 fn matvec_q4_0(
@@ -495,6 +1071,39 @@ fn matvec_q4_0(
                 j += 8;
             }
             acc += d * sum;
+        }
+        *yi = acc;
+    });
+}
+
+fn matvec_q5_0(
+    w_bytes: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    _out_dim: usize,
+    in_dim: usize,
+    bytes_per_row: usize,
+) {
+    let block_bytes = DType::Q5_0.bytes_per_block();
+    let n_blocks = in_dim / QK4_0;
+    y.par_iter_mut().enumerate().for_each(|(i, yi)| {
+        let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+        let mut acc = 0.0f32;
+        for block in 0..n_blocks {
+            let base = block * block_bytes;
+            let d = f16::from_bits(u16::from_le_bytes([row[base], row[base + 1]])).to_f32();
+            let qh = &row[base + 2..base + 6];
+            let qs = &row[base + 6..base + 22];
+            let xb = &x[block * QK4_0..(block + 1) * QK4_0];
+            for j in 0..QK4_0 {
+                let low = if j < 16 {
+                    qs[j] & 0x0f
+                } else {
+                    qs[j - 16] >> 4
+                };
+                let high = (qh[j / 8] >> (j % 8)) & 1;
+                acc += d * ((i32::from(low | (high << 4)) - 16) as f32) * xb[j];
+            }
         }
         *yi = acc;
     });
@@ -933,5 +1542,40 @@ mod tests {
         };
         let x = fill_rng(6, in_dim);
         check_fused(DType::Q6K, &w, &x, out_dim, in_dim);
+    }
+
+    #[test]
+    fn batched_cached_kernels_match_scalar_rows() {
+        let rows = 8;
+        let out_dim = 9;
+        let in_dim = 512;
+        let x = fill_rng(7, rows * in_dim);
+        for dtype in [DType::Q4K, DType::Q6K] {
+            let mut weights = Vec::new();
+            for row in 0..out_dim {
+                let row_bytes = if dtype == DType::Q4K {
+                    make_q4_k_row(in_dim / QK_K)
+                } else {
+                    make_q6_k_row(in_dim / QK_K)
+                };
+                weights.extend(row_bytes.into_iter().map(|v| v.wrapping_add(row as u8)));
+            }
+            let mut batch = vec![0.0f32; rows * out_dim];
+            matmul_quant_batch(&weights, dtype, &x, &mut batch, rows, out_dim, in_dim).unwrap();
+            for r in 0..rows {
+                let mut scalar = vec![0.0f32; out_dim];
+                matvec_quant(
+                    &weights,
+                    dtype,
+                    &x[r * in_dim..(r + 1) * in_dim],
+                    &mut scalar,
+                    out_dim,
+                    in_dim,
+                )
+                .unwrap();
+                let err = max_abs_diff(&batch[r * out_dim..(r + 1) * out_dim], &scalar);
+                assert!(err < 0.05, "dtype={dtype:?} row={r} err={err}");
+            }
+        }
     }
 }

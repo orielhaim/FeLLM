@@ -1,414 +1,260 @@
-#![allow(unsafe_op_in_unsafe_fn)]
+//! Generic floating-point primitives dispatched once through `pulp`.
+//!
+//! Quantized Q4_K/Q6_K kernels intentionally live outside this module: their
+//! nibble unpacking and integer dot products are format-specific.  Everything
+//! here is ordinary f32/f16 elementwise or reduction work and benefits from
+//! one runtime-selected `pulp::Arch`.
 
-use crate::cpu_profile::CpuHardwareProfile;
 use half::f16;
-use wide::f32x8;
+use pulp::{Arch, Simd, WithSimd};
 
-/// Prefer 16-wide AVX-512 loops when the runtime profile says so.
-#[inline]
-pub fn use_avx512(profile: &CpuHardwareProfile) -> bool {
-    profile.has_avx512 && profile.simd_f32_lanes >= 16
+/// Runtime-selected CPU SIMD implementation.
+///
+/// `Arch::new()` is called by `CpuBackend::new()` exactly once. The value is
+/// `Copy`, so passing it through hot kernels does not repeat CPUID detection.
+#[derive(Clone, Copy, Debug)]
+pub struct PulpDispatch {
+    arch: Arch,
 }
 
-/// Contiguous f32 · f32 dot product.
+impl PulpDispatch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { arch: Arch::new() }
+    }
+
+    #[inline(always)]
+    fn dispatch<Op: WithSimd>(&self, op: Op) -> Op::Output {
+        self.arch.dispatch(op)
+    }
+}
+
+impl Default for PulpDispatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct DotF32<'a> {
+    a: &'a [f32],
+    b: &'a [f32],
+}
+
+impl WithSimd for DotF32<'_> {
+    type Output = f32;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let (a_head, a_tail) = S::as_simd_f32s(self.a);
+        let (b_head, b_tail) = S::as_simd_f32s(self.b);
+        let mut acc = simd.splat_f32s(0.0);
+        for (&a, &b) in a_head.iter().zip(b_head) {
+            // Keep the old non-fused accumulation order for transformer
+            // logits. FMA is faster, but changing the rounding here can move
+            // a greedy token across a tie; pulp still supplies the runtime
+            // SIMD implementation and vector loads/reductions.
+            acc = simd.add_f32s(simd.mul_f32s(a, b), acc);
+        }
+        simd.reduce_sum_f32s(acc) + a_tail.iter().zip(b_tail).map(|(&a, &b)| a * b).sum::<f32>()
+    }
+}
+
+struct DotF32F16<'a> {
+    a: &'a [f32],
+    b: &'a [f16],
+}
+
+impl WithSimd for DotF32F16<'_> {
+    type Output = f32;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let lanes = S::F32_LANES;
+        let (a_head, a_tail) = S::as_simd_f32s(self.a);
+        let mut acc = simd.splat_f32s(0.0);
+        let mut b_offset = 0;
+        for &a in a_head {
+            let b_chunk = &self.b[b_offset..b_offset + lanes];
+            // pulp's largest f32 register is 512-bit (16 lanes); keeping this
+            // conversion scratch at the actual upper bound avoids clearing a
+            // larger temporary for every f16 attention dot.
+            let mut converted = [0.0f32; 16];
+            for (dst, src) in converted[..lanes].iter_mut().zip(b_chunk) {
+                *dst = src.to_f32();
+            }
+            let b = simd.partial_load_f32s(&converted[..lanes]);
+            acc = simd.add_f32s(simd.mul_f32s(a, b), acc);
+            b_offset += lanes;
+        }
+        simd.reduce_sum_f32s(acc)
+            + a_tail
+                .iter()
+                .zip(&self.b[b_offset..])
+                .map(|(&a, b)| a * b.to_f32())
+                .sum::<f32>()
+    }
+}
+
+struct AxpyF32<'a> {
+    out: &'a mut [f32],
+    v: &'a [f32],
+    scale: f32,
+}
+
+impl WithSimd for AxpyF32<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let n = self.out.len().min(self.v.len());
+        let (out_head, out_tail) = S::as_mut_simd_f32s(&mut self.out[..n]);
+        let (v_head, v_tail) = S::as_simd_f32s(&self.v[..n]);
+        let scale = simd.splat_f32s(self.scale);
+        for (out, &v) in out_head.iter_mut().zip(v_head) {
+            *out = simd.add_f32s(simd.mul_f32s(v, scale), *out);
+        }
+        for (out, &v) in out_tail.iter_mut().zip(v_tail) {
+            *out += self.scale * v;
+        }
+    }
+}
+
+struct AxpyF32F16<'a> {
+    out: &'a mut [f32],
+    v: &'a [f16],
+    scale: f32,
+}
+
+impl WithSimd for AxpyF32F16<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let n = self.out.len().min(self.v.len());
+        let lanes = S::F32_LANES;
+        let (out_head, out_tail) = S::as_mut_simd_f32s(&mut self.out[..n]);
+        let mut offset = 0;
+        let scale = simd.splat_f32s(self.scale);
+        for out in out_head {
+            let chunk = &self.v[offset..offset + lanes];
+            let mut converted = [0.0f32; 16];
+            for (dst, src) in converted[..lanes].iter_mut().zip(chunk) {
+                *dst = src.to_f32();
+            }
+            let v = simd.partial_load_f32s(&converted[..lanes]);
+            *out = simd.add_f32s(simd.mul_f32s(v, scale), *out);
+            offset += lanes;
+        }
+        for (out, v) in out_tail.iter_mut().zip(&self.v[offset..n]) {
+            *out += self.scale * v.to_f32();
+        }
+    }
+}
+
+struct ScaleF32<'a> {
+    out: &'a mut [f32],
+    scale: f32,
+}
+
+impl WithSimd for ScaleF32<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let (head, tail) = S::as_mut_simd_f32s(self.out);
+        let scale = simd.splat_f32s(self.scale);
+        for value in head {
+            *value = simd.mul_f32s(*value, scale);
+        }
+        for value in tail {
+            *value *= self.scale;
+        }
+    }
+}
+
+struct AddF32<'a> {
+    a: &'a [f32],
+    b: &'a [f32],
+    y: &'a mut [f32],
+}
+
+impl WithSimd for AddF32<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let n = self.y.len().min(self.a.len()).min(self.b.len());
+        let (a, a_tail) = S::as_simd_f32s(&self.a[..n]);
+        let (b, b_tail) = S::as_simd_f32s(&self.b[..n]);
+        let (y, y_tail) = S::as_mut_simd_f32s(&mut self.y[..n]);
+        for ((y, &a), &b) in y.iter_mut().zip(a).zip(b) {
+            *y = simd.add_f32s(a, b);
+        }
+        for ((y, &a), &b) in y_tail.iter_mut().zip(a_tail).zip(b_tail) {
+            *y = a + b;
+        }
+    }
+}
+
+struct MulF32<'a> {
+    a: &'a [f32],
+    b: &'a [f32],
+    y: &'a mut [f32],
+}
+
+impl WithSimd for MulF32<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let n = self.y.len().min(self.a.len()).min(self.b.len());
+        let (a, a_tail) = S::as_simd_f32s(&self.a[..n]);
+        let (b, b_tail) = S::as_simd_f32s(&self.b[..n]);
+        let (y, y_tail) = S::as_mut_simd_f32s(&mut self.y[..n]);
+        for ((y, &a), &b) in y.iter_mut().zip(a).zip(b) {
+            *y = simd.mul_f32s(a, b);
+        }
+        for ((y, &a), &b) in y_tail.iter_mut().zip(a_tail).zip(b_tail) {
+            *y = a * b;
+        }
+    }
+}
+
 #[inline]
-pub fn dot_f32(a: &[f32], b: &[f32], profile: &CpuHardwareProfile) -> f32 {
+pub fn dot_f32(a: &[f32], b: &[f32], dispatch: PulpDispatch) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        return unsafe { dot_f32_avx512(a, b) };
-    }
-    let _ = profile;
-    dot_f32_x8(a, b)
+    dispatch.dispatch(DotF32 { a, b })
 }
 
-/// Contiguous f32 · f16 dot (dequant in-register).
 #[inline]
-pub fn dot_f32_f16(a: &[f32], b: &[f16], profile: &CpuHardwareProfile) -> f32 {
+pub fn dot_f32_f16(a: &[f32], b: &[f16], dispatch: PulpDispatch) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        return unsafe { dot_f32_f16_avx512(a, b) };
-    }
-    let _ = profile;
-    dot_f32_f16_x8(a, b)
-}
-
-/// `out[i] += scale * v[i]` with SIMD FMA-style accumulation.
-#[inline]
-pub fn axpy_f32(out: &mut [f32], v: &[f32], scale: f32, profile: &CpuHardwareProfile) {
-    debug_assert_eq!(out.len(), v.len());
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        unsafe {
-            axpy_f32_avx512(out, v, scale);
-        }
-        return;
-    }
-    let _ = profile;
-    axpy_f32_x8(out, v, scale);
-}
-
-/// `out[i] += scale * v[i].to_f32()` for f16 V rows.
-#[inline]
-pub fn axpy_f32_f16(out: &mut [f32], v: &[f16], scale: f32, profile: &CpuHardwareProfile) {
-    debug_assert_eq!(out.len(), v.len());
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        unsafe {
-            axpy_f32_f16_avx512(out, v, scale);
-        }
-        return;
-    }
-    let _ = profile;
-    axpy_f32_f16_x8(out, v, scale);
-}
-
-/// `out[i] *= scale` (online-softmax rescale).
-#[inline]
-pub fn scale_f32(out: &mut [f32], scale: f32, profile: &CpuHardwareProfile) {
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        unsafe {
-            scale_f32_avx512(out, scale);
-        }
-        return;
-    }
-    let _ = profile;
-    scale_f32_x8(out, scale);
-}
-
-/// Elementwise `y[i] = a[i] + b[i]`.
-#[inline]
-pub fn add_f32(a: &[f32], b: &[f32], y: &mut [f32], profile: &CpuHardwareProfile) {
-    let n = y.len().min(a.len()).min(b.len());
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        unsafe {
-            add_f32_avx512(&a[..n], &b[..n], &mut y[..n]);
-        }
-        return;
-    }
-    let _ = profile;
-    add_f32_x8(&a[..n], &b[..n], &mut y[..n]);
-}
-
-/// Elementwise `y[i] = a[i] * b[i]`.
-#[inline]
-pub fn mul_f32(a: &[f32], b: &[f32], y: &mut [f32], profile: &CpuHardwareProfile) {
-    let n = y.len().min(a.len()).min(b.len());
-    #[cfg(target_arch = "x86_64")]
-    if use_avx512(profile) {
-        // SAFETY: gated on runtime CPUID via profile.
-        unsafe {
-            mul_f32_avx512(&a[..n], &b[..n], &mut y[..n]);
-        }
-        return;
-    }
-    let _ = profile;
-    mul_f32_x8(&a[..n], &b[..n], &mut y[..n]);
+    dispatch.dispatch(DotF32F16 { a, b })
 }
 
 #[inline]
-fn dot_f32_x8(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len();
-    let mut acc = f32x8::ZERO;
-    let mut i = 0;
-    while i + 8 <= n {
-        let av = f32x8::from(*<&[f32; 8]>::try_from(&a[i..i + 8]).unwrap());
-        let bv = f32x8::from(*<&[f32; 8]>::try_from(&b[i..i + 8]).unwrap());
-        acc += av * bv;
-        i += 8;
-    }
-    let mut s = acc.reduce_add();
-    while i < n {
-        s += a[i] * b[i];
-        i += 1;
-    }
-    s
+pub fn axpy_f32(out: &mut [f32], v: &[f32], scale: f32, dispatch: PulpDispatch) {
+    dispatch.dispatch(AxpyF32 { out, v, scale });
 }
 
 #[inline]
-fn dot_f32_f16_x8(a: &[f32], b: &[f16]) -> f32 {
-    let n = a.len();
-    let mut acc = f32x8::ZERO;
-    let mut i = 0;
-    while i + 8 <= n {
-        let av = f32x8::from(*<&[f32; 8]>::try_from(&a[i..i + 8]).unwrap());
-        let bv = f32x8::new([
-            b[i].to_f32(),
-            b[i + 1].to_f32(),
-            b[i + 2].to_f32(),
-            b[i + 3].to_f32(),
-            b[i + 4].to_f32(),
-            b[i + 5].to_f32(),
-            b[i + 6].to_f32(),
-            b[i + 7].to_f32(),
-        ]);
-        acc += av * bv;
-        i += 8;
-    }
-    let mut s = acc.reduce_add();
-    while i < n {
-        s += a[i] * b[i].to_f32();
-        i += 1;
-    }
-    s
+pub fn axpy_f32_f16(out: &mut [f32], v: &[f16], scale: f32, dispatch: PulpDispatch) {
+    dispatch.dispatch(AxpyF32F16 { out, v, scale });
 }
 
 #[inline]
-fn axpy_f32_x8(out: &mut [f32], v: &[f32], scale: f32) {
-    let n = out.len();
-    let sv = f32x8::splat(scale);
-    let mut i = 0;
-    while i + 8 <= n {
-        let ov = f32x8::from(*<&[f32; 8]>::try_from(&out[i..i + 8]).unwrap());
-        let vv = f32x8::from(*<&[f32; 8]>::try_from(&v[i..i + 8]).unwrap());
-        let r = ov + vv * sv;
-        let arr: [f32; 8] = r.into();
-        out[i..i + 8].copy_from_slice(&arr);
-        i += 8;
-    }
-    while i < n {
-        out[i] += scale * v[i];
-        i += 1;
-    }
+pub fn scale_f32(out: &mut [f32], scale: f32, dispatch: PulpDispatch) {
+    dispatch.dispatch(ScaleF32 { out, scale });
 }
 
 #[inline]
-fn axpy_f32_f16_x8(out: &mut [f32], v: &[f16], scale: f32) {
-    let n = out.len();
-    let sv = f32x8::splat(scale);
-    let mut i = 0;
-    while i + 8 <= n {
-        let ov = f32x8::from(*<&[f32; 8]>::try_from(&out[i..i + 8]).unwrap());
-        let vv = f32x8::new([
-            v[i].to_f32(),
-            v[i + 1].to_f32(),
-            v[i + 2].to_f32(),
-            v[i + 3].to_f32(),
-            v[i + 4].to_f32(),
-            v[i + 5].to_f32(),
-            v[i + 6].to_f32(),
-            v[i + 7].to_f32(),
-        ]);
-        let r = ov + vv * sv;
-        let arr: [f32; 8] = r.into();
-        out[i..i + 8].copy_from_slice(&arr);
-        i += 8;
-    }
-    while i < n {
-        out[i] += scale * v[i].to_f32();
-        i += 1;
-    }
+pub fn add_f32(a: &[f32], b: &[f32], y: &mut [f32], dispatch: PulpDispatch) {
+    dispatch.dispatch(AddF32 { a, b, y });
 }
 
 #[inline]
-fn scale_f32_x8(out: &mut [f32], scale: f32) {
-    let n = out.len();
-    let sv = f32x8::splat(scale);
-    let mut i = 0;
-    while i + 8 <= n {
-        let ov = f32x8::from(*<&[f32; 8]>::try_from(&out[i..i + 8]).unwrap());
-        let r = ov * sv;
-        let arr: [f32; 8] = r.into();
-        out[i..i + 8].copy_from_slice(&arr);
-        i += 8;
-    }
-    while i < n {
-        out[i] *= scale;
-        i += 1;
-    }
-}
-
-#[inline]
-fn add_f32_x8(a: &[f32], b: &[f32], y: &mut [f32]) {
-    let n = y.len();
-    let mut i = 0;
-    while i + 8 <= n {
-        let av = f32x8::from(*<&[f32; 8]>::try_from(&a[i..i + 8]).unwrap());
-        let bv = f32x8::from(*<&[f32; 8]>::try_from(&b[i..i + 8]).unwrap());
-        let r = av + bv;
-        let arr: [f32; 8] = r.into();
-        y[i..i + 8].copy_from_slice(&arr);
-        i += 8;
-    }
-    while i < n {
-        y[i] = a[i] + b[i];
-        i += 1;
-    }
-}
-
-#[inline]
-fn mul_f32_x8(a: &[f32], b: &[f32], y: &mut [f32]) {
-    let n = y.len();
-    let mut i = 0;
-    while i + 8 <= n {
-        let av = f32x8::from(*<&[f32; 8]>::try_from(&a[i..i + 8]).unwrap());
-        let bv = f32x8::from(*<&[f32; 8]>::try_from(&b[i..i + 8]).unwrap());
-        let r = av * bv;
-        let arr: [f32; 8] = r.into();
-        y[i..i + 8].copy_from_slice(&arr);
-        i += 8;
-    }
-    while i < n {
-        y[i] = a[i] * b[i];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use core::arch::x86_64::*;
-    let n = a.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0;
-    while i + 16 <= n {
-        let av = _mm512_loadu_ps(a.as_ptr().add(i));
-        let bv = _mm512_loadu_ps(b.as_ptr().add(i));
-        acc = _mm512_fmadd_ps(av, bv, acc);
-        i += 16;
-    }
-    let mut s = _mm512_reduce_add_ps(acc);
-    while i < n {
-        s += a[i] * b[i];
-        i += 1;
-    }
-    s
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dot_f32_f16_avx512(a: &[f32], b: &[f16]) -> f32 {
-    // Convert f16 → f32 scalar then load; avoids requiring AVX-512-FP16.
-    use core::arch::x86_64::*;
-    let n = a.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0;
-    let mut tmp = [0.0f32; 16];
-    while i + 16 <= n {
-        for lane in 0..16 {
-            tmp[lane] = b[i + lane].to_f32();
-        }
-        let av = _mm512_loadu_ps(a.as_ptr().add(i));
-        let bv = _mm512_loadu_ps(tmp.as_ptr());
-        acc = _mm512_fmadd_ps(av, bv, acc);
-        i += 16;
-    }
-    let mut s = _mm512_reduce_add_ps(acc);
-    while i < n {
-        s += a[i] * b[i].to_f32();
-        i += 1;
-    }
-    s
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn axpy_f32_avx512(out: &mut [f32], v: &[f32], scale: f32) {
-    use core::arch::x86_64::*;
-    let n = out.len();
-    let sv = _mm512_set1_ps(scale);
-    let mut i = 0;
-    while i + 16 <= n {
-        let ov = _mm512_loadu_ps(out.as_ptr().add(i));
-        let vv = _mm512_loadu_ps(v.as_ptr().add(i));
-        let r = _mm512_fmadd_ps(vv, sv, ov);
-        _mm512_storeu_ps(out.as_mut_ptr().add(i), r);
-        i += 16;
-    }
-    while i < n {
-        out[i] += scale * v[i];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn axpy_f32_f16_avx512(out: &mut [f32], v: &[f16], scale: f32) {
-    use core::arch::x86_64::*;
-    let n = out.len();
-    let sv = _mm512_set1_ps(scale);
-    let mut i = 0;
-    let mut tmp = [0.0f32; 16];
-    while i + 16 <= n {
-        for lane in 0..16 {
-            tmp[lane] = v[i + lane].to_f32();
-        }
-        let ov = _mm512_loadu_ps(out.as_ptr().add(i));
-        let vv = _mm512_loadu_ps(tmp.as_ptr());
-        let r = _mm512_fmadd_ps(vv, sv, ov);
-        _mm512_storeu_ps(out.as_mut_ptr().add(i), r);
-        i += 16;
-    }
-    while i < n {
-        out[i] += scale * v[i].to_f32();
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn scale_f32_avx512(out: &mut [f32], scale: f32) {
-    use core::arch::x86_64::*;
-    let n = out.len();
-    let sv = _mm512_set1_ps(scale);
-    let mut i = 0;
-    while i + 16 <= n {
-        let ov = _mm512_loadu_ps(out.as_ptr().add(i));
-        let r = _mm512_mul_ps(ov, sv);
-        _mm512_storeu_ps(out.as_mut_ptr().add(i), r);
-        i += 16;
-    }
-    while i < n {
-        out[i] *= scale;
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn add_f32_avx512(a: &[f32], b: &[f32], y: &mut [f32]) {
-    use core::arch::x86_64::*;
-    let n = y.len();
-    let mut i = 0;
-    while i + 16 <= n {
-        let av = _mm512_loadu_ps(a.as_ptr().add(i));
-        let bv = _mm512_loadu_ps(b.as_ptr().add(i));
-        let r = _mm512_add_ps(av, bv);
-        _mm512_storeu_ps(y.as_mut_ptr().add(i), r);
-        i += 16;
-    }
-    while i < n {
-        y[i] = a[i] + b[i];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn mul_f32_avx512(a: &[f32], b: &[f32], y: &mut [f32]) {
-    use core::arch::x86_64::*;
-    let n = y.len();
-    let mut i = 0;
-    while i + 16 <= n {
-        let av = _mm512_loadu_ps(a.as_ptr().add(i));
-        let bv = _mm512_loadu_ps(b.as_ptr().add(i));
-        let r = _mm512_mul_ps(av, bv);
-        _mm512_storeu_ps(y.as_mut_ptr().add(i), r);
-        i += 16;
-    }
-    while i < n {
-        y[i] = a[i] * b[i];
-        i += 1;
-    }
+pub fn mul_f32(a: &[f32], b: &[f32], y: &mut [f32], dispatch: PulpDispatch) {
+    dispatch.dispatch(MulF32 { a, b, y });
 }
 
 #[cfg(test)]
@@ -418,31 +264,22 @@ mod tests {
     #[test]
     fn dot_matches_scalar() {
         let a: Vec<f32> = (0..33).map(|i| i as f32 * 0.1).collect();
-        let b: Vec<f32> = (0..33).map(|i| (i as f32 + 1.0) * 0.05).collect();
-        let mut expected = 0.0f32;
-        for i in 0..a.len() {
-            expected += a[i] * b[i];
-        }
-        let profile = CpuHardwareProfile::detect();
-        let got = dot_f32(&a, &b, &profile);
-        assert!(
-            (got - expected).abs() < 1e-4,
-            "got {got} expected {expected}"
-        );
+        let b: Vec<f32> = (0..33).map(|i| 1.0 - i as f32 * 0.03).collect();
+        let expected: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        let got = dot_f32(&a, &b, PulpDispatch::new());
+        assert!((got - expected).abs() < 1e-4, "{got} vs {expected}");
     }
 
     #[test]
     fn add_mul_match_scalar() {
-        let a: Vec<f32> = (0..19).map(|i| i as f32).collect();
-        let b: Vec<f32> = (0..19).map(|i| (i as f32) * 0.5).collect();
-        let mut y_add = vec![0.0f32; 19];
-        let mut y_mul = vec![0.0f32; 19];
-        let profile = CpuHardwareProfile::detect();
-        add_f32(&a, &b, &mut y_add, &profile);
-        mul_f32(&a, &b, &mut y_mul, &profile);
-        for i in 0..19 {
-            assert!((y_add[i] - (a[i] + b[i])).abs() < 1e-6);
-            assert!((y_mul[i] - (a[i] * b[i])).abs() < 1e-6);
-        }
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let b = vec![5.0f32, 4.0, 3.0, 2.0, 1.0];
+        let dispatch = PulpDispatch::new();
+        let mut y_add = vec![0.0; a.len()];
+        let mut y_mul = vec![0.0; a.len()];
+        add_f32(&a, &b, &mut y_add, dispatch);
+        mul_f32(&a, &b, &mut y_mul, dispatch);
+        assert_eq!(y_add, vec![6.0, 6.0, 6.0, 6.0, 6.0]);
+        assert_eq!(y_mul, vec![5.0, 8.0, 9.0, 8.0, 5.0]);
     }
 }

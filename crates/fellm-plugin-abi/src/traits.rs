@@ -10,6 +10,196 @@ use fellm_core::dtype::DType;
 use fellm_core::error::Result;
 use std::any::Any;
 
+/// Metadata and tensor inventory exposed to an architecture provider.
+#[derive(Debug, Clone, Default)]
+pub struct ModelSource {
+    /// GGUF architecture identifier.
+    pub architecture_id: String,
+    /// Metadata represented as stable string values for the plugin boundary.
+    pub metadata: Vec<(String, String)>,
+    /// Tensor names and layouts represented as stable strings.
+    pub tensors: Vec<(String, String)>,
+}
+
+/// Architecture configuration returned by probing a source.
+#[derive(Debug, Clone)]
+pub struct ArchitectureConfig {
+    /// Architecture identifier.
+    pub architecture_id: String,
+    /// Architecture-owned configuration payload.
+    pub data: String,
+}
+
+/// Backend capabilities visible during graph compilation.
+#[derive(Debug, Clone, Default)]
+pub struct BackendCapabilities {
+    /// Backend id.
+    pub backend_id: String,
+    /// Underlying backend capabilities.
+    pub caps: BackendCaps,
+}
+
+/// Stable graph identifier within a compiled model program.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GraphId(pub u32);
+
+/// A graph descriptor owned by the architecture provider.
+#[derive(Debug, Clone)]
+pub struct GraphSpec {
+    /// Stable graph id.
+    pub id: GraphId,
+    /// Human-readable name.
+    pub name: String,
+}
+
+/// Compiled architecture program.  Concrete graph plans remain runtime-owned;
+/// this descriptor keeps the plugin plane independent from `fellm-graph`.
+#[derive(Debug, Clone, Default)]
+pub struct ModelProgram {
+    /// Architecture id.
+    pub architecture_id: String,
+    /// Graphs required by this program.
+    pub graphs: Vec<GraphSpec>,
+}
+
+/// Generation request passed to a provider.
+#[derive(Debug, Clone)]
+pub struct GenerationRequest {
+    /// Prompt token ids.
+    pub prompt: Vec<u32>,
+    /// Maximum emitted tokens.
+    pub max_tokens: u32,
+    /// Deterministic seed.
+    pub seed: u64,
+}
+
+/// Named input binding requested by a generation driver.
+#[derive(Debug, Clone)]
+pub struct InputBinding {
+    /// Binding name.
+    pub name: String,
+    /// Integer values for token/id bindings.
+    pub values: Vec<u32>,
+    /// F32 values for activation/state bindings.
+    pub float_values: Vec<f32>,
+}
+
+/// State binding requested by a generation driver.
+#[derive(Debug, Clone)]
+pub struct StateBinding {
+    /// Binding name.
+    pub name: String,
+}
+
+/// Graph output delivered to a driver.
+#[derive(Debug, Clone)]
+pub struct GraphOutput {
+    /// Output name.
+    pub name: String,
+    /// Row-major f32 values.
+    pub values: Vec<f32>,
+    /// Number of rows.
+    pub rows: usize,
+    /// Values per row.
+    pub cols: usize,
+}
+
+/// Driver event delivered by the core scheduler.
+#[derive(Debug, Clone)]
+pub enum DriverEvent {
+    /// Start a new request.
+    Started,
+    /// A requested graph completed.
+    GraphCompleted {
+        graph: GraphId,
+        outputs: Vec<GraphOutput>,
+    },
+    /// A cache commit completed.
+    CacheCommitted { token_count: usize },
+    /// The request was cancelled.
+    Cancelled,
+}
+
+/// Bindings for a graph invocation.
+#[derive(Debug, Clone)]
+pub struct InputBindings {
+    /// Input values.
+    pub inputs: Vec<InputBinding>,
+}
+
+/// Runtime state bindings for a graph invocation.
+#[derive(Debug, Clone)]
+pub struct StateBindings {
+    /// State names.
+    pub states: Vec<StateBinding>,
+}
+
+/// A cache transition requested by a driver.
+#[derive(Debug, Clone)]
+pub struct CacheCommit {
+    /// Tokens to append causally.
+    pub token_ids: Vec<u32>,
+}
+
+/// A token batch emitted by a driver.
+#[derive(Debug, Clone)]
+pub struct TokenBatch {
+    /// Emitted token ids.
+    pub token_ids: Vec<u32>,
+    /// Complete finalized block that must be appended to the causal cache
+    /// before the driver starts its next diffusion block.  Keeping this in
+    /// the action makes cache ownership explicit at the host boundary while
+    /// allowing the visible batch to be capped by `max_tokens`.
+    pub commit_token_ids: Vec<u32>,
+}
+
+/// Next action returned by a generation driver.
+#[derive(Debug, Clone)]
+pub enum DriverAction {
+    /// Invoke one precompiled graph.
+    InvokeGraph {
+        graph: GraphId,
+        inputs: InputBindings,
+        state: StateBindings,
+    },
+    /// Commit completed tokens into the persistent causal cache.
+    CommitCache(CacheCommit),
+    /// Emit one or more finalized tokens.
+    Emit(TokenBatch),
+    /// Finish the request.
+    Done,
+}
+
+/// Architecture-specific generation state machine.
+pub trait GenerationDriver: Send {
+    /// Advance the driver after a scheduler event.
+    fn next_action(&mut self, event: DriverEvent) -> Result<DriverAction>;
+}
+
+/// Architecture provider contract.  Providers own probing, graph selection,
+/// architecture state, and generation sequencing; the host still owns
+/// backend kernels, memory, graph execution, and scheduling.
+pub trait ArchitectureProvider: Send + Sync {
+    /// Stable architecture identifier.
+    fn architecture_id(&self) -> &str;
+    /// Validate source metadata/tensors and return architecture config.
+    fn probe(&self, source: &ModelSource) -> Result<ArchitectureConfig>;
+    /// Compile the provider's multi-graph program.
+    fn compile(
+        &self,
+        source: &ModelSource,
+        config: &ArchitectureConfig,
+        backend: &BackendCapabilities,
+    ) -> Result<ModelProgram>;
+    /// Create a generation state machine for a compiled program.
+    fn create_generation_driver(
+        &self,
+        program: &ModelProgram,
+        request: GenerationRequest,
+    ) -> Result<Box<dyn GenerationDriver>>;
+}
+
 /// Opaque handle to a resolved kernel implementation.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -449,4 +449,20 @@ impl MetaMap {
             }),
         }
     }
+
+    /// Fetch a bool array.
+    pub fn get_bool_array(&self, key: &str) -> Result<&[bool]> {
+        match self
+            .inner
+            .get(key)
+            .ok_or_else(|| FellmError::MetadataKeyNotFound(key.into()))?
+        {
+            MetaValue::Array(MetaArray::Bool(v)) => Ok(v.as_slice()),
+            other => Err(FellmError::MetadataTypeMismatch {
+                key: key.into(),
+                expected: "array<bool>",
+                got: other.kind_name(),
+            }),
+        }
+    }
 }

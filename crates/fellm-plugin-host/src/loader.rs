@@ -5,7 +5,7 @@ use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
     HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestFn,
-    PluginRegisterFn, PluginShutdownFn, abi_hash, symbols,
+    PluginRegisterArchitecturesFn, PluginRegisterFn, PluginShutdownFn, abi_hash, symbols,
 };
 use libloading::Library;
 use std::ffi::OsStr;
@@ -34,6 +34,7 @@ impl Drop for LoadedPlugin {
 pub struct PluginHost {
     plugins: Vec<LoadedPlugin>,
     registry: KernelRegistry,
+    architectures: crate::registry::ArchitectureRegistry,
 }
 
 impl PluginHost {
@@ -43,6 +44,7 @@ impl PluginHost {
         Self {
             plugins: Vec::new(),
             registry: KernelRegistry::new(),
+            architectures: crate::registry::ArchitectureRegistry::new(),
         }
     }
 
@@ -55,6 +57,17 @@ impl PluginHost {
     /// Mutable registry.
     pub fn registry_mut(&mut self) -> &mut KernelRegistry {
         &mut self.registry
+    }
+
+    /// Architecture provider registry.
+    #[must_use]
+    pub fn architectures(&self) -> &crate::registry::ArchitectureRegistry {
+        &self.architectures
+    }
+
+    /// Mutable architecture provider registry.
+    pub fn architectures_mut(&mut self) -> &mut crate::registry::ArchitectureRegistry {
+        &mut self.architectures
     }
 
     /// Number of loaded plugin libraries.
@@ -122,10 +135,18 @@ impl PluginHost {
                 .map_err(|e| FellmError::other(format!("missing abi_version: {e}")))?
         };
         let reported = unsafe { abi_version_fn() };
-        if reported.major != ABI_VERSION.major || reported.minor != ABI_VERSION.minor {
+        if reported.major != ABI_VERSION.major
+            || reported.minor != ABI_VERSION.minor
+            || reported.patch != ABI_VERSION.patch
+        {
             return Err(FellmError::other(format!(
-                "plugin ABI {}.{} incompatible with host {}.{}",
-                reported.major, reported.minor, ABI_VERSION.major, ABI_VERSION.minor
+                "plugin ABI {}.{}.{} incompatible with host {}.{}.{}",
+                reported.major,
+                reported.minor,
+                reported.patch,
+                ABI_VERSION.major,
+                ABI_VERSION.minor,
+                ABI_VERSION.patch
             )));
         }
 
@@ -158,6 +179,18 @@ impl PluginHost {
         let rc = unsafe { register_fn(&raw mut vtable) };
         if rc != 0 {
             return Err(FellmError::other(format!("plugin register failed ({rc})")));
+        }
+
+        if let Ok(sym) =
+            unsafe { lib.get::<PluginRegisterArchitecturesFn>(symbols::REGISTER_ARCHITECTURES) }
+        {
+            let mut architecture_vtable = self.architectures.vtable();
+            let rc = unsafe { (*sym)(&raw mut architecture_vtable) };
+            if rc != 0 {
+                return Err(FellmError::other(format!(
+                    "plugin architecture registration failed ({rc})"
+                )));
+            }
         }
 
         let shutdown: Option<PluginShutdownFn> =

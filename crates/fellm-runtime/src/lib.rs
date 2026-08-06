@@ -1,4 +1,6 @@
+pub mod architecture;
 pub mod backend_select;
+pub mod block_diffusion;
 pub mod compiled;
 pub mod engine;
 pub mod executor;

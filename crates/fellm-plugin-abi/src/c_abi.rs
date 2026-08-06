@@ -17,6 +17,9 @@ pub const PLUGIN_MAX_OPS: usize = 32;
 /// Maximum input dtypes recorded per registered op.
 pub const PLUGIN_MAX_INPUT_DTYPES: usize = 8;
 
+/// Maximum length of a registered architecture identifier, including NUL.
+pub const ARCHITECTURE_ID_MAX: usize = PLUGIN_NAME_MAX;
+
 /// Opaque device / context handle (`CUcontext` cast to `u64`, or `0` on CPU).
 pub type DeviceHandle = u64;
 
@@ -112,7 +115,7 @@ impl PluginManifest {
 pub const fn abi_hash() -> u64 {
     // FNV-1a 64-bit over "fellm-abi-{major}.{minor}.{patch}"
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = b"fellm-abi-0.3.0";
+    let bytes = b"fellm-abi-0.4.0";
     let mut i = 0;
     while i < bytes.len() {
         hash ^= bytes[i] as u64;
@@ -161,6 +164,55 @@ pub struct KernelRegistryVtable {
         unsafe extern "C" fn(registry: *mut c_void, reg: *const PluginOpRegistration) -> c_int,
 }
 
+/// Opaque architecture provider callback types.
+///
+/// Architecture callbacks are deliberately strict and opaque at the C
+/// boundary.  The host owns the source/config/program objects and passes
+/// handles to callbacks; a plugin must implement the complete current set or
+/// registration fails.  The Rust-side [`ArchitectureProvider`] trait is the
+/// ergonomic contract for statically linked providers.
+pub type ArchitectureProbeFn =
+    unsafe extern "C" fn(source: *const c_void, config: *mut c_void) -> c_int;
+/// Compile an architecture program.
+pub type ArchitectureCompileFn = unsafe extern "C" fn(
+    source: *const c_void,
+    config: *const c_void,
+    backend: *const c_void,
+    program: *mut c_void,
+) -> c_int;
+/// Create an architecture-owned generation driver.
+pub type ArchitectureCreateDriverFn = unsafe extern "C" fn(
+    program: *const c_void,
+    request: *const c_void,
+    driver: *mut c_void,
+) -> c_int;
+
+/// One architecture provider registration record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ArchitecturePluginRegistration {
+    /// NUL-terminated architecture id.
+    pub architecture_id: [c_char; ARCHITECTURE_ID_MAX],
+    /// Probe callback.
+    pub probe: Option<ArchitectureProbeFn>,
+    /// Compile callback.
+    pub compile: Option<ArchitectureCompileFn>,
+    /// Generation-driver callback.
+    pub create_generation_driver: Option<ArchitectureCreateDriverFn>,
+}
+
+/// Vtable for architecture-provider registration.
+#[repr(C)]
+pub struct ArchitectureRegistryVtable {
+    /// Opaque host registry pointer.
+    pub registry: *mut c_void,
+    /// Register one complete architecture provider.
+    pub register_architecture: unsafe extern "C" fn(
+        registry: *mut c_void,
+        registration: *const ArchitecturePluginRegistration,
+    ) -> c_int,
+}
+
 /// Required plugin entry: report ABI version.
 pub type PluginAbiVersionFn = unsafe extern "C" fn() -> AbiVersion;
 /// Optional plugin entry: static manifest.
@@ -169,6 +221,10 @@ pub type PluginManifestFn = unsafe extern "C" fn() -> PluginManifest;
 pub type PluginInitFn = unsafe extern "C" fn(ctx: *const HostContext) -> c_int;
 /// Required plugin entry: register ops into the host registry.
 pub type PluginRegisterFn = unsafe extern "C" fn(registry: *mut KernelRegistryVtable) -> c_int;
+/// Optional architecture registration entry.  If present, it must register
+/// complete providers using the exact current contract.
+pub type PluginRegisterArchitecturesFn =
+    unsafe extern "C" fn(registry: *mut ArchitectureRegistryVtable) -> c_int;
 /// Required plugin entry: tear down plugin state.
 pub type PluginShutdownFn = unsafe extern "C" fn();
 /// Optional: invalidate a host f32 buffer's device mirror after a CPU write.
@@ -186,6 +242,8 @@ pub mod symbols {
     pub const INIT: &[u8] = b"_fellm_plugin_init\0";
     /// `_fellm_plugin_register`
     pub const REGISTER: &[u8] = b"_fellm_plugin_register\0";
+    /// `_fellm_plugin_register_architectures` (optional for kernel-only plugins)
+    pub const REGISTER_ARCHITECTURES: &[u8] = b"_fellm_plugin_register_architectures\0";
     /// `_fellm_plugin_shutdown`
     pub const SHUTDOWN: &[u8] = b"_fellm_plugin_shutdown\0";
     /// `_fellm_plugin_invalidate_f32` (optional)

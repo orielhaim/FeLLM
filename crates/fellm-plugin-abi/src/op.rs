@@ -2,70 +2,94 @@
 
 use fellm_core::dtype::DType;
 
-/// The set of operations FeLLM knows about.
+/// Stable numeric operation identity.
 ///
-/// The core dispatches by matching `(OpKind, input dtypes)` in the backend's
-/// kernel registry.
-#[repr(u32)]
+/// Built-ins occupy the low range. Plugins use [`Self::custom`] to derive a
+/// namespaced numeric id at graph-build time. The compiled graph and backend
+/// registry carry only this integer, so the execution loop never performs a
+/// string lookup. This is intentionally a transparent value rather than a
+/// closed enum: adding an operation does not require editing the engine.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OpKind {
+pub struct OpKind(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl OpKind {
     /// Element-wise add.
-    Add = 0,
+    pub const Add: Self = Self(0);
     /// Element-wise multiply.
-    Mul = 1,
+    pub const Mul: Self = Self(1);
     /// Matmul: `C = A @ B^T` (weights row-major).
-    MatMul = 2,
+    pub const MatMul: Self = Self(2);
     /// RMSNorm with a learned weight vector.
-    RmsNorm = 3,
+    pub const RmsNorm: Self = Self(3);
     /// Rotary position embedding applied in-place to Q or K.
-    Rope = 4,
+    pub const Rope: Self = Self(4);
     /// SiLU/Swish gate: `out = silu(gate) * up`.
-    SiluGate = 5,
+    pub const SiluGate: Self = Self(5);
     /// Softmax (last dim), numerically stable, with optional causal mask.
-    Softmax = 6,
+    pub const Softmax: Self = Self(6);
     /// Full-attention over cached KV: takes Q, K-cache-view, V-cache-view.
-    Attention = 7,
+    pub const Attention: Self = Self(7);
     /// Embedding lookup: gather rows from an embedding matrix by token id.
-    Embedding = 8,
+    pub const Embedding: Self = Self(8);
     /// Concatenate along the last dim (mostly for KV cache append).
-    Concat = 9,
+    pub const Concat: Self = Self(9);
     /// Reshape (no-op if strides permit).
-    Reshape = 10,
+    pub const Reshape: Self = Self(10);
     /// Convert dtype.
-    Cast = 11,
+    pub const Cast: Self = Self(11);
     /// Sample the next token from a logit vector.
-    Sample = 12,
+    pub const Sample: Self = Self(12);
     /// Write a K/V row into the cache at `position`, in-place on the cache buffer.
-    KvWrite = 13,
+    pub const KvWrite: Self = Self(13);
     /// Short convolution block used by LFM2-style decode.
-    ShortConv = 14,
+    pub const ShortConv: Self = Self(14);
     /// Mixture-of-Experts feed-forward block.
-    MoE = 15,
+    pub const MoE: Self = Self(15);
+    /// Softmax-weighted embedding projection used by diffusion self-conditioning.
+    pub const WeightedEmbedding: Self = Self(16);
+
+    const CUSTOM_TAG: u32 = 0x8000_0000;
+
+    /// Derive a stable namespaced plugin operation id using FNV-1a.
+    #[must_use]
+    pub fn custom(namespace: &str, name: &str) -> Self {
+        let mut hash = 0x811c_9dc5u32;
+        for byte in namespace
+            .as_bytes()
+            .iter()
+            .chain(std::iter::once(&b':'))
+            .chain(name.as_bytes())
+        {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        Self(hash | Self::CUSTOM_TAG)
+    }
+
+    /// Raw C-ABI discriminant / plugin registry key.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this is a plugin-defined operation.
+    #[must_use]
+    pub const fn is_custom(self) -> bool {
+        self.0 & Self::CUSTOM_TAG != 0
+    }
 }
 
 impl OpKind {
     /// Reconstruct from the C-ABI `u32` discriminant.
     #[must_use]
     pub fn from_u32(v: u32) -> Option<Self> {
-        Some(match v {
-            0 => Self::Add,
-            1 => Self::Mul,
-            2 => Self::MatMul,
-            3 => Self::RmsNorm,
-            4 => Self::Rope,
-            5 => Self::SiluGate,
-            6 => Self::Softmax,
-            7 => Self::Attention,
-            8 => Self::Embedding,
-            9 => Self::Concat,
-            10 => Self::Reshape,
-            11 => Self::Cast,
-            12 => Self::Sample,
-            13 => Self::KvWrite,
-            14 => Self::ShortConv,
-            15 => Self::MoE,
-            _ => return None,
-        })
+        if v <= Self::WeightedEmbedding.raw() || v & Self::CUSTOM_TAG != 0 {
+            Some(Self(v))
+        } else {
+            None
+        }
     }
 
     /// A stable string name.
@@ -88,6 +112,9 @@ impl OpKind {
             Self::KvWrite => "kv_write",
             Self::ShortConv => "shortconv",
             Self::MoE => "moe",
+            Self::WeightedEmbedding => "weighted_embedding",
+            _ if self.is_custom() => "custom",
+            _ => "unknown",
         }
     }
 }
@@ -146,6 +173,20 @@ pub struct OpAttrs {
     pub kv_slot: u32,
     /// Attention / KvWrite layer ordinal (paged path).
     pub layer_ord: u32,
+    /// Attention mode: `0` causal one-step, `1` bidirectional canvas.
+    pub attention_mode: u32,
+    /// Sliding-window size (`0` = unrestricted).
+    pub attention_window: u32,
+    /// Query row count for batched attention.
+    pub query_len: u32,
+    /// Explicit KV row count for batched attention.
+    pub kv_len: u32,
+    /// Prefix row count visible to a canvas query.
+    pub prefix_len: u32,
+    /// Final-logit soft cap (`0` = disabled).
+    pub softcap: f32,
+    /// Namespaced custom operation id for extension dispatch.
+    pub custom_op_id: u32,
 }
 
 impl OpAttrs {
@@ -153,5 +194,21 @@ impl OpAttrs {
     #[must_use]
     pub fn cast_dtype(&self) -> Option<DType> {
         DType::from_ggml_code(self.cast_to).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpKind;
+
+    #[test]
+    fn custom_ops_are_namespaced_numeric_ids() {
+        let a = OpKind::custom("example", "fused_bias");
+        let b = OpKind::custom("other", "fused_bias");
+        assert!(a.is_custom());
+        assert_ne!(a, b);
+        assert_eq!(OpKind::from_u32(a.raw()), Some(a));
+        assert_eq!(a.name(), "custom");
+        assert!(OpKind::from_u32(17).is_none());
     }
 }

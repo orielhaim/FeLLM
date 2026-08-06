@@ -81,6 +81,7 @@ struct Sequence {
     gen_start: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
     hit_stop: bool,
+    generated_tokens: Vec<u32>,
 }
 
 /// Round-robin scheduler owning waiting/running queues.
@@ -112,10 +113,12 @@ impl Scheduler {
         params: GenParams,
         stream: bool,
     ) -> Result<SequenceHandle> {
-        let prompt = match engine
-            .tokenizer()
-            .apply_chat_template_with_tools(messages, tools, true)?
-        {
+        let prepared_messages = engine.prepare_chat_messages(messages);
+        let prompt = match engine.tokenizer().apply_chat_template_with_tools(
+            &prepared_messages,
+            tools,
+            true,
+        )? {
             Some(formatted) => formatted,
             None => messages
                 .iter()
@@ -166,6 +169,7 @@ impl Scheduler {
             gen_start: std::time::Instant::now(),
             first_token_at: None,
             hit_stop: false,
+            generated_tokens: Vec::with_capacity(params.max_tokens as usize),
         };
         self.waiting.push_back(seq);
         Ok(SequenceHandle { id })
@@ -307,6 +311,8 @@ impl Scheduler {
                 seq.params.top_k,
                 seq.params.top_p,
                 seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+                seq.params.repetition_penalty,
+                &seq.generated_tokens,
             )
         } else {
             let logits = logits_owned.as_slice::<f32>()?;
@@ -317,8 +323,11 @@ impl Scheduler {
                 seq.params.top_k,
                 seq.params.top_p,
                 seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+                seq.params.repetition_penalty,
+                &seq.generated_tokens,
             )
         };
+        seq.generated_tokens.push(tok);
         seq.emitted += 1;
         if seq.first_token_at.is_none() {
             seq.first_token_at = Some(std::time::Instant::now());

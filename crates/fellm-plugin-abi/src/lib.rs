@@ -5,8 +5,9 @@ pub mod tensor_ref;
 pub mod traits;
 
 pub use c_abi::{
-    DeviceHandle, HostContext, KernelRegistryVtable, PLUGIN_MAX_INPUT_DTYPES, PLUGIN_MAX_OPS,
-    PLUGIN_NAME_MAX, PluginLaunchFn, PluginManifest, PluginOpRegistration, abi_hash,
+    ArchitecturePluginRegistration, ArchitectureRegistryVtable, DeviceHandle, HostContext,
+    KernelRegistryVtable, PLUGIN_MAX_INPUT_DTYPES, PLUGIN_MAX_OPS, PLUGIN_NAME_MAX, PluginLaunchFn,
+    PluginManifest, PluginOpRegistration, abi_hash,
 };
 pub use op::{OpAttrs, OpKind};
 pub use paged_ctx::{
@@ -15,7 +16,12 @@ pub use paged_ctx::{
     with_paged_context_mut,
 };
 pub use tensor_ref::{TensorMut, TensorRef};
-pub use traits::{Architecture, Backend, BackendCaps, KernelHandle};
+pub use traits::{
+    Architecture, ArchitectureConfig, ArchitectureProvider, Backend, BackendCapabilities,
+    BackendCaps, CacheCommit, DriverAction, DriverEvent, GenerationDriver, GenerationRequest,
+    GraphId, GraphOutput, GraphSpec, InputBinding, InputBindings, KernelHandle, ModelProgram,
+    ModelSource, StateBinding, StateBindings, TokenBatch,
+};
 
 /// A stream handle. On CPU this is always 0; on GPU backends this wraps
 /// the vendor stream/queue pointer as a `u64`.
@@ -36,6 +42,6 @@ pub struct AbiVersion {
 /// The ABI version this crate advertises. Bump on breaking changes.
 pub const ABI_VERSION: AbiVersion = AbiVersion {
     major: 0,
-    minor: 3,
+    minor: 4,
     patch: 0,
 };

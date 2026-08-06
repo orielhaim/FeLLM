@@ -1,5 +1,8 @@
 //! The Engine: the top-level user-facing API.
 
+use crate::architecture::{
+    ArchitectureGenerationMode, ArchitecturePluginHandle, ArchitecturePreparation,
+};
 use crate::backend_select::{BackendPreference, BackendSelect};
 use crate::compiled::CompiledStep;
 use crate::executor::MutableBinding;
@@ -18,9 +21,14 @@ use fellm_graph::plan::ExecutionPlan;
 use fellm_model::{
     ModelSpec, StepBindings, build_step_graph, collect_step_bindings, parse_assistant_output,
 };
-use fellm_plugin_abi::{Backend, PagedKvContext, set_paged_context};
+use fellm_plugin_abi::{
+    Backend, DriverAction, DriverEvent, GenerationRequest, GraphId, GraphOutput, PagedKvContext,
+    set_paged_context,
+};
 use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -199,24 +207,27 @@ impl GenStats {
 pub struct GenParams {
     /// Maximum number of tokens to generate.
     pub max_tokens: u32,
-    /// Softmax temperature (0.0 = greedy).
+    /// Softmax temperature. LFM2.5's recommended default is 0.2.
     pub temperature: f32,
-    /// top-k (0 disables).
+    /// top-k. Zero disables the restriction.
     pub top_k: u32,
     /// top-p / nucleus (>= 1.0 disables).
     pub top_p: f32,
     /// RNG seed.
     pub seed: u64,
+    /// Repetition penalty. Values <= 1.0 disable it.
+    pub repetition_penalty: f32,
 }
 
 impl Default for GenParams {
     fn default() -> Self {
         Self {
             max_tokens: 128,
-            temperature: 0.0,
-            top_k: 0,
+            temperature: 0.2,
+            top_k: 80,
             top_p: 1.0,
             seed: 0,
+            repetition_penalty: 1.05,
         }
     }
 }
@@ -225,6 +236,7 @@ impl Default for GenParams {
 pub struct EngineBuilder {
     model_path: Option<String>,
     settings: EngineSettings,
+    architecture: Option<ArchitecturePluginHandle>,
 }
 
 impl EngineBuilder {
@@ -234,6 +246,7 @@ impl EngineBuilder {
         Self {
             model_path: None,
             settings: EngineSettings::default(),
+            architecture: None,
         }
     }
 
@@ -258,12 +271,19 @@ impl EngineBuilder {
         self
     }
 
+    /// Install an architecture plugin for model-family-specific preparation.
+    #[must_use]
+    pub fn architecture(mut self, plugin: ArchitecturePluginHandle) -> Self {
+        self.architecture = Some(plugin);
+        self
+    }
+
     /// Finalize.
     pub fn build(self) -> Result<Engine> {
         let path = self
             .model_path
             .ok_or_else(|| FellmError::other("no model path"))?;
-        Engine::open_with(Path::new(&path), self.settings)
+        Engine::open_with_architecture(Path::new(&path), self.settings, self.architecture)
     }
 }
 
@@ -280,6 +300,8 @@ pub struct Engine {
     tokenizer: Box<dyn Tokenizer>,
     backend: Box<dyn Backend>,
     model: LoadedModel,
+    architecture: Option<ArchitecturePluginHandle>,
+    architecture_program: Option<fellm_plugin_abi::ModelProgram>,
     /// Evaluation / physical batch settings.
     settings: EngineSettings,
 }
@@ -287,6 +309,7 @@ pub struct Engine {
 /// Runtime state + compiled step graph for one GGUF model.
 struct LoadedModel {
     spec: ModelSpec,
+    architecture_mode: ArchitectureGenerationMode,
     /// Shared physical KV pool + prefix/swap.
     cache: CacheManager,
     /// Active single-request sequence (CLI / default path).
@@ -303,6 +326,14 @@ struct LoadedModel {
     bindings: StepBindings,
     /// Compiled step schedule, built once on first step and reused.
     compiled: Option<CompiledStep>,
+    /// Optional full-canvas graph supplied by an architecture plugin.
+    canvas_graph: Option<Graph>,
+    canvas_plan: Option<ExecutionPlan>,
+    canvas_bindings: StepBindings,
+    compiled_canvas: Option<CompiledStep>,
+    /// Reused self-conditioning input storage.  Sparse mode is normally only
+    /// a few hundred KiB; dense mode remains available as an explicit fallback.
+    self_conditioning_buffer: Option<Rc<RefCell<AlignedBuffer>>>,
 }
 
 impl Engine {
@@ -315,6 +346,15 @@ impl Engine {
     }
 
     pub fn open_with(path: &Path, settings: EngineSettings) -> Result<Self> {
+        Self::open_with_architecture(path, settings, None)
+    }
+
+    /// Open with an optional architecture plugin.
+    pub fn open_with_architecture(
+        path: &Path,
+        settings: EngineSettings,
+        architecture: Option<ArchitecturePluginHandle>,
+    ) -> Result<Self> {
         let gguf = Arc::new(GgufFile::open(path)?);
         let tokenizer = load_tokenizer(&gguf)?;
 
@@ -340,9 +380,26 @@ impl Engine {
             "context / batch settings"
         );
 
-        let mut model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx)?;
-
         let backend = settings.backend.resolve()?;
+        let preparation = architecture
+            .as_ref()
+            .map(|plugin| plugin.prepare(&gguf, &spec, backend.as_ref()))
+            .transpose()?
+            .flatten();
+        if spec.is_diffusion && preparation.is_none() {
+            return Err(FellmError::other(
+                "diffusion-gemma requires an architecture plugin; pass the DiffusionGemma plugin to EngineBuilder",
+            ));
+        }
+        if let Some(preparation) = &preparation {
+            tracing::info!(
+                architecture = %preparation.program.architecture_id,
+                graphs = preparation.program.graphs.len(),
+                "architecture plugin program ready"
+            );
+        }
+        let architecture_program = preparation.as_ref().map(|p| p.program.clone());
+        let mut model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx, preparation)?;
 
         // B2: size VRAM KV arena to match the host PhysicalPool.
         #[cfg(feature = "backend-cuda")]
@@ -367,6 +424,8 @@ impl Engine {
             tokenizer,
             backend,
             model,
+            architecture,
+            architecture_program,
             settings: EngineSettings {
                 n_ctx: Some(max_seq),
                 n_ctx_from_model: settings.n_ctx_from_model,
@@ -418,6 +477,25 @@ impl Engine {
         self.tokenizer.as_ref()
     }
 
+    /// Add the model-family system message required by LFM2.5 when callers
+    /// provide a user-only conversation. Other model families are unchanged.
+    #[must_use]
+    pub fn prepare_chat_messages(&self, messages: &[Message]) -> Vec<Message> {
+        if self.model.spec.arch_id == "lfm2moe"
+            && !messages.iter().any(|message| message.role == "system")
+        {
+            let mut prepared = Vec::with_capacity(messages.len() + 1);
+            prepared.push(Message::text(
+                "system",
+                "You are a helpful assistant trained by Liquid AI.",
+            ));
+            prepared.extend_from_slice(messages);
+            prepared
+        } else {
+            messages.to_vec()
+        }
+    }
+
     /// Probed model recipe.
     #[must_use]
     pub fn spec(&self) -> &ModelSpec {
@@ -466,20 +544,22 @@ impl Engine {
         params: GenParams,
     ) -> Result<TokenStream<'_>> {
         self.model.reset();
-        let prompt = match self
-            .tokenizer
-            .apply_chat_template_with_tools(messages, tools, true)?
-        {
-            Some(formatted) => {
-                tracing::debug!(prompt = %formatted, "chat template applied");
-                formatted
-            }
-            None => messages
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        };
+        let prepared_messages = self.prepare_chat_messages(messages);
+        let prompt =
+            match self
+                .tokenizer
+                .apply_chat_template_with_tools(&prepared_messages, tools, true)?
+            {
+                Some(formatted) => {
+                    tracing::debug!(prompt = %formatted, "chat template applied");
+                    formatted
+                }
+                None => prepared_messages
+                    .iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
         let ids = self.tokenizer.encode(&prompt, true)?;
         tracing::info!(n_tokens = ids.len(), "chat prompt tokenized");
         self.generate_from_ids(&ids, params)
@@ -523,6 +603,10 @@ impl Engine {
             )));
         }
 
+        if self.model.architecture_mode == ArchitectureGenerationMode::BlockDiffusion {
+            return self.generate_diffusion_from_ids(ids, params);
+        }
+
         let stop_token_ids = self.stop_token_ids();
         let n_batch = self.settings.n_batch.max(1);
         let n_ubatch = self.settings.resolve_ubatch();
@@ -556,10 +640,169 @@ impl Engine {
             engine: self,
             params,
             pending_logits: Some(last_logits),
+            prefetched: std::collections::VecDeque::new(),
             emitted: 0,
             position: start_pos,
             finished: false,
             stop_token_ids,
+            generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            stats: GenStats {
+                prompt_tokens: ids.len() as u32,
+                predicted_tokens: 0,
+                prompt_ms: duration_ms(prompt_elapsed),
+                time_to_first_token_ms: 0.0,
+                predicted_ms: 0.0,
+                total_ms: 0.0,
+            },
+            gen_start,
+            first_token_at: None,
+            last_token_at: None,
+        })
+    }
+
+    fn generate_diffusion_from_ids(
+        &mut self,
+        ids: &[u32],
+        params: GenParams,
+    ) -> Result<TokenStream<'_>> {
+        let plugin = self
+            .architecture
+            .clone()
+            .ok_or_else(|| FellmError::other("block-diffusion model has no architecture plugin"))?;
+        let program = self.architecture_program.clone().ok_or_else(|| {
+            FellmError::other("architecture plugin did not provide a generation program")
+        })?;
+        let gen_start = Instant::now();
+        let n_batch = self.settings.n_batch.max(1);
+        let n_ubatch = self.settings.resolve_ubatch();
+        let mut pos = 0usize;
+        while pos < ids.len() {
+            let scheduled = (ids.len() - pos).min(n_batch);
+            let mut done = 0usize;
+            while done < scheduled {
+                let chunk = (scheduled - done).min(n_ubatch);
+                for i in 0..chunk {
+                    let abs = pos + done + i;
+                    let _ = self.step(ids[abs], abs, false)?;
+                }
+                done += chunk;
+            }
+            pos += scheduled;
+        }
+        let prompt_elapsed = gen_start.elapsed();
+        let stop_token_ids = self.stop_token_ids();
+        let mut emitted = Vec::new();
+        let mut context_len = ids.len();
+        let request = GenerationRequest {
+            prompt: ids.to_vec(),
+            max_tokens: params.max_tokens,
+            seed: params.seed,
+        };
+        let mut driver = plugin.create_generation_driver(&program, request)?;
+        let mut action = driver.next_action(DriverEvent::Started)?;
+        while !matches!(action, DriverAction::Done) {
+            action = match action {
+                DriverAction::InvokeGraph { graph, .. } if graph == GraphId(0) => {
+                    // The generic engine has already prefetched the prompt
+                    // through its paged causal graph.  Notify the plugin's
+                    // state machine without duplicating that work.
+                    driver.next_action(DriverEvent::GraphCompleted {
+                        graph,
+                        outputs: Vec::new(),
+                    })?
+                }
+                DriverAction::InvokeGraph { graph, inputs, .. } if graph == GraphId(1) => {
+                    let canvas = inputs
+                        .inputs
+                        .iter()
+                        .find(|binding| binding.name == "canvas_tokens")
+                        .ok_or_else(|| {
+                            FellmError::other("diffusion driver omitted canvas_tokens")
+                        })?;
+                    let logits = self.model.canvas_step(
+                        self.backend.as_ref(),
+                        &canvas.values,
+                        &canvas.float_values,
+                        context_len,
+                    )?;
+                    let values = logits.as_slice::<f32>()?.to_vec();
+                    driver.next_action(DriverEvent::GraphCompleted {
+                        graph,
+                        outputs: vec![GraphOutput {
+                            name: "logits".into(),
+                            values,
+                            rows: canvas.values.len(),
+                            cols: self.model.spec.vocab_size,
+                        }],
+                    })?
+                }
+                DriverAction::Emit(batch) => {
+                    let mut hit_stop = false;
+                    for token in batch.token_ids {
+                        if stop_token_ids.contains(&token) {
+                            hit_stop = true;
+                            break;
+                        }
+                        emitted.push(token);
+                    }
+                    if hit_stop || emitted.len() >= params.max_tokens as usize {
+                        break;
+                    }
+                    // The driver supplies the complete finalized canvas in
+                    // the action, while the visible token batch remains
+                    // capped by max_tokens.
+                    for token in batch.commit_token_ids {
+                        self.step(token, context_len, false)?;
+                        context_len += 1;
+                        if context_len >= self.model.max_seq {
+                            break;
+                        }
+                    }
+                    if emitted.len() >= params.max_tokens as usize
+                        || context_len >= self.model.max_seq
+                    {
+                        break;
+                    }
+                    driver.next_action(DriverEvent::CacheCommitted {
+                        token_count: context_len,
+                    })?
+                }
+                DriverAction::InvokeGraph { graph, .. } if graph == GraphId(2) => {
+                    // The host performed the cache append carried by the
+                    // preceding Emit action.  Complete the plugin graph
+                    // transition without a second causal forward pass.
+                    driver.next_action(DriverEvent::GraphCompleted {
+                        graph,
+                        outputs: Vec::new(),
+                    })?
+                }
+                DriverAction::CommitCache(commit) => {
+                    let token_count = commit.token_ids.len();
+                    for token in commit.token_ids {
+                        self.step(token, context_len, false)?;
+                        context_len += 1;
+                    }
+                    driver.next_action(DriverEvent::CacheCommitted { token_count })?
+                }
+                DriverAction::InvokeGraph { graph, .. } => {
+                    return Err(FellmError::other(format!(
+                        "unsupported architecture graph id {}",
+                        graph.0
+                    )));
+                }
+                DriverAction::Done => DriverAction::Done,
+            };
+        }
+        Ok(TokenStream {
+            engine: self,
+            params,
+            pending_logits: None,
+            prefetched: emitted.into_iter().collect(),
+            emitted: 0,
+            position: context_len,
+            finished: false,
+            stop_token_ids,
+            generated_tokens: Vec::with_capacity(params.max_tokens as usize),
             stats: GenStats {
                 prompt_tokens: ids.len() as u32,
                 predicted_tokens: 0,
@@ -728,7 +971,13 @@ impl Engine {
 }
 
 impl LoadedModel {
-    fn new(gguf: &GgufFile, spec: ModelSpec, max_seq: usize, model_max_ctx: usize) -> Result<Self> {
+    fn new(
+        gguf: &GgufFile,
+        spec: ModelSpec,
+        max_seq: usize,
+        model_max_ctx: usize,
+        preparation: Option<ArchitecturePreparation>,
+    ) -> Result<Self> {
         let n_attn = spec.n_attn_layers().max(1);
         let cache = CacheManager::with_capacity(
             max_seq,
@@ -757,6 +1006,38 @@ impl LoadedModel {
         let step_graph = build_step_graph(gguf, &spec)?;
         let step_plan = ExecutionPlan::from_graph(&step_graph)?;
         let bindings = collect_step_bindings(&step_graph);
+        let (architecture_mode, canvas_graph, canvas_plan, canvas_bindings) =
+            if let Some(preparation) = preparation {
+                let ArchitecturePreparation {
+                    generation_mode,
+                    canvas_graph,
+                    ..
+                } = preparation;
+                let Some(graph) = canvas_graph else {
+                    return Err(FellmError::other(
+                        "architecture plugin did not provide its required graph",
+                    ));
+                };
+                let plan = ExecutionPlan::from_graph(&graph)?;
+                let bindings = collect_step_bindings(&graph);
+                (generation_mode, Some(graph), Some(plan), bindings)
+            } else {
+                (
+                    ArchitectureGenerationMode::Autoregressive,
+                    None,
+                    None,
+                    StepBindings::default(),
+                )
+            };
+        let self_conditioning_buffer = if canvas_graph.is_some() {
+            let slots = fellm_model::diffusion_self_conditioning_slots(spec.vocab_size);
+            Some(Rc::new(RefCell::new(AlignedBuffer::new_zeroed(
+                spec.canvas_length.saturating_mul(slots).saturating_mul(4),
+                64,
+            ))))
+        } else {
+            None
+        };
         tracing::info!(
             nodes = step_graph.node_count(),
             rope = bindings.rope.len(),
@@ -770,6 +1051,7 @@ impl LoadedModel {
 
         Ok(Self {
             spec,
+            architecture_mode,
             cache,
             seq,
             dummy_kv,
@@ -780,6 +1062,11 @@ impl LoadedModel {
             step_plan,
             bindings,
             compiled: None,
+            canvas_graph,
+            canvas_plan,
+            canvas_bindings,
+            compiled_canvas: None,
+            self_conditioning_buffer,
         })
     }
 
@@ -827,9 +1114,29 @@ impl LoadedModel {
             }
         }
 
+        if let Some(buffer) = &self.self_conditioning_buffer {
+            let slots = fellm_model::diffusion_self_conditioning_slots(self.spec.vocab_size);
+            mutable_inputs.insert(
+                "self_conditioning_logits".into(),
+                MutableBinding {
+                    dtype: DType::F32,
+                    shape: Shape::new(&[self.spec.canvas_length as u64, slots as u64])?,
+                    buffer: buffer.clone(),
+                },
+            );
+        }
+
         let compiled =
             CompiledStep::compile(&self.step_graph, &self.step_plan, backend, &mutable_inputs)?;
         self.compiled = Some(compiled);
+        if let (Some(graph), Some(plan)) = (&self.canvas_graph, &self.canvas_plan) {
+            self.compiled_canvas = Some(CompiledStep::compile(
+                graph,
+                plan,
+                backend,
+                &mutable_inputs,
+            )?);
+        }
         Ok(())
     }
 
@@ -976,6 +1283,80 @@ impl LoadedModel {
         step.run(backend, compute_logits)
     }
 
+    fn canvas_step(
+        &mut self,
+        backend: &dyn Backend,
+        canvas: &[u32],
+        self_conditioning_logits: &[f32],
+        prompt_len: usize,
+    ) -> Result<Tensor> {
+        self.compile_step(backend)?;
+        let Some(graph) = &self.canvas_graph else {
+            return Err(FellmError::other("canvas graph is not available"));
+        };
+        let n_logical = self.seq.table(0).num_blocks().max(1);
+        let block_table = self.seq.flatten_block_tables();
+        let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
+        set_paged_context(Some(PagedKvContext {
+            arena: arena_ptr,
+            arena_len,
+            block_table: std::sync::Arc::<[u32]>::from(block_table),
+            n_logical_blocks: n_logical,
+            n_layers: self.cache.pool.n_layers(),
+            tokens_stride: self.cache.pool.tokens_stride(),
+            block_bytes: self.cache.pool.block_bytes(),
+            block_size: crate::paged::BLOCK_SIZE,
+            elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
+            device_arena: std::ptr::null_mut(),
+            device_arena_len: 0,
+        }));
+        backend.begin_step();
+        let result = (|| {
+            let slots = fellm_model::diffusion_self_conditioning_slots(self.spec.vocab_size);
+            if self_conditioning_logits.len() != canvas.len().saturating_mul(slots) {
+                return Err(FellmError::other(format!(
+                    "self-conditioning payload shape mismatch: got {} values, expected {}",
+                    self_conditioning_logits.len(),
+                    canvas.len().saturating_mul(slots)
+                )));
+            }
+            if let Some(buffer) = &self.self_conditioning_buffer {
+                let mut buffer = buffer.borrow_mut();
+                buffer
+                    .as_mut_slice()
+                    .copy_from_slice(bytemuck::cast_slice(self_conditioning_logits));
+            }
+            let step = self
+                .compiled_canvas
+                .as_mut()
+                .ok_or_else(|| FellmError::other("canvas graph not compiled"))?;
+            for &id in &self.canvas_bindings.rope {
+                let mut attrs = graph.node(id).attrs;
+                attrs.position = prompt_len as u32;
+                step.set_attrs(id, attrs);
+            }
+            for &id in &self.canvas_bindings.attention {
+                let mut attrs = graph.node(id).attrs;
+                attrs.past_len = prompt_len as u32;
+                attrs.query_len = canvas.len() as u32;
+                attrs.attention_mode = 1;
+                step.set_attrs(id, attrs);
+            }
+            step.bind_input("canvas_tokens", u32_tensor(canvas)?);
+            if self.self_conditioning_buffer.is_none() {
+                step.bind_input(
+                    "self_conditioning_logits",
+                    f32_matrix_tensor(self_conditioning_logits, canvas.len(), slots)?,
+                );
+            }
+            step.run(backend, true)
+        })();
+        let _ = backend.synchronize();
+        backend.end_step();
+        set_paged_context(None);
+        result
+    }
+
     /// Access the shared cache manager (scheduler / multi-seq).
     #[allow(dead_code)]
     fn cache_mut(&mut self) -> &mut CacheManager {
@@ -988,10 +1369,12 @@ pub struct TokenStream<'a> {
     engine: &'a mut Engine,
     params: GenParams,
     pending_logits: Option<Tensor>,
+    prefetched: std::collections::VecDeque<u32>,
     emitted: u32,
     position: usize,
     finished: bool,
     stop_token_ids: Vec<u32>,
+    generated_tokens: Vec<u32>,
     stats: GenStats,
     gen_start: Instant,
     first_token_at: Option<Instant>,
@@ -1043,6 +1426,19 @@ impl Iterator for TokenStream<'_> {
         if self.finished || self.emitted >= self.params.max_tokens {
             return None;
         }
+        if let Some(tok) = self.prefetched.pop_front() {
+            self.emitted += 1;
+            self.stats.predicted_tokens = self.emitted;
+            let now = Instant::now();
+            if self.first_token_at.is_none() {
+                self.first_token_at = Some(now);
+            }
+            self.last_token_at = Some(now);
+            if self.stop_token_ids.contains(&tok) || self.prefetched.is_empty() {
+                self.finished = self.prefetched.is_empty();
+            }
+            return Some(Ok(tok));
+        }
         let logits_tensor = self.pending_logits.take()?;
         let mut logits_owned = logits_tensor;
         let tok = if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
@@ -1052,6 +1448,8 @@ impl Iterator for TokenStream<'_> {
                 self.params.top_k,
                 self.params.top_p,
                 self.params.seed.wrapping_add(u64::from(self.emitted)),
+                self.params.repetition_penalty,
+                &self.generated_tokens,
             )
         } else {
             // Fallback if storage is shared / non-owned (should not happen
@@ -1070,8 +1468,11 @@ impl Iterator for TokenStream<'_> {
                 self.params.top_k,
                 self.params.top_p,
                 self.params.seed.wrapping_add(u64::from(self.emitted)),
+                self.params.repetition_penalty,
+                &self.generated_tokens,
             )
         };
+        self.generated_tokens.push(tok);
         self.emitted += 1;
         self.stats.predicted_tokens = self.emitted;
 
@@ -1115,6 +1516,37 @@ fn scalar_u32_tensor(v: u32) -> Tensor {
     let layout = Layout::contiguous(DType::U32, Shape::new(&[1]).expect("valid"));
     let storage = Arc::new(Storage::Owned(Arc::new(buf)));
     Tensor::from_storage(layout, storage)
+}
+
+fn u32_tensor(values: &[u32]) -> Result<Tensor> {
+    let mut buf = AlignedBuffer::new_zeroed(values.len() * 4, 4);
+    for (index, value) in values.iter().copied().enumerate() {
+        let start = index * 4;
+        buf.as_mut_slice()[start..start + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let layout = Layout::contiguous(
+        DType::U32,
+        Shape::new(&[values.len() as u64]).map_err(FellmError::from)?,
+    );
+    let storage = Arc::new(Storage::Owned(Arc::new(buf)));
+    Ok(Tensor::from_storage(layout, storage))
+}
+
+fn f32_matrix_tensor(values: &[f32], rows: usize, cols: usize) -> Result<Tensor> {
+    if values.len() != rows.saturating_mul(cols) {
+        return Err(FellmError::other("f32 matrix tensor shape mismatch"));
+    }
+    let mut buf = AlignedBuffer::new_zeroed(values.len() * 4, 64);
+    let bytes: &mut [u8] = buf.as_mut_slice();
+    for (index, value) in values.iter().copied().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let layout = Layout::contiguous(
+        DType::F32,
+        Shape::new(&[rows as u64, cols as u64]).map_err(FellmError::from)?,
+    );
+    let storage = Arc::new(Storage::Owned(Arc::new(buf)));
+    Ok(Tensor::from_storage(layout, storage))
 }
 
 #[cfg(test)]

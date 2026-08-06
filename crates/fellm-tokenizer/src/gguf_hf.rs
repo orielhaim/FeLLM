@@ -22,7 +22,7 @@ const LLAMA3_SPLIT_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}
 pub fn build_hf_tokenizer(gguf: &GgufFile) -> Result<HfTokenizer> {
     let model = gguf.metadata.get_string("tokenizer.ggml.model")?;
     match model {
-        "gpt2" | "llama" | "llama3" => {}
+        "gpt2" | "llama" | "llama3" | "gemma4" => {}
         other => return Err(FellmError::UnsupportedTokenizer(other.into())),
     }
 

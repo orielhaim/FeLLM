@@ -52,11 +52,11 @@ struct Args {
     max_tokens: u32,
 
     /// Default sampling temperature.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.2)]
     temperature: f32,
 
     /// Default top-k (0 disables).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 80)]
     top_k: u32,
 
     /// Default top-p (>= 1.0 disables).
@@ -66,6 +66,10 @@ struct Args {
     /// Default RNG seed.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    /// Default repetition penalty (1.0 disables).
+    #[arg(long, default_value_t = 1.05)]
+    repetition_penalty: f32,
 
     /// Log filter (e.g. `info`, `debug`).
     #[arg(long, default_value = "info")]
@@ -114,6 +118,7 @@ async fn main() {
         top_k: args.top_k,
         top_p: args.top_p,
         seed: args.seed,
+        repetition_penalty: args.repetition_penalty,
     };
 
     let (task_tx, task_rx) = mpsc::channel(64);
@@ -159,6 +164,22 @@ async fn main() {
 fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_filter(filter),
+            )
+            .with(tracing_tracy::TracyLayer::default())
+            .init();
+        return;
+    }
+
+    #[cfg(not(feature = "tracy"))]
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

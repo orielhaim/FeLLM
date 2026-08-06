@@ -10,6 +10,7 @@ use fellm_graph::plan::ExecutionPlan;
 use fellm_plugin_abi::op::OpAttrs;
 use fellm_plugin_abi::traits::Backend;
 use fellm_plugin_abi::{TensorMut, TensorRef};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -74,10 +75,16 @@ fn tensor_ref_from(nv: &NodeValue) -> TensorRef {
     match nv {
         NodeValue::Constant(t) | NodeValue::Input(t) => {
             let bytes = t.as_bytes();
-            let dims = t.shape().dims().to_vec();
-            let strides = t.shape().row_major_strides().as_slice().to_vec();
             // SAFETY: bytes.as_ptr() valid for bytes.len() bytes for &t's lifetime.
-            unsafe { TensorRef::from_raw(t.dtype(), &dims, &strides, bytes.as_ptr(), bytes.len()) }
+            unsafe {
+                TensorRef::from_raw(
+                    t.dtype(),
+                    t.shape().dims(),
+                    t.shape().row_major_strides().as_slice(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                )
+            }
         }
         NodeValue::Runtime {
             dtype,
@@ -89,8 +96,6 @@ fn tensor_ref_from(nv: &NodeValue) -> TensorRef {
             shape,
             buffer,
         } => {
-            let dims = shape.dims().to_vec();
-            let strides = shape.row_major_strides().as_slice().to_vec();
             // We take a read-only borrow through Ref -> raw ptr. The pointer is
             // valid as long as the borrow lives; TensorRef by construction is
             // only used within one op-launch scope, so we drop the Ref right
@@ -101,7 +106,15 @@ fn tensor_ref_from(nv: &NodeValue) -> TensorRef {
             drop(borrow);
             // SAFETY: no other &mut exists during this op's kernel launch; the
             // executor never launches two ops in parallel per step.
-            unsafe { TensorRef::from_raw(*dtype, &dims, &strides, ptr, len) }
+            unsafe {
+                TensorRef::from_raw(
+                    *dtype,
+                    shape.dims(),
+                    shape.row_major_strides().as_slice(),
+                    ptr,
+                    len,
+                )
+            }
         }
     }
 }
@@ -122,15 +135,21 @@ fn tensor_mut_from(nv: &NodeValue) -> TensorMut {
             shape,
             buffer,
         } => {
-            let dims = shape.dims().to_vec();
-            let strides = shape.row_major_strides().as_slice().to_vec();
             let mut borrow = buffer.borrow_mut();
             let ptr = borrow.as_mut_slice().as_mut_ptr();
             let len = borrow.len();
             drop(borrow);
             // SAFETY: the executor is single-threaded per step and only holds
             // one mutable output at a time.
-            unsafe { TensorMut::from_raw(*dtype, &dims, &strides, ptr, len) }
+            unsafe {
+                TensorMut::from_raw(
+                    *dtype,
+                    shape.dims(),
+                    shape.row_major_strides().as_slice(),
+                    ptr,
+                    len,
+                )
+            }
         }
         _ => panic!("cannot take mutable view of a non-mutable node value"),
     }
@@ -186,7 +205,19 @@ impl<'a> GraphExecutor<'a> {
 
     /// Execute the plan.
     pub fn run(&self) -> Result<HashMap<String, Tensor>> {
-        let mut values: HashMap<NodeId, NodeValue> = HashMap::with_capacity(self.plan.order.len());
+        // NodeIndex values are stable for the immutable graph.  A flat slot
+        // table avoids rebuilding a hash table and hashing every dependency on
+        // every compatibility-executor run.
+        let value_slots = self
+            .plan
+            .order
+            .iter()
+            .chain(self.graph.outputs().iter())
+            .map(|id| id.index())
+            .max()
+            .map_or(0, |index| index + 1);
+        let mut values: Vec<Option<NodeValue>> =
+            std::iter::repeat_with(|| None).take(value_slots).collect();
 
         for &id in &self.plan.order {
             let node = self.graph.node(id);
@@ -204,52 +235,51 @@ impl<'a> GraphExecutor<'a> {
                                 mb.dtype, dtype
                             )));
                         }
-                        values.insert(
-                            id,
-                            NodeValue::MutableInput {
-                                dtype: mb.dtype,
-                                shape: mb.shape.clone(),
-                                buffer: mb.buffer.clone(),
-                            },
-                        );
+                        values[id.index()] = Some(NodeValue::MutableInput {
+                            dtype: mb.dtype,
+                            shape: mb.shape.clone(),
+                            buffer: mb.buffer.clone(),
+                        });
                     } else {
                         let t = self
                             .inputs
                             .get(name)
                             .ok_or_else(|| FellmError::other(format!("missing input {name}")))?
                             .clone();
-                        values.insert(id, NodeValue::Input(t));
+                        values[id.index()] = Some(NodeValue::Input(t));
                     }
                 }
                 OpValue::Constant(t) => {
-                    values.insert(id, NodeValue::Constant(t.clone()));
+                    values[id.index()] = Some(NodeValue::Constant(t.clone()));
                 }
                 OpValue::Output { .. } => {
                     // Handled below.
                 }
                 OpValue::Runtime { dtype, shape } => {
-                    let inputs = self.graph.inputs_of(id);
+                    let inputs = self.graph.inputs_slice(id);
                     // Determine output buffer: fresh, or aliased to an input.
-                    let (out_buffer, out_shape, out_dtype) =
-                        if let Some(slot) = node.in_place_output_from {
-                            let src_id = inputs.get(slot as usize).copied().ok_or_else(|| {
-                                FellmError::other(format!(
-                                    "in-place op {} at slot {slot}: no such input",
-                                    node.label
-                                ))
-                            })?;
-                            let src = values.get(&src_id).ok_or_else(|| {
-                                FellmError::other("in-place source not yet computed")
-                            })?;
-                            let buf = src.shared_buffer().ok_or_else(|| {
-                                FellmError::other("in-place source is not a runtime/mutable value")
-                            })?;
-                            (buf, src.shape(), src.dtype())
-                        } else {
-                            let bytes = dtype.byte_size(shape.num_elements());
-                            let buf = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes, 64)));
-                            (buf, shape.clone(), *dtype)
-                        };
+                    let (out_buffer, out_shape, out_dtype) = if let Some(slot) =
+                        node.in_place_output_from
+                    {
+                        let src_id = inputs.get(slot as usize).copied().ok_or_else(|| {
+                            FellmError::other(format!(
+                                "in-place op {} at slot {slot}: no such input",
+                                node.label
+                            ))
+                        })?;
+                        let src = values
+                            .get(src_id.index())
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| FellmError::other("in-place source not yet computed"))?;
+                        let buf = src.shared_buffer().ok_or_else(|| {
+                            FellmError::other("in-place source is not a runtime/mutable value")
+                        })?;
+                        (buf, src.shape(), src.dtype())
+                    } else {
+                        let bytes = dtype.byte_size(shape.num_elements());
+                        let buf = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes, 64)));
+                        (buf, shape.clone(), *dtype)
+                    };
 
                     let op = node
                         .op
@@ -262,15 +292,18 @@ impl<'a> GraphExecutor<'a> {
                     } else {
                         inputs.len()
                     };
-                    let mut input_refs: Vec<TensorRef> = Vec::with_capacity(input_ref_count);
+                    let mut input_refs: SmallVec<[TensorRef; 6]> = SmallVec::new();
                     for iid in inputs.iter().take(input_ref_count) {
-                        let nv = values.get(iid).ok_or_else(|| {
-                            FellmError::other("dep not computed (should not happen)")
-                        })?;
+                        let nv = values
+                            .get(iid.index())
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                FellmError::other("dep not computed (should not happen)")
+                            })?;
                         input_refs.push(tensor_ref_from(nv));
                     }
                     let attrs = self.attr_overrides.get(&id).copied().unwrap_or(node.attrs);
-                    let input_dtypes: Vec<DType> = input_refs
+                    let input_dtypes: SmallVec<[DType; 6]> = input_refs
                         .iter()
                         .map(|r| r.dtype().unwrap_or(DType::F32))
                         .collect();
@@ -293,16 +326,19 @@ impl<'a> GraphExecutor<'a> {
                         shape: out_shape,
                         buffer: out_buffer,
                     };
-                    values.insert(id, nv);
-                    let nv_ref = values.get(&id).unwrap();
+                    values[id.index()] = Some(nv);
+                    let nv_ref = values[id.index()].as_ref().unwrap();
                     let out_mut = tensor_mut_from(nv_ref);
                     if op == fellm_plugin_abi::op::OpKind::ShortConv {
                         let state_id = inputs.get(4).copied().ok_or_else(|| {
                             FellmError::other("shortconv runtime node missing state input")
                         })?;
-                        let state = values.get(&state_id).ok_or_else(|| {
-                            FellmError::other("shortconv state input not computed")
-                        })?;
+                        let state = values
+                            .get(state_id.index())
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                FellmError::other("shortconv state input not computed")
+                            })?;
                         let state_mut = tensor_mut_from(state);
                         let mut outs = [out_mut, state_mut];
                         self.backend
@@ -324,13 +360,14 @@ impl<'a> GraphExecutor<'a> {
                 OpValue::Output { name } => name.clone(),
                 _ => continue,
             };
-            let preds = self.graph.inputs_of(oid);
+            let preds = self.graph.inputs_slice(oid);
             let src = preds
                 .first()
                 .copied()
                 .ok_or_else(|| FellmError::InvalidGraph("output node has no source".into()))?;
             let nv = values
-                .get(&src)
+                .get(src.index())
+                .and_then(Option::as_ref)
                 .ok_or_else(|| FellmError::InvalidGraph("output source not computed".into()))?;
             let dtype = nv.dtype();
             let shape = nv.shape();
