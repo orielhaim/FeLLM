@@ -9,7 +9,6 @@ pub struct SwapArena {
     arena: AlignedBuffer,
     block_bytes: usize,
     free_slots: Vec<u32>,
-    /// physical_id → swap_slot
     map: HashMap<u32, u32>,
 }
 

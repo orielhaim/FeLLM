@@ -13,7 +13,7 @@ pub fn rmsnorm_row(x: &[f32], weight: &[f32], eps: f32, y: &mut [f32]) {
     while i + 8 <= n {
         let arr: [f32; 8] = x[i..i + 8].try_into().unwrap();
         let v = f32x8::from(arr);
-        acc = acc + v * v;
+        acc += v * v;
         i += 8;
     }
     sumsq += acc.reduce_add();

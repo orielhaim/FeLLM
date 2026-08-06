@@ -66,7 +66,7 @@ impl NodeValue {
     }
 }
 
-/// Build a TensorRef for reading.
+/// Build a `TensorRef` for reading.
 ///
 /// # Safety
 /// Caller must ensure no concurrent mutable borrow of the same buffer.
@@ -106,7 +106,7 @@ fn tensor_ref_from(nv: &NodeValue) -> TensorRef {
     }
 }
 
-/// Build a TensorMut for writing.
+/// Build a `TensorMut` for writing.
 ///
 /// # Safety
 /// Caller must ensure exclusive access.
@@ -281,7 +281,7 @@ impl<'a> GraphExecutor<'a> {
                             op: op.name().into(),
                             dtypes: input_dtypes
                                 .iter()
-                                .map(|d| d.to_string())
+                                .map(std::string::ToString::to_string)
                                 .collect::<Vec<_>>()
                                 .join(","),
                         })?;

@@ -10,8 +10,8 @@ pub use c_abi::{
 };
 pub use op::{OpAttrs, OpKind};
 pub use paged_ctx::{
-    host_snapshot_paged_kv, has_paged_context, set_paged_context, snapshot_paged_context,
-    with_paged_context, HostSnapshotPagedFn, PAGED_KV_ELEM_BYTES, PagedKvContext, PagedKvSnapshot,
+    HostSnapshotPagedFn, PAGED_KV_ELEM_BYTES, PagedKvContext, PagedKvSnapshot, has_paged_context,
+    host_snapshot_paged_kv, set_paged_context, snapshot_paged_context, with_paged_context,
 };
 pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{Architecture, Backend, BackendCaps, KernelHandle};

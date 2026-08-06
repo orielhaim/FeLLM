@@ -54,7 +54,7 @@ impl BlockTable {
         self.blocks.clear();
     }
 
-    /// Map logical token index → (physical_id, slot_in_block).
+    /// Map logical token index → (`physical_id`, `slot_in_block`).
     #[must_use]
     pub fn locate(&self, token_pos: usize) -> (u32, usize) {
         let logical = token_pos / BLOCK_SIZE;
@@ -122,7 +122,7 @@ impl SequenceCache {
     ///
     /// All layers must have the same number of logical blocks.
     pub fn flatten_block_tables(&self) -> Vec<u32> {
-        let n = self.tables.first().map(BlockTable::num_blocks).unwrap_or(0);
+        let n = self.tables.first().map_or(0, BlockTable::num_blocks);
         let mut out = Vec::with_capacity(n * self.tables.len());
         for t in &self.tables {
             debug_assert_eq!(t.num_blocks(), n);

@@ -360,7 +360,12 @@ mod x86_avx512 {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
-    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx2", enable = "fma")]
+    #[target_feature(
+        enable = "avx512f",
+        enable = "avx512bw",
+        enable = "avx2",
+        enable = "fma"
+    )]
     pub(super) unsafe fn vec_dot_q4_k_q8_k_row_avx512(row: &[u8], xq: &[Q8KBlock]) -> f32 {
         unsafe {
             let n_blocks = xq.len();

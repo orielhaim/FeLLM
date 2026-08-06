@@ -1,6 +1,6 @@
 //! Bucketed CUDA graph capture for decode steps.
 //!
-//! `CudaGraph` is not Sync in cudarc; FeLLM's inference worker is single-threaded,
+//! `CudaGraph` is not Sync in cudarc; `FeLLM`'s inference worker is single-threaded,
 //! so we mark [`GraphCache`] Send+Sync under that ownership contract.
 
 #[cfg(feature = "cuda")]

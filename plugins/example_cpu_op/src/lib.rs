@@ -50,7 +50,7 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
             launch: Some(launch_identity_cast),
         };
         reg.input_dtypes[0] = DType::F32 as u32;
-        unsafe { (vt.register_op)(vt.registry, &reg) }
+        unsafe { (vt.register_op)(vt.registry, &raw const reg) }
     }));
     result.unwrap_or(-99)
 }

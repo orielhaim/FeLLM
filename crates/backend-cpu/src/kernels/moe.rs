@@ -78,10 +78,10 @@ pub fn moe_decode(
             n_experts * n_embd
         )));
     }
-    if let Some(b) = bias {
-        if b.len() < n_experts {
-            return Err(FellmError::other("moe: bias shorter than n_experts"));
-        }
+    if let Some(b) = bias
+        && b.len() < n_experts
+    {
+        return Err(FellmError::other("moe: bias shorter than n_experts"));
     }
 
     let mut logits = vec![0.0f32; n_experts];

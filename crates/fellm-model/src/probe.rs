@@ -7,7 +7,7 @@ use fellm_core::error::{FellmError, Result};
 use fellm_gguf::GgufFile;
 use fellm_gguf::meta::MetaValue;
 
-/// Kind of RoPE frequency scaling.
+/// Kind of `RoPE` frequency scaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeScalingType {
     /// No scaling.
@@ -35,9 +35,9 @@ pub enum MixKind {
 /// Feed-forward block for one layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnKind {
-    /// Dense SwiGLU FFN.
+    /// Dense `SwiGLU` FFN.
     Dense,
-    /// MoE routed experts.
+    /// `MoE` routed experts.
     MoE,
 }
 
@@ -48,7 +48,7 @@ pub struct LayerSpec {
     pub index: usize,
     /// Ordinal among attention layers only (`k_in_{ord}`), if attention.
     pub attn_ordinal: Option<usize>,
-    /// Ordinal among ShortConv layers only (`conv_in_{ord}`), if ShortConv.
+    /// Ordinal among `ShortConv` layers only (`conv_in_{ord}`), if `ShortConv`.
     pub conv_ordinal: Option<usize>,
     /// Mix block kind.
     pub mix: MixKind,
@@ -73,29 +73,29 @@ pub struct ModelSpec {
     pub head_dim: usize,
     /// Dense FFN hidden dim.
     pub dense_ffn_dim: usize,
-    /// MoE expert FFN dim.
+    /// `MoE` expert FFN dim.
     pub expert_ffn_dim: usize,
     /// Expert count (0 if unused).
     pub n_experts: usize,
     /// Experts used per token.
     pub n_expert_used: usize,
-    /// MoE gating: 1 = softmax, 2 = sigmoid.
+    /// `MoE` gating: 1 = softmax, 2 = sigmoid.
     pub expert_gating_func: u32,
-    /// Renormalize MoE top-k probs.
+    /// Renormalize `MoE` top-k probs.
     pub norm_topk_prob: bool,
-    /// MoE route scale.
+    /// `MoE` route scale.
     pub routed_scaling_factor: f32,
-    /// Expert bias tensor present on MoE layers.
+    /// Expert bias tensor present on `MoE` layers.
     pub use_expert_bias: bool,
-    /// RMSNorm epsilon.
+    /// `RMSNorm` epsilon.
     pub norm_eps: f32,
-    /// RoPE base.
+    /// `RoPE` base.
     pub rope_base: f32,
-    /// RoPE rotation dim.
+    /// `RoPE` rotation dim.
     pub rope_dim: usize,
-    /// RoPE scaling.
+    /// `RoPE` scaling.
     pub rope_scaling_type: RopeScalingType,
-    /// RoPE scale factor.
+    /// `RoPE` scale factor.
     pub rope_scaling_factor: f32,
     /// Original ctx for Llama3 scaling.
     pub rope_original_ctx: u32,
@@ -109,7 +109,7 @@ pub struct ModelSpec {
     pub vocab_size: usize,
     /// Tied embeddings (no `output.weight`).
     pub tied_embeddings: bool,
-    /// ShortConv window (`l_cache`); 0 if unused.
+    /// `ShortConv` window (`l_cache`); 0 if unused.
     pub shortconv_l_cache: usize,
     /// Per-layer recipe.
     pub layers: Vec<LayerSpec>,
@@ -159,17 +159,15 @@ impl ModelSpec {
         let rope_base = m.get_f32(&format!("{p}.rope.freq_base")).unwrap_or(10000.0);
         let rope_dim = m
             .get_u32(&format!("{p}.rope.dimension_count"))
-            .map(|x| x as usize)
-            .unwrap_or(head_dim);
+            .map_or(head_dim, |x| x as usize);
         let context_length = m.get_u32(&format!("{p}.context_length")).unwrap_or(4096) as usize;
-        let vocab_size = m
-            .get_u32(&format!("{p}.vocab_size"))
-            .map(|x| x as usize)
-            .unwrap_or_else(|_| {
+        let vocab_size = m.get_u32(&format!("{p}.vocab_size")).map_or_else(
+            |_| {
                 m.get_string_array("tokenizer.ggml.tokens")
-                    .map(<[String]>::len)
-                    .unwrap_or(0)
-            });
+                    .map_or(0, <[String]>::len)
+            },
+            |x| x as usize,
+        );
         let tied_embeddings = !gguf.has_tensor("output.weight");
         let shortconv_l_cache = m.get_u32(&format!("{p}.shortconv.l_cache")).unwrap_or(0) as usize;
 
@@ -290,7 +288,7 @@ impl ModelSpec {
             .count()
     }
 
-    /// Number of ShortConv layers.
+    /// Number of `ShortConv` layers.
     #[must_use]
     pub fn n_conv_layers(&self) -> usize {
         self.layers
@@ -299,13 +297,13 @@ impl ModelSpec {
             .count()
     }
 
-    /// Whether any layer uses ShortConv (hybrid state needed).
+    /// Whether any layer uses `ShortConv` (hybrid state needed).
     #[must_use]
     pub fn is_hybrid(&self) -> bool {
         self.n_conv_layers() > 0
     }
 
-    /// Per-layer KV head counts (`0` = ShortConv) for hybrid state allocation.
+    /// Per-layer KV head counts (`0` = `ShortConv`) for hybrid state allocation.
     #[must_use]
     pub fn layer_kv_heads_for_state(&self) -> Vec<usize> {
         self.layers

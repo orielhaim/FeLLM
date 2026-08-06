@@ -4,10 +4,9 @@ use chrono::Local;
 use fellm_core::error::{FellmError, Result};
 use minijinja::{Environment, ErrorKind, context};
 use minijinja_contrib::pycompat;
-use regex::Regex;
+use regex::regex;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::sync::LazyLock;
 
 /// A message in a chat conversation.
 #[derive(Debug, Clone, Serialize)]
@@ -111,11 +110,6 @@ struct ToolForTemplate {
     parameters: JsonValue,
 }
 
-static GENERATION_OPEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{%-?\s*generation\s*-?%\}").expect("generation open regex"));
-static GENERATION_CLOSE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{%-?\s*endgeneration\s*-?%\}").expect("generation close regex"));
-
 fn raise_exception(err_text: String) -> std::result::Result<String, minijinja::Error> {
     Err(minijinja::Error::new(ErrorKind::SyntaxError, err_text))
 }
@@ -130,8 +124,12 @@ fn prepare_template(source: &str) -> String {
     // Python reverse slice → MiniJinja filter.
     s = s.replace("[::-1]", "|reverse");
     // `{% generation %}` is training-only assistant masking; strip for inference.
-    s = GENERATION_OPEN.replace_all(&s, "").into_owned();
-    s = GENERATION_CLOSE.replace_all(&s, "").into_owned();
+    s = regex!(r"\{%-?\s*generation\s*-?%\}")
+        .replace_all(&s, "")
+        .into_owned();
+    s = regex!(r"\{%-?\s*endgeneration\s*-?%\}")
+        .replace_all(&s, "")
+        .into_owned();
     s
 }
 

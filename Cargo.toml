@@ -1,18 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/fellm-core",
-  "crates/fellm-gguf",
-  "crates/fellm-tokenizer",
-  "crates/fellm-graph",
-  "crates/fellm-plugin-abi",
-  "crates/fellm-plugin-host",
-  "crates/fellm-model",
-  "crates/fellm-runtime",
-  "crates/backend-cpu",
-  "crates/backend-cuda",
-  "crates/fellm-cli",
-  "crates/fellm-server",
+  "crates/*",
   "plugins/example_cpu_op",
 ]
 
@@ -23,7 +12,7 @@ exclude = ["plugins/cuda_kernels"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "Apache-2.0"
 authors = ["oriel"]
 repository = "https://github.com/orielhaim/fellm"
@@ -40,26 +29,26 @@ fellm-model = { path = "crates/fellm-model", version = "0.1.0" }
 fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
 backend-cuda = { path = "crates/backend-cuda", version = "0.1.0" }
-libloading = "0.8"
+libloading = "0.9"
 
 # External
 thiserror = "2"
 bytemuck = { version = "1.25", features = ["derive", "extern_crate_alloc"] }
 memmap2 = "0.9"
 half = { version = "2.7", features = ["bytemuck", "num-traits"] }
-smallvec = { version = "1.13", features = ["const_generics", "union"] }
+smallvec = { version = "1.15", features = ["const_generics", "union"] }
 rayon = "1.12"
 faer = "0.24"
-pulp = "0.21"
+pulp = "0.22"
 matrixmultiply = { version = "0.3", features = ["threading"] }
-wide = "0.7"
+wide = "1.6"
 petgraph = "0.8"
 abi_stable = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
@@ -70,7 +59,7 @@ tokio = { version = "1", features = [
   "signal",
 ] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 async-openai = { version = "0.41", default-features = false, features = [

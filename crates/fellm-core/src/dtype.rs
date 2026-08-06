@@ -15,29 +15,29 @@ pub enum DType {
     F16 = 1,
 
     // GGUF k-quants and legacy quants (values match ggml_type)
-    /// GGUF Q4_0.
+    /// GGUF `Q4_0`.
     Q4_0 = 2,
-    /// GGUF Q4_1.
+    /// GGUF `Q4_1`.
     Q4_1 = 3,
-    /// GGUF Q5_0.
+    /// GGUF `Q5_0`.
     Q5_0 = 6,
-    /// GGUF Q5_1.
+    /// GGUF `Q5_1`.
     Q5_1 = 7,
-    /// GGUF Q8_0.
+    /// GGUF `Q8_0`.
     Q8_0 = 8,
-    /// GGUF Q8_1.
+    /// GGUF `Q8_1`.
     Q8_1 = 9,
-    /// GGUF Q2_K.
+    /// GGUF `Q2_K`.
     Q2K = 10,
-    /// GGUF Q3_K.
+    /// GGUF `Q3_K`.
     Q3K = 11,
-    /// GGUF Q4_K.
+    /// GGUF `Q4_K`.
     Q4K = 12,
-    /// GGUF Q5_K.
+    /// GGUF `Q5_K`.
     Q5K = 13,
-    /// GGUF Q6_K.
+    /// GGUF `Q6_K`.
     Q6K = 14,
-    /// GGUF Q8_K.
+    /// GGUF `Q8_K`.
     Q8K = 15,
 
     // Integer / bool

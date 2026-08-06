@@ -13,8 +13,8 @@ use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use fellm_plugin_host::PluginHost;
 use std::any::Any;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Bit set on handles that route to the embedded CPU backend.
 const CPU_FALLBACK_BIT: u64 = 1 << 55;
@@ -169,7 +169,7 @@ impl CudaBackend {
         }
     }
 
-    /// Upload host PhysicalPool bytes into the VRAM arena (prefix / cold start).
+    /// Upload host `PhysicalPool` bytes into the VRAM arena (prefix / cold start).
     pub fn sync_kv_host_to_device(&self, host: &[u8]) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -197,7 +197,7 @@ impl CudaBackend {
         }
     }
 
-    /// Download VRAM arena into host PhysicalPool (swap / debug).
+    /// Download VRAM arena into host `PhysicalPool` (swap / debug).
     pub fn sync_kv_device_to_host(&self, host: &mut [u8]) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -333,19 +333,18 @@ impl Backend for CudaBackend {
         input_dtypes: &[DType],
         output_dtype: DType,
     ) -> Option<KernelDescriptor> {
-        if self.use_plugins {
-            if let Some((h, _)) = self
+        if self.use_plugins
+            && let Some((h, _)) = self
                 .plugins
                 .registry()
                 .lookup(op, input_dtypes, output_dtype)
-            {
-                return Some(KernelDescriptor {
-                    op,
-                    input_dtypes: input_dtypes.to_vec(),
-                    output_dtype,
-                    handle: KernelHandle(PLUGIN_BIT | h),
-                });
-            }
+        {
+            return Some(KernelDescriptor {
+                op,
+                input_dtypes: input_dtypes.to_vec(),
+                output_dtype,
+                handle: KernelHandle(PLUGIN_BIT | h),
+            });
         }
         let desc = self.cpu.resolve_kernel(op, input_dtypes, output_dtype)?;
         Some(KernelDescriptor {

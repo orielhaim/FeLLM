@@ -2,7 +2,7 @@
 
 use crate::probe::{ModelSpec, RopeScalingType};
 
-/// Precompute inverse frequencies for RoPE (`rope_dim / 2` values).
+/// Precompute inverse frequencies for `RoPE` (`rope_dim / 2` values).
 #[must_use]
 pub fn compute_rope_inv_freqs(spec: &ModelSpec) -> Vec<f32> {
     let half = spec.rope_dim / 2;

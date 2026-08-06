@@ -46,7 +46,7 @@ impl CpuHardwareProfile {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            return detect_x86(logical);
+            detect_x86(logical)
         }
 
         #[cfg(target_arch = "aarch64")]

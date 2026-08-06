@@ -5,8 +5,6 @@
 
 **A Rust-native inference engine built for what comes after the Transformer monoculture.**
 
----
-
 FeLLM is an LLM inference engine and serving runtime written entirely in Rust. It exists because the model landscape has fractured: attention, SSMs, mixture-of-experts, block-diffusion, hybrid stacks - and existing tools force you to choose between edge performance and datacenter scale. FeLLM refuses the tradeoff.
 
 ## What it does

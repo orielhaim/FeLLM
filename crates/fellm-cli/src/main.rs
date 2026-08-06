@@ -120,7 +120,6 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     };
 
     let mut engine = Engine::open_with(&args.model, settings)?;
-    tracing::info!(backend = engine.backend_id(), "engine opened");
     let params = GenParams {
         max_tokens: args.max_tokens,
         temperature: args.temperature,

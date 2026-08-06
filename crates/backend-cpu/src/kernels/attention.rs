@@ -17,7 +17,7 @@ pub fn attention_step(
     profile: &CpuHardwareProfile,
 ) {
     debug_assert_eq!(q.len(), n_heads * head_dim);
-    debug_assert!(n_heads % n_kv_heads == 0);
+    debug_assert!(n_heads.is_multiple_of(n_kv_heads));
     debug_assert_eq!(out.len(), n_heads * head_dim);
     let seq = past_len + 1;
     debug_assert_eq!(k_cache.len(), seq * n_kv_heads * head_dim);
@@ -50,7 +50,7 @@ pub fn attention_step_paged(
     profile: &CpuHardwareProfile,
 ) {
     debug_assert_eq!(q.len(), n_heads * head_dim);
-    debug_assert!(n_heads % n_kv_heads == 0);
+    debug_assert!(n_heads.is_multiple_of(n_kv_heads));
     debug_assert_eq!(out.len(), n_heads * head_dim);
     let seq = past_len + 1;
     let heads_per_kv = n_heads / n_kv_heads;

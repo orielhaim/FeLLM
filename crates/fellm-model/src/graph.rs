@@ -70,7 +70,7 @@ pub fn build_step_graph(gguf: &GgufFile, spec: &ModelSpec) -> Result<Graph> {
 /// Node ids whose attrs must be patched each decode step.
 #[derive(Debug, Default, Clone)]
 pub struct StepBindings {
-    /// RoPE ops.
+    /// `RoPE` ops.
     pub rope: Vec<NodeId>,
     /// KV write ops.
     pub kv_write: Vec<NodeId>,
@@ -78,7 +78,7 @@ pub struct StepBindings {
     pub attention: Vec<NodeId>,
 }
 
-/// Collect position / past_len binding targets from a built graph.
+/// Collect position / `past_len` binding targets from a built graph.
 #[must_use]
 pub fn collect_step_bindings(graph: &Graph) -> StepBindings {
     let mut nodes = StepBindings::default();

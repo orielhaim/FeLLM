@@ -90,8 +90,7 @@ async fn main() {
     let model_id = args.model_id.clone().unwrap_or_else(|| {
         args.model
             .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "fellm".into())
+            .map_or_else(|| "fellm".into(), |s| s.to_string_lossy().into_owned())
     });
 
     let preference = BackendPreference::parse(&args.backend).unwrap_or_else(|e| {

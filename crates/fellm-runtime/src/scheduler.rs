@@ -300,25 +300,24 @@ impl Scheduler {
         let Some(mut logits_owned) = seq.pending_logits.take() else {
             return Ok(None);
         };
-        let tok = match logits_owned.as_mut_slice::<f32>() {
-            Ok(work) => crate::sampling::sample(
+        let tok = if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
+            crate::sampling::sample(
                 work,
                 seq.params.temperature,
                 seq.params.top_k,
                 seq.params.top_p,
                 seq.params.seed.wrapping_add(u64::from(seq.emitted)),
-            ),
-            Err(_) => {
-                let logits = logits_owned.as_slice::<f32>()?;
-                let mut work = logits.to_vec();
-                crate::sampling::sample(
-                    &mut work,
-                    seq.params.temperature,
-                    seq.params.top_k,
-                    seq.params.top_p,
-                    seq.params.seed.wrapping_add(u64::from(seq.emitted)),
-                )
-            }
+            )
+        } else {
+            let logits = logits_owned.as_slice::<f32>()?;
+            let mut work = logits.to_vec();
+            crate::sampling::sample(
+                &mut work,
+                seq.params.temperature,
+                seq.params.top_k,
+                seq.params.top_p,
+                seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+            )
         };
         seq.emitted += 1;
         if seq.first_token_at.is_none() {
@@ -390,10 +389,9 @@ impl Scheduler {
             prompt_tokens: seq.prompt_tokens,
             predicted_tokens: seq.emitted,
             prompt_ms: 0.0,
-            time_to_first_token_ms: seq
-                .first_token_at
-                .map(|t| t.duration_since(seq.gen_start).as_secs_f64() * 1000.0)
-                .unwrap_or(0.0),
+            time_to_first_token_ms: seq.first_token_at.map_or(0.0, |t| {
+                t.duration_since(seq.gen_start).as_secs_f64() * 1000.0
+            }),
             predicted_ms: 0.0,
             total_ms: seq.gen_start.elapsed().as_secs_f64() * 1000.0,
         };

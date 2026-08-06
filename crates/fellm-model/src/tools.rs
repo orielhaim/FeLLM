@@ -13,7 +13,7 @@ use fellm_tokenizer::{AssistantOutput, ToolCall};
 #[must_use]
 pub fn parse_assistant_output(text: &str) -> AssistantOutput {
     let t = text.trim();
-    let t = t.strip_prefix("<|python_tag|>").map(str::trim).unwrap_or(t);
+    let t = t.strip_prefix("<|python_tag|>").map_or(t, str::trim);
 
     if let Some(calls) = try_parse_json_tool_call(t) {
         return AssistantOutput::ToolCalls(calls);
@@ -233,7 +233,7 @@ struct JsonParser<'a> {
     i: usize,
 }
 
-impl<'a> JsonParser<'a> {
+impl JsonParser<'_> {
     fn skip_ws(&mut self) {
         while self.i < self.src.len() && self.src[self.i].is_ascii_whitespace() {
             self.i += 1;
@@ -261,7 +261,7 @@ impl<'a> JsonParser<'a> {
             Some(b'"') => Ok(JsonValue::String(self.parse_string()?)),
             Some(b'[') => self.parse_array(),
             Some(b'{') => self.parse_object(),
-            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
             other => Err(FellmError::Tokenization(format!(
                 "unexpected JSON byte {other:?}"
             ))),

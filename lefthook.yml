@@ -1,0 +1,11 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: rust-fmt
+      glob: "**/*.rs"
+      stage_fixed: true
+      run: cargo fmt
+
+    - name: rust-clippy
+      glob: "**/*.rs"
+      run: cargo clippy --workspace -- -D warnings

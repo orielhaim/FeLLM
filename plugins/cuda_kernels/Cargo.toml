@@ -10,7 +10,7 @@ name = "cuda_kernels"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "FeLLM CUDA kernel plugin (cuda-oxide)"
+description = "FeLLM CUDA kernel plugin"
 
 [lib]
 crate-type = ["cdylib"]

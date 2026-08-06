@@ -123,7 +123,7 @@ impl KernelRegistry {
             .ok_or_else(|| FellmError::other("plugin kernel missing"))?;
         let rc = unsafe {
             (kern.launch)(
-                attrs as *const OpAttrs,
+                std::ptr::from_ref::<OpAttrs>(attrs),
                 inputs.as_ptr(),
                 inputs.len() as u32,
                 outputs.as_mut_ptr(),
@@ -143,7 +143,7 @@ impl KernelRegistry {
     #[must_use]
     pub fn vtable(&mut self) -> KernelRegistryVtable {
         KernelRegistryVtable {
-            registry: self as *mut KernelRegistry as *mut c_void,
+            registry: std::ptr::from_mut::<KernelRegistry>(self).cast::<c_void>(),
             register_op: registry_register_op,
         }
     }
@@ -158,6 +158,6 @@ unsafe extern "C" fn registry_register_op(
     }
     // SAFETY: host passes a valid KernelRegistry pointer for the duration of register.
     let reg_ref = unsafe { &*reg };
-    let host = unsafe { &mut *(registry as *mut KernelRegistry) };
+    let host = unsafe { &mut *registry.cast::<KernelRegistry>() };
     host.register(reg_ref)
 }

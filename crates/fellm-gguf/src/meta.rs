@@ -55,24 +55,6 @@ impl MetaKind {
             other => return Err(FellmError::parse(format!("unknown meta kind {other}"))),
         })
     }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::U8 => "u8",
-            Self::I8 => "i8",
-            Self::U16 => "u16",
-            Self::I16 => "i16",
-            Self::U32 => "u32",
-            Self::I32 => "i32",
-            Self::F32 => "f32",
-            Self::Bool => "bool",
-            Self::String => "string",
-            Self::Array => "array",
-            Self::U64 => "u64",
-            Self::I64 => "i64",
-            Self::F64 => "f64",
-        }
-    }
 }
 
 /// A typed metadata value.

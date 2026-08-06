@@ -10,16 +10,19 @@ ahash = "0.8"
 chrono = "0.4.45"
 fellm-core.workspace = true
 fellm-gguf.workspace = true
-minijinja = { version = "2.21.0", features = [
+minijinja = { version = "2.22", features = [
   "json",
   "builtins",
   "macros",
   "multi_template",
   "loop_controls",
 ] }
-minijinja-contrib = { version = "2.21.0", features = ["pycompat"] }
-regex = "1.12.4"
+minijinja-contrib = { version = "2.22", features = ["pycompat"] }
+regex = "1.13"
 serde.workspace = true
 serde_json.workspace = true
-tokenizers = "0.23.1"
+tokenizers = { version = "0.23.1", default-features = false, features = [
+  "progressbar",
+  "fancy-regex",
+] }
 tracing.workspace = true

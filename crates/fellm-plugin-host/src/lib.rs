@@ -1,4 +1,4 @@
-//! Dynamic loader and kernel registry for FeLLM operator plugins.
+//! Dynamic loader and kernel registry for `FeLLM` operator plugins.
 
 #![deny(missing_docs)]
 

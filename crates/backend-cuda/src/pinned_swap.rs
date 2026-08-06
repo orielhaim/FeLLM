@@ -13,7 +13,7 @@ pub struct PinnedSwapArena {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     block_bytes: usize,
     free_slots: Vec<u32>,
-    /// physical_id → swap_slot
+    /// `physical_id` → `swap_slot`
     map: HashMap<u32, u32>,
 }
 

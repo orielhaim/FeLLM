@@ -1,17 +1,17 @@
-//! Fixed-size ShortConv state for hybrid models (non-paged).
+//! Fixed-size `ShortConv` state for hybrid models (non-paged).
 
 use fellm_core::error::{FellmError, Result};
 use fellm_core::storage::AlignedBuffer;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Recurrent ShortConv buffers for LFM2-style hybrids.
+/// Recurrent `ShortConv` buffers for LFM2-style hybrids.
 pub struct HybridConvState {
-    /// ShortConv buffers, one per recurrent layer.
+    /// `ShortConv` buffers, one per recurrent layer.
     pub conv: Vec<Rc<RefCell<AlignedBuffer>>>,
     /// Original block indices that are attention layers.
     pub attn_layer_ids: Vec<usize>,
-    /// Original block indices that are recurrent ShortConv layers.
+    /// Original block indices that are recurrent `ShortConv` layers.
     pub conv_layer_ids: Vec<usize>,
     conv_bytes: usize,
 }
@@ -60,12 +60,12 @@ impl HybridConvState {
         }
     }
 
-    /// Shared ShortConv buffer for a recurrent ordinal.
+    /// Shared `ShortConv` buffer for a recurrent ordinal.
     pub fn conv_buffer(&self, conv_ord: usize) -> Rc<RefCell<AlignedBuffer>> {
         self.conv[conv_ord].clone()
     }
 
-    /// Shape of each ShortConv state buffer in f32 elements.
+    /// Shape of each `ShortConv` state buffer in f32 elements.
     #[must_use]
     pub fn conv_elements(&self) -> usize {
         self.conv_bytes / 4

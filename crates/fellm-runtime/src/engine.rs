@@ -294,7 +294,7 @@ struct LoadedModel {
     /// Dummy contiguous buffers kept so the graph can bind `k_in_*` / `v_in_*`
     /// (paged kernels ignore their contents when [`PagedKvContext`] is set).
     dummy_kv: KvCache,
-    /// Fixed ShortConv state for hybrid models.
+    /// Fixed `ShortConv` state for hybrid models.
     conv: Option<HybridConvState>,
     max_seq: usize,
     model_max_ctx: usize,
@@ -306,7 +306,6 @@ struct LoadedModel {
 }
 
 impl Engine {
-    /// Open a GGUF model with default settings (ctx 8192, clamped to model max).
     pub fn open(path: &Path, max_seq_override: Option<usize>) -> Result<Self> {
         let mut settings = EngineSettings::default();
         if let Some(n) = max_seq_override {
@@ -315,9 +314,7 @@ impl Engine {
         Self::open_with(path, settings)
     }
 
-    /// Open a GGUF model with explicit settings.
     pub fn open_with(path: &Path, settings: EngineSettings) -> Result<Self> {
-        tracing::info!(path = ?path, "opening GGUF");
         let gguf = Arc::new(GgufFile::open(path)?);
         let tokenizer = load_tokenizer(&gguf)?;
 
@@ -346,7 +343,6 @@ impl Engine {
         let mut model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx)?;
 
         let backend = settings.backend.resolve()?;
-        tracing::info!(backend = backend.id(), "compute backend ready");
 
         // B2: size VRAM KV arena to match the host PhysicalPool.
         #[cfg(feature = "backend-cuda")]
@@ -619,11 +615,11 @@ impl Engine {
 
     /// Attach radix-prefix blocks for `ids` onto `seq_cache`. Returns matched token count.
     pub fn attach_prefix(&mut self, ids: &[u32], seq_cache: &mut SequenceCache) -> usize {
-        let matched = self
-            .model
-            .cache
-            .prefix
-            .attach_match(&mut self.model.cache.pool, seq_cache, ids);
+        let matched =
+            self.model
+                .cache
+                .prefix
+                .attach_match(&mut self.model.cache.pool, seq_cache, ids);
         #[cfg(feature = "backend-cuda")]
         if matched > 0 {
             if let Some(cuda) = self
@@ -643,7 +639,7 @@ impl Engine {
         self.model.cache.prefix.insert_prompt(ids, seq_cache);
     }
 
-    /// Ensure `pos` is writable in `seq_cache` (alloc / CoW).
+    /// Ensure `pos` is writable in `seq_cache` (alloc / `CoW`).
     pub fn ensure_seq_writable(&mut self, seq_cache: &mut SequenceCache, pos: usize) -> Result<()> {
         self.model.cache.ensure_writable(seq_cache, pos)
     }
@@ -758,7 +754,6 @@ impl LoadedModel {
             None
         };
 
-        tracing::info!("building step graph (once)");
         let step_graph = build_step_graph(gguf, &spec)?;
         let step_plan = ExecutionPlan::from_graph(&step_graph)?;
         let bindings = collect_step_bindings(&step_graph);
@@ -870,8 +865,7 @@ impl LoadedModel {
                         tracing::warn!(error = %e, "KV H2D sync failed");
                     }
                     if cuda.plugins_enabled() {
-                        cuda.device_kv_ptr()
-                            .unwrap_or((std::ptr::null_mut(), 0))
+                        cuda.device_kv_ptr().unwrap_or((std::ptr::null_mut(), 0))
                     } else {
                         (std::ptr::null_mut(), 0)
                     }
@@ -1002,7 +996,7 @@ pub struct TokenStream<'a> {
     last_token_at: Option<Instant>,
 }
 
-impl<'a> TokenStream<'a> {
+impl TokenStream<'_> {
     /// Decode a token id to bytes.
     pub fn decode_token(&self, id: u32) -> Result<Vec<u8>> {
         self.engine.tokenizer.decode_token(id)
@@ -1040,7 +1034,7 @@ impl<'a> TokenStream<'a> {
     }
 }
 
-impl<'a> Iterator for TokenStream<'a> {
+impl Iterator for TokenStream<'_> {
     type Item = Result<u32>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1049,33 +1043,32 @@ impl<'a> Iterator for TokenStream<'a> {
         }
         let logits_tensor = self.pending_logits.take()?;
         let mut logits_owned = logits_tensor;
-        let tok = match logits_owned.as_mut_slice::<f32>() {
-            Ok(work) => sampling::sample(
+        let tok = if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
+            sampling::sample(
                 work,
                 self.params.temperature,
                 self.params.top_k,
                 self.params.top_p,
                 self.params.seed.wrapping_add(u64::from(self.emitted)),
-            ),
-            Err(_) => {
-                // Fallback if storage is shared / non-owned (should not happen
-                // on the compiled path).
-                let logits = match logits_owned.as_slice::<f32>() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.finished = true;
-                        return Some(Err(e));
-                    }
-                };
-                let mut work = logits.to_vec();
-                sampling::sample(
-                    &mut work,
-                    self.params.temperature,
-                    self.params.top_k,
-                    self.params.top_p,
-                    self.params.seed.wrapping_add(u64::from(self.emitted)),
-                )
-            }
+            )
+        } else {
+            // Fallback if storage is shared / non-owned (should not happen
+            // on the compiled path).
+            let logits = match logits_owned.as_slice::<f32>() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.finished = true;
+                    return Some(Err(e));
+                }
+            };
+            let mut work = logits.to_vec();
+            sampling::sample(
+                &mut work,
+                self.params.temperature,
+                self.params.top_k,
+                self.params.top_p,
+                self.params.seed.wrapping_add(u64::from(self.emitted)),
+            )
         };
         self.emitted += 1;
         self.stats.predicted_tokens = self.emitted;

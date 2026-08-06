@@ -1,4 +1,4 @@
-//! OpenAI request/response mapping helpers.
+//! `OpenAI` request/response mapping helpers.
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Map an OpenAI chat completion request into engine inputs.
+/// Map an `OpenAI` chat completion request into engine inputs.
 pub fn map_request(
     req: &CreateChatCompletionRequest,
     defaults: GenParams,
@@ -311,7 +311,7 @@ pub fn stream_role_chunk(id: &str, created: u64, model: &str) -> String {
     format!("data: {v}\n\n")
 }
 
-/// Final streaming chunk with finish_reason and optional tool_calls.
+/// Final streaming chunk with `finish_reason` and optional `tool_calls`.
 pub fn stream_final_chunk(
     id: &str,
     created: u64,
@@ -414,16 +414,14 @@ pub fn models_response(model_id: &str) -> ModelsResponse {
 pub fn completion_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("chatcmpl-{nanos}")
 }
 
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[allow(dead_code)]

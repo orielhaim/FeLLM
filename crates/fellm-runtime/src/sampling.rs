@@ -1,6 +1,6 @@
 //! Host-side sampling from a logit vector (backend-agnostic).
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -38,7 +38,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: u32, top_p: f32, seed
     if sum <= 0.0 || !sum.is_finite() {
         return argmax(logits) as u32;
     }
-    for (_, p) in probs.iter_mut() {
+    for (_, p) in &mut probs {
         *p /= sum;
     }
 
@@ -54,7 +54,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: u32, top_p: f32, seed
         }
         probs.truncate(cut);
         let s: f32 = probs.iter().map(|(_, p)| *p).sum();
-        for (_, p) in probs.iter_mut() {
+        for (_, p) in &mut probs {
             *p /= s;
         }
     }
@@ -70,7 +70,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: u32, top_p: f32, seed
             return *i as u32;
         }
     }
-    probs.last().map(|(i, _)| *i as u32).unwrap_or(0)
+    probs.last().map_or(0, |(i, _)| *i as u32)
 }
 
 fn splitmix64(mut x: u64) -> u64 {

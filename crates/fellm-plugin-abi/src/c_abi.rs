@@ -5,7 +5,7 @@
 //! `catch_unwind` so panics never unwind across FFI.
 
 use crate::op::OpAttrs;
-use crate::paged_ctx::{host_snapshot_paged_kv, HostSnapshotPagedFn};
+use crate::paged_ctx::{HostSnapshotPagedFn, host_snapshot_paged_kv};
 use crate::tensor_ref::{TensorMut, TensorRef};
 use crate::{ABI_VERSION, AbiVersion, StreamHandle};
 use core::ffi::{c_char, c_int, c_void};

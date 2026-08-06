@@ -53,7 +53,7 @@ pub fn dequantize_row(dtype: DType, src: &[u8], dst: &mut [f32], n_elements: usi
 // Formula: w[i] = d * (nibble - 8)
 fn dequantize_q4_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
     let n_blocks = n_elements / QK4_0;
-    if n_elements % QK4_0 != 0 {
+    if !n_elements.is_multiple_of(QK4_0) {
         return Err(FellmError::other("Q4_0: n_elements not multiple of 32"));
     }
     let block_bytes = DType::Q4_0.bytes_per_block();
@@ -81,7 +81,7 @@ fn dequantize_q4_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
 // Formula: w[i] = d * qs[i]
 fn dequantize_q8_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
     let n_blocks = n_elements / QK8_0;
-    if n_elements % QK8_0 != 0 {
+    if !n_elements.is_multiple_of(QK8_0) {
         return Err(FellmError::other("Q8_0: n_elements not multiple of 32"));
     }
     let block_bytes = DType::Q8_0.bytes_per_block();
@@ -114,7 +114,7 @@ fn dequantize_q8_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
 //   Then advance qs by 32 and is by 2. Four such groups cover 256 weights.
 fn dequantize_q4_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
     let n_blocks = n_elements / QK_K;
-    if n_elements % QK_K != 0 {
+    if !n_elements.is_multiple_of(QK_K) {
         return Err(FellmError::other("Q4_K: n_elements not multiple of 256"));
     }
     let block_bytes = DType::Q4K.bytes_per_block();
@@ -178,7 +178,7 @@ pub fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 // Formula: w[i] = d * scale[i/16] * (q[i] - 32)  where q is 6-bit unsigned.
 fn dequantize_q6_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
     let n_blocks = n_elements / QK_K;
-    if n_elements % QK_K != 0 {
+    if !n_elements.is_multiple_of(QK_K) {
         return Err(FellmError::other("Q6_K: n_elements not multiple of 256"));
     }
     let block_bytes = DType::Q6K.bytes_per_block();
@@ -215,7 +215,7 @@ fn dequantize_q6_k_block(block: &[u8], out: &mut [f32]) {
 
         for l in 0..32 {
             let is = l / 16; // 0 or 1
-            let q1 = ((ql[l] & 0xF) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+            let q1 = ((ql[l] & 0xF) as i32 | ((qh[l] & 3) as i32) << 4) - 32;
             let q2 = ((ql[l + 32] & 0xF) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
             let q3 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
             let q4 = ((ql[l + 32] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;

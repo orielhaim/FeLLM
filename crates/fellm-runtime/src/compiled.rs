@@ -51,7 +51,7 @@ struct RuntimeOp {
     op: OpKind,
     handle: KernelHandle,
     attrs: OpAttrs,
-    /// Number of inputs passed as read-only refs (ShortConv hides its state input).
+    /// Number of inputs passed as read-only refs (`ShortConv` hides its state input).
     input_ref_count: usize,
 }
 
@@ -203,7 +203,7 @@ impl CompiledStep {
                             op: op.name().into(),
                             dtypes: input_dtypes
                                 .iter()
-                                .map(|d| d.to_string())
+                                .map(std::string::ToString::to_string)
                                 .collect::<Vec<_>>()
                                 .join(","),
                         })?;

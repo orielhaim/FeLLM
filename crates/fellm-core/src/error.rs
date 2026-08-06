@@ -1,8 +1,8 @@
-//! Central error type for the entire FeLLM stack.
+//! Central error type for the entire `FeLLM` stack.
 
 use thiserror::Error;
 
-/// The one error type used by every FeLLM crate.
+/// The one error type used by every `FeLLM` crate.
 #[derive(Debug, Error)]
 pub enum FellmError {
     /// I/O error from the OS.

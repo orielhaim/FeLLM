@@ -252,19 +252,19 @@ pub fn matvec_quant(
 
     match w_dtype {
         DType::Q4_0 => {
-            if in_dim % QK4_0 != 0 {
+            if !in_dim.is_multiple_of(QK4_0) {
                 return Err(FellmError::other("Q4_0: in_dim not multiple of 32"));
             }
             matvec_q4_0(w_bytes, x, y, out_dim, in_dim, bytes_per_row);
         }
         DType::Q8_0 => {
-            if in_dim % QK8_0 != 0 {
+            if !in_dim.is_multiple_of(QK8_0) {
                 return Err(FellmError::other("Q8_0: in_dim not multiple of 32"));
             }
             matvec_q8_0(w_bytes, x, y, out_dim, in_dim, bytes_per_row);
         }
         DType::Q4K => {
-            if in_dim % QK_K != 0 {
+            if !in_dim.is_multiple_of(QK_K) {
                 return Err(FellmError::other("Q4_K: in_dim not multiple of 256"));
             }
             let n = in_dim / QK_K;
@@ -279,7 +279,7 @@ pub fn matvec_quant(
             });
         }
         DType::Q6K => {
-            if in_dim % QK_K != 0 {
+            if !in_dim.is_multiple_of(QK_K) {
                 return Err(FellmError::other("Q6_K: in_dim not multiple of 256"));
             }
             let n = in_dim / QK_K;
@@ -421,9 +421,7 @@ fn matvec_q4_k(
                 let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
                 // Prefetch next weight row into L2 while computing current.
                 if j + 1 < n {
-                    let next = w_bytes
-                        .as_ptr()
-                        .wrapping_add((i + 1) * bytes_per_row);
+                    let next = w_bytes.as_ptr().wrapping_add((i + 1) * bytes_per_row);
                     #[cfg(target_arch = "x86_64")]
                     {
                         // SAFETY: prefetch is a hint; address need not be dereferenceable.

@@ -1,7 +1,7 @@
 //! Sampling from a logit vector (CPU kernel path; shared logic lives in
 //! `fellm_runtime::sampling` for the engine/scheduler).
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 

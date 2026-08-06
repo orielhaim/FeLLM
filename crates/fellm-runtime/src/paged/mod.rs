@@ -83,7 +83,7 @@ impl CacheManager {
         seq.clear_tables();
     }
 
-    /// Ensure `pos` is writable for every layer (allocate / CoW as needed).
+    /// Ensure `pos` is writable for every layer (allocate / `CoW` as needed).
     pub fn ensure_writable(&mut self, seq: &mut SequenceCache, pos: usize) -> Result<()> {
         if pos >= seq.max_seq {
             return Err(FellmError::other(format!(

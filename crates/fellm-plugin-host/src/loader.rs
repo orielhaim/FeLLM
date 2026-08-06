@@ -1,4 +1,4 @@
-//! Dynamic library loader for FeLLM kernel plugins.
+//! Dynamic library loader for `FeLLM` kernel plugins.
 
 use crate::registry::KernelRegistry;
 use fellm_core::error::{FellmError, Result};
@@ -69,7 +69,9 @@ impl PluginHost {
     /// `ensure_f32` re-uploads instead of trusting a stale `device_valid` cache.
     pub fn invalidate_f32_outputs(&self, outputs: &[fellm_plugin_abi::TensorMut]) {
         for out in outputs {
-            if out.dtype().is_some_and(|d| d == fellm_core::dtype::DType::F32)
+            if out
+                .dtype()
+                .is_some_and(|d| d == fellm_core::dtype::DType::F32)
                 && !out.data.is_null()
                 && out.byte_len >= 4
             {
@@ -88,8 +90,7 @@ impl PluginHost {
         let path = match dir {
             Some(p) => p.to_path_buf(),
             None => std::env::var_os("FELLM_PLUGIN_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("plugins")),
+                .map_or_else(|| PathBuf::from("plugins"), PathBuf::from),
         };
         if !path.is_dir() {
             tracing::debug!(?path, "plugin dir missing; skipping");
@@ -154,7 +155,7 @@ impl PluginHost {
                 .map_err(|e| FellmError::other(format!("missing register: {e}")))?
         };
         let mut vtable = self.registry.vtable();
-        let rc = unsafe { register_fn(&mut vtable) };
+        let rc = unsafe { register_fn(&raw mut vtable) };
         if rc != 0 {
             return Err(FellmError::other(format!("plugin register failed ({rc})")));
         }

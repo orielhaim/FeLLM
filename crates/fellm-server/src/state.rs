@@ -16,7 +16,7 @@ pub struct AppState {
 
 /// One generation job submitted by an HTTP handler.
 pub struct InferenceTask {
-    /// Chat messages (already mapped from OpenAI).
+    /// Chat messages (already mapped from `OpenAI`).
     pub messages: Vec<Message>,
     /// Tool definitions (may be empty).
     pub tools: Vec<ToolDef>,

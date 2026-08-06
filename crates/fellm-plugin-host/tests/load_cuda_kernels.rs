@@ -56,7 +56,11 @@ fn load_cuda_kernels_registers_b1_ops() {
     );
     assert!(
         host.registry()
-            .lookup(OpKind::Attention, &[DType::F32, DType::F32, DType::F32], DType::F32)
+            .lookup(
+                OpKind::Attention,
+                &[DType::F32, DType::F32, DType::F32],
+                DType::F32
+            )
             .is_some()
     );
     assert!(
