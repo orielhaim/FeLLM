@@ -16,7 +16,7 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
   "driver",
   "std",
   "cuda-12040",
-  "dynamic-loading",
+  "dynamic-linking",
 ] }
 backend-cpu.workspace = true
 

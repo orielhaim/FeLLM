@@ -888,7 +888,7 @@ fn build_attention(
         OpKind::Attention,
         OpAttrs {
             layer_ord: attn_ord as u32,
-            ..attention_attrs(spec, n_kv)
+            ..attention_attrs(spec, n_kv, head_dim)
         },
         DType::F32,
         Shape::new(&[q_stride as u64])?,
@@ -1035,13 +1035,13 @@ fn norm_attrs(spec: &ModelSpec) -> OpAttrs {
     }
 }
 
-fn attention_attrs(spec: &ModelSpec, n_kv: usize) -> OpAttrs {
+fn attention_attrs(spec: &ModelSpec, n_kv: usize, head_dim: usize) -> OpAttrs {
     OpAttrs {
         n_heads: spec.n_heads as u32,
         n_kv_heads: n_kv as u32,
-        head_dim: spec.head_dim as u32,
+        head_dim: head_dim as u32,
         past_len: 0,
-        scale: 1.0 / (spec.head_dim as f32).sqrt(),
+        scale: 1.0 / (head_dim as f32).sqrt(),
         block_size: 16,
         ..Default::default()
     }

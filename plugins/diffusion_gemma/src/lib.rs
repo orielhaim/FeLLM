@@ -71,7 +71,7 @@ impl ArchitectureProvider for DiffusionGemmaPlugin {
         if config.architecture_id != Self::ID {
             return Err(FellmError::other("DiffusionGemma config/provider mismatch"));
         }
-        tracing::debug!(backend = %backend.backend_id, "compiling DiffusionGemma plugin program");
+        tracing::debug!(device_kind = ?backend.caps.device_kind, "compiling DiffusionGemma plugin program");
         Ok(ModelProgram {
             architecture_id: Self::ID.into(),
             graphs: vec![

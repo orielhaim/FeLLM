@@ -8,18 +8,59 @@ use backend_cpu::CpuBackend;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
-use fellm_plugin_abi::traits::{Backend, BackendCaps, KernelDescriptor, KernelHandle};
+use fellm_plugin_abi::traits::{Backend, BackendCaps, DeviceKind, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use fellm_plugin_host::PluginHost;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Bit set on handles that route to the embedded CPU backend.
 const CPU_FALLBACK_BIT: u64 = 1 << 55;
 /// Bit set on handles that route to a loaded CUDA plugin.
 const PLUGIN_BIT: u64 = 1 << 56;
+
+/// CUDA execution policy. Only debug mode permits arbitrary per-operation CPU fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaExecutionMode {
+    /// Every graph operation must resolve to a CUDA kernel.
+    StrictCuda,
+    /// Explicit model partitions may use the host; arbitrary op fallback is forbidden.
+    Hybrid,
+    /// Correctness bring-up with visible CPU fallback accounting.
+    CpuFallbackDebug,
+}
+
+impl CudaExecutionMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("FELLM_CUDA_MODE")
+            .unwrap_or_else(|_| "strict-cuda".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "strict" | "strict-cuda" => Ok(Self::StrictCuda),
+            "hybrid" => Ok(Self::Hybrid),
+            "debug" | "cpu-fallback-debug" => Ok(Self::CpuFallbackDebug),
+            other => Err(FellmError::other(format!(
+                "invalid FELLM_CUDA_MODE '{other}' (expected strict-cuda|hybrid|cpu-fallback-debug)"
+            ))),
+        }
+    }
+}
+
+/// Transfer and fallback counters used by correctness assertions and benchmarks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaExecutionMetrics {
+    /// Bytes uploaded after backend initialization.
+    pub h2d_bytes: u64,
+    /// Bytes downloaded after backend initialization.
+    pub d2h_bytes: u64,
+    /// Operations executed by the CPU debug fallback.
+    pub cpu_fallback_count: u64,
+}
 
 /// CUDA compute backend with per-op CPU fallback for missing GPU kernels.
 pub struct CudaBackend {
@@ -38,6 +79,10 @@ pub struct CudaBackend {
     use_plugins: bool,
     /// Host KV arena has writes that are not yet mirrored to VRAM (prefix / swap-in).
     kv_host_dirty: AtomicBool,
+    mode: CudaExecutionMode,
+    h2d_bytes: AtomicU64,
+    d2h_bytes: AtomicU64,
+    cpu_fallback_count: AtomicU64,
 }
 
 impl CudaBackend {
@@ -67,7 +112,21 @@ impl CudaBackend {
             }
         }
         let cpu = CpuBackend::new();
-        let caps = cpu.capabilities();
+        let mode = CudaExecutionMode::from_env()?;
+        let caps = BackendCaps {
+            device_kind: DeviceKind::Gpu,
+            supports_persistent_device_state: true,
+            supports_graph_capture: true,
+            supports_async_execution: true,
+            supports_read_only_prefix_kv: true,
+            // These become true only when the corresponding native kernels exist.
+            supports_grouped_moe: false,
+            supports_device_sampling: false,
+            supports_bidirectional_attention: plugin_ops_supports(&plugins, OpKind::Attention),
+            supports_batched_quantized_gemm: plugin_ops_supports(&plugins, OpKind::MatMul),
+            supports_custom_operations: true,
+            ..BackendCaps::default()
+        };
         let plugin_ops = plugins.registry().len();
         // Default ON when registry non-empty. Opt-out: FELLM_PLUGIN_KERNELS=0.
         let use_plugins = Self::resolve_use_plugins(plugin_ops);
@@ -86,6 +145,10 @@ impl CudaBackend {
             caps,
             use_plugins,
             kv_host_dirty: AtomicBool::new(false),
+            mode,
+            h2d_bytes: AtomicU64::new(0),
+            d2h_bytes: AtomicU64::new(0),
+            cpu_fallback_count: AtomicU64::new(0),
         })
     }
 
@@ -102,6 +165,22 @@ impl CudaBackend {
     #[must_use]
     pub fn plugins_enabled(&self) -> bool {
         self.use_plugins
+    }
+
+    /// Selected CUDA execution policy.
+    #[must_use]
+    pub fn execution_mode(&self) -> CudaExecutionMode {
+        self.mode
+    }
+
+    /// Snapshot transfer/fallback instrumentation.
+    #[must_use]
+    pub fn metrics(&self) -> CudaExecutionMetrics {
+        CudaExecutionMetrics {
+            h2d_bytes: self.h2d_bytes.load(Ordering::Relaxed),
+            d2h_bytes: self.d2h_bytes.load(Ordering::Relaxed),
+            cpu_fallback_count: self.cpu_fallback_count.load(Ordering::Relaxed),
+        }
     }
 
     /// Mark host KV as needing a one-shot H2D (prefix attach / swap-in).
@@ -188,6 +267,8 @@ impl CudaBackend {
                 .stream()
                 .memcpy_htod(host, arena.buffer_mut())
                 .map_err(|e| FellmError::other(format!("KV H2D: {e}")))?;
+            self.h2d_bytes
+                .fetch_add(host.len() as u64, Ordering::Relaxed);
             Ok(())
         }
         #[cfg(not(feature = "cuda"))]
@@ -216,6 +297,8 @@ impl CudaBackend {
                 .stream()
                 .memcpy_dtoh(arena.buffer(), host)
                 .map_err(|e| FellmError::other(format!("KV D2H: {e}")))?;
+            self.d2h_bytes
+                .fetch_add(host.len() as u64, Ordering::Relaxed);
             Ok(())
         }
         #[cfg(not(feature = "cuda"))]
@@ -354,6 +437,9 @@ impl Backend for CudaBackend {
                 handle: KernelHandle(PLUGIN_BIT | h),
             });
         }
+        if self.mode != CudaExecutionMode::CpuFallbackDebug {
+            return None;
+        }
         let desc = self.cpu.resolve_kernel(op, input_dtypes, output_dtype)?;
         Some(KernelDescriptor {
             op: desc.op,
@@ -384,6 +470,11 @@ impl Backend for CudaBackend {
                 .launch(h, attrs, inputs, outputs, stream);
         }
         if handle.0 & CPU_FALLBACK_BIT != 0 {
+            self.cpu_fallback_count.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                op_handle = handle.0,
+                "CPU fallback in cpu-fallback-debug CUDA mode"
+            );
             let cpu_handle = KernelHandle(handle.0 & (CPU_FALLBACK_BIT - 1));
             let result = self.cpu.launch(cpu_handle, attrs, inputs, outputs, 0);
             if result.is_ok() && self.use_plugins {
@@ -397,4 +488,8 @@ impl Backend for CudaBackend {
             handle.0
         )))
     }
+}
+
+fn plugin_ops_supports(plugins: &PluginHost, op: OpKind) -> bool {
+    plugins.registry().supports_op(op)
 }

@@ -10,6 +10,7 @@ use fellm_plugin_abi::traits::{Backend, KernelHandle};
 use fellm_plugin_abi::{TensorMut, TensorRef};
 use smallvec::SmallVec;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -92,6 +93,63 @@ impl CompiledStep {
         backend: &dyn Backend,
         mutable_inputs: &HashMap<String, MutableBinding>,
     ) -> Result<Self> {
+        // Resolve the complete operation surface before allocating or executing.
+        // Strict accelerators therefore report every missing dtype combination
+        // in one compile error and can never silently cross a host boundary.
+        let mut inferred_dtypes: HashMap<NodeId, DType> = HashMap::new();
+        let mut missing = BTreeSet::new();
+        for &id in &plan.order {
+            let node = graph.node(id);
+            let mut input_dtypes: Vec<DType> = graph
+                .inputs_slice(id)
+                .iter()
+                .filter_map(|input| inferred_dtypes.get(input).copied())
+                .collect();
+            // The recurrent ShortConv state is an aliased mutable output, not
+            // a read-only kernel input (see the launch path below).
+            if node.op == Some(OpKind::ShortConv) {
+                input_dtypes.truncate(input_dtypes.len().saturating_sub(1));
+            }
+            let output_dtype = match &node.value {
+                OpValue::Input { dtype, .. } | OpValue::Runtime { dtype, .. } => *dtype,
+                OpValue::Constant(t) => t.dtype(),
+                OpValue::Output { .. } => input_dtypes.first().copied().unwrap_or(DType::F32),
+            };
+            let output_dtype = node
+                .in_place_output_from
+                .and_then(|slot| input_dtypes.get(slot as usize).copied())
+                .unwrap_or(output_dtype);
+            inferred_dtypes.insert(id, output_dtype);
+            if let Some(op) = node.op
+                && backend
+                    .resolve_kernel(op, &input_dtypes, output_dtype)
+                    .is_none()
+            {
+                missing.insert(format!(
+                    "{}({}) -> {}",
+                    op.name(),
+                    input_dtypes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    output_dtype
+                ));
+            }
+        }
+        if !missing.is_empty() {
+            let boundary =
+                if backend.capabilities().device_kind == fellm_plugin_abi::DeviceKind::Gpu {
+                    "strict CUDA execution would require CPU fallback"
+                } else {
+                    "backend execution plan is incomplete"
+                };
+            return Err(FellmError::other(format!(
+                "{boundary}; missing kernels:\n  {}",
+                missing.into_iter().collect::<Vec<_>>().join("\n  ")
+            )));
+        }
+
         // Plan index for each node id.
         let mut index_of: HashMap<NodeId, usize> = HashMap::with_capacity(plan.order.len());
         for (i, &id) in plan.order.iter().enumerate() {
@@ -198,7 +256,16 @@ impl CompiledStep {
                     let (dims, strides) = dims_strides(&out_shape);
 
                     // Resolve the kernel using compile-time input dtypes.
-                    let input_dtypes: Vec<DType> = inputs.iter().map(|&i| nodes[i].dtype).collect();
+                    let input_ref_count = if op == OpKind::ShortConv {
+                        inputs.len().saturating_sub(1)
+                    } else {
+                        inputs.len()
+                    };
+                    let input_dtypes: Vec<DType> = inputs
+                        .iter()
+                        .take(input_ref_count)
+                        .map(|&i| nodes[i].dtype)
+                        .collect();
                     let desc = backend
                         .resolve_kernel(op, &input_dtypes, out_dtype)
                         .ok_or_else(|| FellmError::NoKernel {
@@ -209,12 +276,6 @@ impl CompiledStep {
                                 .collect::<Vec<_>>()
                                 .join(","),
                         })?;
-
-                    let input_ref_count = if op == OpKind::ShortConv {
-                        inputs.len().saturating_sub(1)
-                    } else {
-                        inputs.len()
-                    };
 
                     nodes.push(CompiledNode {
                         inputs,
@@ -331,10 +392,34 @@ impl CompiledStep {
                     .ok_or_else(|| FellmError::other("shortconv node missing state input"))?;
                 let state_mut = self.tensor_mut(state_idx)?;
                 let mut outs = [out_mut, state_mut];
-                backend.launch(rt.handle, &attrs, &input_refs, &mut outs, 0)?;
+                backend
+                    .launch(rt.handle, &attrs, &input_refs, &mut outs, 0)
+                    .map_err(|error| {
+                        FellmError::other(format!(
+                            "CUDA/runtime launch failed at {} ({}): {error}",
+                            rt.op.name(),
+                            node.dims
+                                .iter()
+                                .map(u64::to_string)
+                                .collect::<Vec<_>>()
+                                .join("x")
+                        ))
+                    })?;
             } else {
                 let mut outs = [out_mut];
-                backend.launch(rt.handle, &attrs, &input_refs, &mut outs, 0)?;
+                backend
+                    .launch(rt.handle, &attrs, &input_refs, &mut outs, 0)
+                    .map_err(|error| {
+                        FellmError::other(format!(
+                            "CUDA/runtime launch failed at {} ({}): {error}",
+                            rt.op.name(),
+                            node.dims
+                                .iter()
+                                .map(u64::to_string)
+                                .collect::<Vec<_>>()
+                                .join("x")
+                        ))
+                    })?;
             }
             if let Some(started) = started {
                 let shape = node

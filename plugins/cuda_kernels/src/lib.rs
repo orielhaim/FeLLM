@@ -12,18 +12,21 @@ mod tensor;
 use cuda_core::CudaContext;
 use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::{
-    abi_hash, HostContext, KernelRegistryVtable, PluginManifest, PluginOpRegistration,
+    HostContext, KernelRegistryVtable, PluginManifest, PluginOpRegistration, abi_hash,
 };
 use fellm_plugin_abi::op::OpKind;
-use fellm_plugin_abi::{AbiVersion, PagedKvSnapshot, ABI_VERSION};
+use fellm_plugin_abi::{ABI_VERSION, AbiVersion, PagedKvSnapshot};
 use oxide_kernels::kernels;
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_void};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use oxide_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS};
+pub use oxide_kernels::{
+    Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q6K_BLOCK_BYTES,
+    Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
+};
 
 /// Paged KV tokens per physical block.
 pub const PAGED_BLOCK_SIZE: usize = 16;
@@ -53,11 +56,7 @@ pub(crate) fn host_paged_snapshot() -> Option<PagedKvSnapshot> {
         device_arena_len: 0,
     };
     let rc = unsafe { snap_fn(&mut out) };
-    if rc == 0 {
-        Some(out)
-    } else {
-        None
-    }
+    if rc == 0 { Some(out) } else { None }
 }
 
 static OXIDE_CTX: OnceLock<Arc<CudaContext>> = OnceLock::new();
@@ -87,7 +86,10 @@ fn this_plugin_path() -> PathBuf {
     };
     let addr = _fellm_plugin_abi_version as *const c_void;
     let rc = unsafe { dladdr(addr, &mut info) };
-    assert!(rc != 0 && !info.dli_fname.is_null(), "dladdr failed for plugin");
+    assert!(
+        rc != 0 && !info.dli_fname.is_null(),
+        "dladdr failed for plugin"
+    );
     let cstr = unsafe { CStr::from_ptr(info.dli_fname) };
     PathBuf::from(cstr.to_string_lossy().as_ref())
 }
@@ -190,7 +192,9 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         let vt = unsafe { &*registry };
         let f32 = DType::F32;
         let q4k = DType::Q4K;
+        let q5_0 = DType::Q5_0;
         let q6k = DType::Q6K;
+        let q8_0 = DType::Q8_0;
         let u32 = DType::U32;
 
         // RmsNorm: [x f32, w f32] → f32
@@ -242,6 +246,26 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         }
         if register_one(
             vt,
+            OpKind::MatMul,
+            &[q8_0, f32],
+            f32,
+            launchers::launch_q8_0_matmul,
+        ) != 0
+        {
+            return -16;
+        }
+        if register_one(
+            vt,
+            OpKind::MatMul,
+            &[q5_0, f32],
+            f32,
+            launchers::launch_q5_0_matmul,
+        ) != 0
+        {
+            return -23;
+        }
+        if register_one(
+            vt,
             OpKind::Attention,
             &[f32, f32, f32],
             f32,
@@ -262,6 +286,29 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         }
         if register_one(vt, OpKind::Add, &[f32, f32], f32, launchers::launch_add) != 0 {
             return -8;
+        }
+        if register_one(vt, OpKind::Mul, &[f32, f32], f32, launchers::launch_mul) != 0 {
+            return -24;
+        }
+        if register_one(
+            vt,
+            OpKind::Attention,
+            &[f32, f32, f32, f32, f32],
+            f32,
+            launchers::launch_attention,
+        ) != 0
+        {
+            return -25;
+        }
+        if register_one(
+            vt,
+            OpKind::WeightedEmbedding,
+            &[q6k, f32],
+            f32,
+            launchers::launch_weighted_embedding_q6k,
+        ) != 0
+        {
+            return -26;
         }
         if register_one(
             vt,
@@ -292,6 +339,66 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         ) != 0
         {
             return -11;
+        }
+        if register_one(
+            vt,
+            OpKind::Embedding,
+            &[q8_0, u32],
+            f32,
+            launchers::launch_embedding_q8_0,
+        ) != 0
+        {
+            return -17;
+        }
+        if register_one(
+            vt,
+            OpKind::ShortConv,
+            &[f32, q4k, f32, q4k],
+            f32,
+            launchers::launch_shortconv_q4k,
+        ) != 0
+        {
+            return -18;
+        }
+        if register_one(
+            vt,
+            OpKind::MoE,
+            &[f32, f32, q4k, q4k, q4k, f32],
+            f32,
+            launchers::launch_moe_q4k_down,
+        ) != 0
+        {
+            return -19;
+        }
+        if register_one(
+            vt,
+            OpKind::MoE,
+            &[f32, f32, q4k, q4k, q6k, f32],
+            f32,
+            launchers::launch_moe_q6k_down,
+        ) != 0
+        {
+            return -20;
+        }
+        if register_one(
+            vt,
+            OpKind::MoE,
+            &[f32, f32, q4k, q5_0, q4k, q4k, q5_0],
+            f32,
+            launchers::launch_moe_gemma_q5,
+        ) != 0
+        {
+            return -21;
+        }
+        if register_one(
+            vt,
+            OpKind::MoE,
+            &[f32, f32, q4k, q8_0, q4k, q4k, q8_0],
+            f32,
+            launchers::launch_moe_gemma_q8,
+        ) != 0
+        {
+            return -22;
         }
         0
     }))

@@ -14,7 +14,7 @@ use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi as paged_ctx;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
-use fellm_plugin_abi::traits::{Backend, BackendCaps, KernelDescriptor, KernelHandle};
+use fellm_plugin_abi::traits::{Backend, BackendCaps, DeviceKind, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use rayon::ThreadPool;
 use rayon::prelude::*;
@@ -74,12 +74,22 @@ impl CpuBackend {
             });
         Self {
             caps: BackendCaps {
+                device_kind: DeviceKind::Cpu,
                 simd_f32_lanes: profile.simd_f32_lanes,
                 has_avx512: profile.has_avx512,
                 has_avx2: profile.has_avx2,
                 has_neon: profile.has_neon,
                 physical_cores: profile.physical_cores as u32,
                 logical_threads: profile.logical_threads as u32,
+                supports_persistent_device_state: false,
+                supports_graph_capture: false,
+                supports_async_execution: false,
+                supports_read_only_prefix_kv: true,
+                supports_grouped_moe: true,
+                supports_device_sampling: false,
+                supports_bidirectional_attention: true,
+                supports_batched_quantized_gemm: true,
+                supports_custom_operations: true,
             },
             profile,
             simd: PulpDispatch::new(),

@@ -14,6 +14,7 @@ echo "==> FeLLM CUDA dual-pipeline build"
 echo "    A) host  = stable ($(cat "$ROOT/rust-toolchain.toml" | tr '\n' ' '))"
 echo "    B) plugin = oxide nightly (plugins/cuda_kernels/rust-toolchain.toml)"
 
+bash "$ROOT/scripts/wsl-doctor-cuda.sh"
 bash "$ROOT/scripts/wsl-build-host.sh" --cuda
 bash "$ROOT/scripts/wsl-build-plugin.sh"
 

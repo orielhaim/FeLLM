@@ -33,10 +33,21 @@ pub struct ArchitectureConfig {
 /// Backend capabilities visible during graph compilation.
 #[derive(Debug, Clone, Default)]
 pub struct BackendCapabilities {
-    /// Backend id.
+    /// Diagnostic backend id. Architecture decisions must use `caps`, not this string.
     pub backend_id: String,
     /// Underlying backend capabilities.
     pub caps: BackendCaps,
+}
+
+/// Hardware family without naming a concrete backend implementation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// General-purpose host processor.
+    #[default]
+    Cpu,
+    /// Discrete or integrated accelerator.
+    Gpu,
 }
 
 /// Stable graph identifier within a compiled model program.
@@ -208,6 +219,8 @@ pub struct KernelHandle(pub u64);
 /// Backend capabilities discovered at startup.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BackendCaps {
+    /// Broad hardware family.
+    pub device_kind: DeviceKind,
     /// Widest SIMD vector width in f32 lanes.
     pub simd_f32_lanes: u32,
     /// True if AVX-512 available.
@@ -220,6 +233,24 @@ pub struct BackendCaps {
     pub physical_cores: u32,
     /// Logical threads.
     pub logical_threads: u32,
+    /// Persistent model/request tensors can remain device-resident.
+    pub supports_persistent_device_state: bool,
+    /// Backend can capture stable execution graphs.
+    pub supports_graph_capture: bool,
+    /// Launches and transfers can be enqueued without a global synchronization.
+    pub supports_async_execution: bool,
+    /// Attention can read immutable prefix KV while writing separate causal state.
+    pub supports_read_only_prefix_kv: bool,
+    /// Routed experts can execute as grouped device work.
+    pub supports_grouped_moe: bool,
+    /// Sampling and stopping reductions can remain on the device.
+    pub supports_device_sampling: bool,
+    /// Bidirectional attention is available.
+    pub supports_bidirectional_attention: bool,
+    /// Quantized matrix multiplication supports multiple input rows.
+    pub supports_batched_quantized_gemm: bool,
+    /// Namespaced semantic custom operations can be resolved at compile time.
+    pub supports_custom_operations: bool,
 }
 
 /// A resolved kernel launch descriptor.

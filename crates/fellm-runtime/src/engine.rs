@@ -1296,6 +1296,26 @@ impl LoadedModel {
         };
         let n_logical = self.seq.table(0).num_blocks().max(1);
         let block_table = self.seq.flatten_block_tables();
+        let (device_arena, device_arena_len) = {
+            #[cfg(feature = "backend-cuda")]
+            {
+                if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+                    let host = self.cache.pool.arena_bytes();
+                    cuda.sync_kv_if_dirty(host)?;
+                    if cuda.plugins_enabled() {
+                        cuda.device_kv_ptr().unwrap_or((std::ptr::null_mut(), 0))
+                    } else {
+                        (std::ptr::null_mut(), 0)
+                    }
+                } else {
+                    (std::ptr::null_mut(), 0)
+                }
+            }
+            #[cfg(not(feature = "backend-cuda"))]
+            {
+                (std::ptr::null_mut(), 0usize)
+            }
+        };
         let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
         set_paged_context(Some(PagedKvContext {
             arena: arena_ptr,
@@ -1307,8 +1327,8 @@ impl LoadedModel {
             block_bytes: self.cache.pool.block_bytes(),
             block_size: crate::paged::BLOCK_SIZE,
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
-            device_arena: std::ptr::null_mut(),
-            device_arena_len: 0,
+            device_arena,
+            device_arena_len,
         }));
         backend.begin_step();
         let result = (|| {

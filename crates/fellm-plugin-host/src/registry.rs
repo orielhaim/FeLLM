@@ -150,6 +150,12 @@ impl KernelRegistry {
         self.entries.is_empty()
     }
 
+    /// Whether any dtype/layout implementation is registered for an operation.
+    #[must_use]
+    pub fn supports_op(&self, op: OpKind) -> bool {
+        self.entries.keys().any(|key| key.op == op)
+    }
+
     /// Register from a C ABI record. Returns `0` on success.
     pub fn register(&mut self, reg: &PluginOpRegistration) -> c_int {
         let Some(op) = OpKind::from_u32(reg.op_kind) else {

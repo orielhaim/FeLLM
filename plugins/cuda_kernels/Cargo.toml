@@ -22,6 +22,6 @@ fellm-core = { path = "../../crates/fellm-core" }
 half = "2.7"
 
 # cuda-oxide (git) — same pins as `cargo oxide new`
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "981b9eb01b019df0dfe24992d338ac3c29e6811e" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "981b9eb01b019df0dfe24992d338ac3c29e6811e" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "981b9eb01b019df0dfe24992d338ac3c29e6811e" }
