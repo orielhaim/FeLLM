@@ -5,7 +5,8 @@ use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
     HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestFn,
-    PluginRegisterArchitecturesFn, PluginRegisterFn, PluginShutdownFn, abi_hash, symbols,
+    PluginRegisterArchitecturesFn, PluginRegisterDeviceTensorFn, PluginRegisterFn,
+    PluginShutdownFn, PluginUpdateStepParamsFn, abi_hash, symbols,
 };
 use libloading::Library;
 use std::ffi::OsStr;
@@ -18,6 +19,8 @@ pub struct LoadedPlugin {
     _lib: Library,
     shutdown: Option<PluginShutdownFn>,
     invalidate_f32: Option<PluginInvalidateF32Fn>,
+    update_step_params: Option<PluginUpdateStepParamsFn>,
+    register_device_tensor: Option<PluginRegisterDeviceTensorFn>,
 }
 
 impl Drop for LoadedPlugin {
@@ -96,6 +99,41 @@ impl PluginHost {
                 }
             }
         }
+    }
+
+    /// Upload the fixed-layout controls consumed by prepared CUDA kernels.
+    pub fn update_step_params(&self, params: &fellm_plugin_abi::DeviceStepParams) -> Result<()> {
+        for plugin in &self.plugins {
+            if let Some(update) = plugin.update_step_params {
+                let rc = unsafe { update(std::ptr::from_ref(params)) };
+                if rc != 0 {
+                    return Err(FellmError::other(format!(
+                        "plugin step-parameter update failed ({rc})"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind a host constant to its stable address in the packed CUDA model image.
+    pub fn register_device_tensor(
+        &self,
+        host_ptr: *const u8,
+        nbytes: usize,
+        device_ptr: u64,
+    ) -> Result<()> {
+        for plugin in &self.plugins {
+            if let Some(register) = plugin.register_device_tensor {
+                let rc = unsafe { register(host_ptr, nbytes, device_ptr) };
+                if rc != 0 {
+                    return Err(FellmError::other(format!(
+                        "plugin device tensor registration failed ({rc})"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load all plugins from `dir` (or `FELLM_PLUGIN_DIR` if `dir` is `None`).
@@ -197,12 +235,18 @@ impl PluginHost {
             unsafe { lib.get(symbols::SHUTDOWN).ok().map(|s| *s) };
         let invalidate_f32: Option<PluginInvalidateF32Fn> =
             unsafe { lib.get(symbols::INVALIDATE_F32).ok().map(|s| *s) };
+        let update_step_params: Option<PluginUpdateStepParamsFn> =
+            unsafe { lib.get(symbols::UPDATE_STEP_PARAMS).ok().map(|s| *s) };
+        let register_device_tensor: Option<PluginRegisterDeviceTensorFn> =
+            unsafe { lib.get(symbols::REGISTER_DEVICE_TENSOR).ok().map(|s| *s) };
 
         self.plugins.push(LoadedPlugin {
             path: path.to_path_buf(),
             _lib: lib,
             shutdown,
             invalidate_f32,
+            update_step_params,
+            register_device_tensor,
         });
         Ok(())
     }

@@ -1,6 +1,7 @@
 pub mod c_abi;
 pub mod op;
 pub mod paged_ctx;
+pub mod physical_plan;
 pub mod tensor_ref;
 pub mod traits;
 
@@ -14,6 +15,10 @@ pub use paged_ctx::{
     HostSnapshotPagedFn, PAGED_KV_ELEM_BYTES, PagedKvContext, PagedKvSnapshot, has_paged_context,
     host_snapshot_paged_kv, set_paged_context, snapshot_paged_context, with_paged_context,
     with_paged_context_mut,
+};
+pub use physical_plan::{
+    AllocationId, ArenaSlot, DevicePtr, DeviceStepParams, DeviceTensor, MacroOpKind, PhysicalPlan,
+    PlanTensorDesc, PlanTensorId, PreparedMacroOp, StorageClass,
 };
 pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{
@@ -42,6 +47,6 @@ pub struct AbiVersion {
 /// The ABI version this crate advertises. Bump on breaking changes.
 pub const ABI_VERSION: AbiVersion = AbiVersion {
     major: 0,
-    minor: 4,
+    minor: 6,
     patch: 0,
 };

@@ -1,6 +1,6 @@
 //! Oxide `#[cuda_module]` kernels for FeLLM B1 ops.
 
-use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread, warp};
 use cuda_host::cuda_module;
 
 /// Q4_K super-block size (GGUF / ggml).
@@ -61,6 +61,52 @@ pub mod kernels {
             // silu(x) = x / (1 + exp(-x))
             let s = g / (1.0 + (-g).exp());
             *o = s * u;
+        }
+    }
+
+    /// Hierarchical greedy argmax. Launch one 256-thread block.
+    #[kernel]
+    pub fn argmax_token(logits: &[f32], n: u32, mut out: DisjointSlice<f32>) {
+        static mut VALUES: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut INDICES: SharedArray<u32, 256> = SharedArray::UNINIT;
+        let lane = thread::threadIdx_x() as usize;
+        let mut best = f32::NEG_INFINITY;
+        let mut best_index = 0u32;
+        let mut i = lane;
+        while i < n as usize {
+            let value = unsafe { *logits.get_unchecked(i) };
+            if value > best || (value == best && (i as u32) < best_index) {
+                best = value;
+                best_index = i as u32;
+            }
+            i += 256;
+        }
+        unsafe {
+            VALUES[lane] = best;
+            INDICES[lane] = best_index;
+        }
+        thread::sync_threads();
+        let mut width = 128usize;
+        while width != 0 {
+            if lane < width {
+                let other = unsafe { VALUES[lane + width] };
+                let other_index = unsafe { INDICES[lane + width] };
+                let current = unsafe { VALUES[lane] };
+                let current_index = unsafe { INDICES[lane] };
+                if other > current || (other == current && other_index < current_index) {
+                    unsafe {
+                        VALUES[lane] = other;
+                        INDICES[lane] = other_index;
+                    }
+                }
+            }
+            thread::sync_threads();
+            width /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                *out.get_unchecked_mut(0) = INDICES[0] as f32;
+            }
         }
     }
 
@@ -283,15 +329,13 @@ pub mod kernels {
                 let sc = blk + 192 + half * 8;
                 let y0 = xb + half * 128;
                 let is = lane / 16;
-                let q1 = ((w[ql + lane] & 0xF) as i32
-                    | (((w[qh + lane] >> 0) & 3) as i32) << 4)
-                    - 32;
+                let q1 =
+                    ((w[ql + lane] & 0xF) as i32 | (((w[qh + lane] >> 0) & 3) as i32) << 4) - 32;
                 let q2 = ((w[ql + lane + 32] & 0xF) as i32
                     | (((w[qh + lane] >> 2) & 3) as i32) << 4)
                     - 32;
-                let q3 = ((w[ql + lane] >> 4) as i32
-                    | (((w[qh + lane] >> 4) & 3) as i32) << 4)
-                    - 32;
+                let q3 =
+                    ((w[ql + lane] >> 4) as i32 | (((w[qh + lane] >> 4) & 3) as i32) << 4) - 32;
                 let q4 = ((w[ql + lane + 32] >> 4) as i32
                     | (((w[qh + lane] >> 6) & 3) as i32) << 4)
                     - 32;
@@ -516,18 +560,12 @@ pub mod kernels {
                 let sc = blk + 192 + half * 8;
                 let y0 = xb + half * 128;
                 let is = tid / 16;
-                let q1 =
-                    ((w[ql + tid] & 0xF) as i32 | (((w[qh + tid] >> 0) & 3) as i32) << 4)
-                        - 32;
-                let q2 = ((w[ql + tid + 32] & 0xF) as i32
-                    | (((w[qh + tid] >> 2) & 3) as i32) << 4)
-                    - 32;
-                let q3 = ((w[ql + tid] >> 4) as i32
-                    | (((w[qh + tid] >> 4) & 3) as i32) << 4)
-                    - 32;
-                let q4 = ((w[ql + tid + 32] >> 4) as i32
-                    | (((w[qh + tid] >> 6) & 3) as i32) << 4)
-                    - 32;
+                let q1 = ((w[ql + tid] & 0xF) as i32 | (((w[qh + tid] >> 0) & 3) as i32) << 4) - 32;
+                let q2 =
+                    ((w[ql + tid + 32] & 0xF) as i32 | (((w[qh + tid] >> 2) & 3) as i32) << 4) - 32;
+                let q3 = ((w[ql + tid] >> 4) as i32 | (((w[qh + tid] >> 4) & 3) as i32) << 4) - 32;
+                let q4 =
+                    ((w[ql + tid + 32] >> 4) as i32 | (((w[qh + tid] >> 6) & 3) as i32) << 4) - 32;
                 let s0 = w[sc + is] as i8 as f32;
                 let s1 = w[sc + is + 2] as i8 as f32;
                 let s2 = w[sc + is + 4] as i8 as f32;
@@ -585,16 +623,24 @@ pub mod kernels {
         let x_base = batch * n_blocks as usize * Q6K_BLOCK_ELEMS as usize;
         let a0 = if row0 < out_dim as usize {
             dot_q6k_lane(w, row0 * row_bytes, x, x_base, n_blocks, lane)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let a1 = if row0 + 1 < out_dim as usize {
             dot_q6k_lane(w, (row0 + 1) * row_bytes, x, x_base, n_blocks, lane)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let a2 = if row0 + 2 < out_dim as usize {
             dot_q6k_lane(w, (row0 + 2) * row_bytes, x, x_base, n_blocks, lane)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let a3 = if row0 + 3 < out_dim as usize {
             dot_q6k_lane(w, (row0 + 3) * row_bytes, x, x_base, n_blocks, lane)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         unsafe {
             PARTIAL[lane] = a0;
             PARTIAL[32 + lane] = a1;
@@ -618,10 +664,18 @@ pub mod kernels {
         if lane == 0 {
             let base = batch * out_dim as usize + row0;
             unsafe {
-                if row0 < out_dim as usize { *out.get_unchecked_mut(base) = PARTIAL[0]; }
-                if row0 + 1 < out_dim as usize { *out.get_unchecked_mut(base + 1) = PARTIAL[32]; }
-                if row0 + 2 < out_dim as usize { *out.get_unchecked_mut(base + 2) = PARTIAL[64]; }
-                if row0 + 3 < out_dim as usize { *out.get_unchecked_mut(base + 3) = PARTIAL[96]; }
+                if row0 < out_dim as usize {
+                    *out.get_unchecked_mut(base) = PARTIAL[0];
+                }
+                if row0 + 1 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 1) = PARTIAL[32];
+                }
+                if row0 + 2 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 2) = PARTIAL[64];
+                }
+                if row0 + 3 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 3) = PARTIAL[96];
+                }
             }
         }
     }
@@ -641,12 +695,16 @@ pub mod kernels {
         if index >= input.len() {
             return;
         }
-        unsafe { MAXABS[lane] = input[index].abs(); }
+        unsafe {
+            MAXABS[lane] = input[index].abs();
+        }
         thread::sync_threads();
         let mut stride = 16usize;
         while stride > 0 {
             if lane < stride {
-                unsafe { MAXABS[lane] = MAXABS[lane].max(MAXABS[lane + stride]); }
+                unsafe {
+                    MAXABS[lane] = MAXABS[lane].max(MAXABS[lane + stride]);
+                }
             }
             thread::sync_threads();
             stride /= 2;
@@ -657,9 +715,13 @@ pub mod kernels {
         } else {
             0
         };
-        unsafe { *quants.get_unchecked_mut(index) = quant; }
+        unsafe {
+            *quants.get_unchecked_mut(index) = quant;
+        }
         if lane == 0 {
-            unsafe { *scales.get_unchecked_mut(chunk) = scale; }
+            unsafe {
+                *scales.get_unchecked_mut(chunk) = scale;
+            }
         }
     }
 
@@ -675,9 +737,8 @@ pub mod kernels {
         let ql_idx = lane + if quad == 1 || quad == 3 { 32 } else { 0 };
         let packed = unsafe { *w.get_unchecked(ql + ql_idx) };
         let low = if quad < 2 { packed & 15 } else { packed >> 4 };
-        (low as i32
-            | ((((unsafe { *w.get_unchecked(qh + lane) } >> shift) & 3) as i32) << 4)
-            - 32) as i8
+        (low as i32 | ((((unsafe { *w.get_unchecked(qh + lane) } >> shift) & 3) as i32) << 4) - 32)
+            as i8
     }
 
     #[inline]
@@ -715,11 +776,12 @@ pub mod kernels {
         batch_rows: u32,
         mut out: DisjointSlice<f32>,
     ) {
-        static mut PARTIAL: SharedArray<f32, 128> = SharedArray::UNINIT;
         let lane = thread::threadIdx_x() as usize;
         let groups = (out_dim as usize + 3) / 4;
         let group = thread::blockIdx_x() as usize;
-        if group >= groups * batch_rows as usize { return; }
+        if group >= groups * batch_rows as usize {
+            return;
+        }
         let batch = group / groups;
         let row0 = (group % groups) * 4;
         let row_bytes = n_blocks as usize * Q6K_BLOCK_BYTES as usize;
@@ -736,61 +798,184 @@ pub mod kernels {
                 let j = j0 + pair * 4;
                 let xi = x_base + block * 256 + j;
                 let xp = u32::from_le_bytes(unsafe {
-                    [*qx.get_unchecked(xi) as u8, *qx.get_unchecked(xi + 1) as u8,
-                     *qx.get_unchecked(xi + 2) as u8, *qx.get_unchecked(xi + 3) as u8]
+                    [
+                        *qx.get_unchecked(xi) as u8,
+                        *qx.get_unchecked(xi + 1) as u8,
+                        *qx.get_unchecked(xi + 2) as u8,
+                        *qx.get_unchecked(xi + 3) as u8,
+                    ]
                 });
                 let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
                 if row0 < out_dim as usize {
-                    sum0 += q6k_q8_chunk(w, row0 * row_bytes + block * Q6K_BLOCK_BYTES as usize, j, xp, xs);
+                    sum0 += q6k_q8_chunk(
+                        w,
+                        row0 * row_bytes + block * Q6K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        xs,
+                    );
                 }
                 if row0 + 1 < out_dim as usize {
-                    sum1 += q6k_q8_chunk(w, (row0 + 1) * row_bytes + block * Q6K_BLOCK_BYTES as usize, j, xp, xs);
+                    sum1 += q6k_q8_chunk(
+                        w,
+                        (row0 + 1) * row_bytes + block * Q6K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        xs,
+                    );
                 }
                 if row0 + 2 < out_dim as usize {
-                    sum2 += q6k_q8_chunk(w, (row0 + 2) * row_bytes + block * Q6K_BLOCK_BYTES as usize, j, xp, xs);
+                    sum2 += q6k_q8_chunk(
+                        w,
+                        (row0 + 2) * row_bytes + block * Q6K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        xs,
+                    );
                 }
                 if row0 + 3 < out_dim as usize {
-                    sum3 += q6k_q8_chunk(w, (row0 + 3) * row_bytes + block * Q6K_BLOCK_BYTES as usize, j, xp, xs);
+                    sum3 += q6k_q8_chunk(
+                        w,
+                        (row0 + 3) * row_bytes + block * Q6K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        xs,
+                    );
                 }
                 pair += 1;
             }
             block += 1;
         }
-        unsafe {
-            PARTIAL[lane] = sum0; PARTIAL[32 + lane] = sum1;
-            PARTIAL[64 + lane] = sum2; PARTIAL[96 + lane] = sum3;
-        }
-        thread::sync_threads();
-        let mut stride = 16usize;
+        let mut stride = 16u32;
         while stride > 0 {
-            if lane < stride {
-                unsafe {
-                    PARTIAL[lane] += PARTIAL[lane + stride];
-                    PARTIAL[32 + lane] += PARTIAL[32 + lane + stride];
-                    PARTIAL[64 + lane] += PARTIAL[64 + lane + stride];
-                    PARTIAL[96 + lane] += PARTIAL[96 + lane + stride];
-                }
-            }
-            thread::sync_threads(); stride /= 2;
+            sum0 += warp::shuffle_down_f32(sum0, stride);
+            sum1 += warp::shuffle_down_f32(sum1, stride);
+            sum2 += warp::shuffle_down_f32(sum2, stride);
+            sum3 += warp::shuffle_down_f32(sum3, stride);
+            stride /= 2;
         }
         if lane == 0 {
             let base = batch * out_dim as usize + row0;
             unsafe {
-                if row0 < out_dim as usize { *out.get_unchecked_mut(base) = PARTIAL[0]; }
-                if row0 + 1 < out_dim as usize { *out.get_unchecked_mut(base + 1) = PARTIAL[32]; }
-                if row0 + 2 < out_dim as usize { *out.get_unchecked_mut(base + 2) = PARTIAL[64]; }
-                if row0 + 3 < out_dim as usize { *out.get_unchecked_mut(base + 3) = PARTIAL[96]; }
+                if row0 < out_dim as usize {
+                    *out.get_unchecked_mut(base) = sum0;
+                }
+                if row0 + 1 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 1) = sum1;
+                }
+                if row0 + 2 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 2) = sum2;
+                }
+                if row0 + 3 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 3) = sum3;
+                }
+            }
+        }
+    }
+
+    /// Four-warp, one-row Q6_K decode policy for latency-bound Ada MMVQ.
+    #[kernel]
+    pub fn q6k_q8_gemv_multiwarp(
+        w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        residual: &[f32],
+        fuse_residual: u32,
+        out_dim: u32,
+        n_blocks: u32,
+        batch_rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let nwarps = (thread::blockDim_x() as usize) >> 5;
+        let linear_row = thread::blockIdx_x() as usize;
+        if linear_row >= out_dim as usize * batch_rows as usize || warp_id >= nwarps {
+            return;
+        }
+        let row = linear_row % out_dim as usize;
+        let batch = linear_row / out_dim as usize;
+        let row_bytes = n_blocks as usize * Q6K_BLOCK_BYTES as usize;
+        let x_base = batch * n_blocks as usize * Q6K_BLOCK_ELEMS as usize;
+        let mut sum = 0.0f32;
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let j0 = lane * 8;
+            let mut pair = 0usize;
+            while pair < 2 {
+                let j = j0 + pair * 4;
+                let xi = x_base + block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                sum += q6k_q8_chunk(
+                    w,
+                    row * row_bytes + block * Q6K_BLOCK_BYTES as usize,
+                    j,
+                    xp,
+                    xs,
+                );
+                pair += 1;
+            }
+            block += nwarps;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            sum += warp::shuffle_down_f32(sum, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe { WARP_SUMS[warp_id] = sum };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut total = if lane < nwarps {
+                unsafe { WARP_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut width = 16u32;
+            while width > 0 {
+                total += warp::shuffle_down_f32(total, width);
+                width /= 2;
+            }
+            if lane == 0 {
+                let skip = if fuse_residual != 0 {
+                    unsafe { *residual.get_unchecked(linear_row) }
+                } else {
+                    0.0
+                };
+                unsafe { *out.get_unchecked_mut(linear_row) = total + skip };
             }
         }
     }
 
     #[inline]
-    fn q4k_quant(w: &[u8], blk: usize, j: usize) -> i8 {
-        let lane = j % 32;
+    fn load_u32(bytes: &[u8], offset: usize) -> u32 {
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<u32>()) }
+    }
+
+    #[inline]
+    fn load_i8x4(values: &[i8], offset: usize) -> u32 {
+        unsafe { core::ptr::read_unaligned(values.as_ptr().add(offset).cast::<u32>()) }
+    }
+
+    #[inline]
+    fn q4k_signed4(w: &[u8], blk: usize, j: usize) -> u32 {
+        let byte_index = j % 32;
         let chunk = j / 64;
-        let packed = unsafe { *w.get_unchecked(blk + 16 + chunk * 32 + lane) };
-        let q = if j % 64 < 32 { packed & 15 } else { packed >> 4 };
-        q as i8 - 8
+        let packed = load_u32(w, blk + 16 + chunk * 32 + byte_index);
+        let nibble = if j % 64 < 32 {
+            packed & 0x0f0f_0f0f
+        } else {
+            (packed >> 4) & 0x0f0f_0f0f
+        };
+        // Convert unsigned 0..15 nibbles to four packed signed (-8..7)
+        // bytes without cross-byte subtraction/borrow.
+        let signed4 = nibble ^ 0x0808_0808;
+        let sign = signed4 & 0x0808_0808;
+        signed4 | (sign << 1) | (sign << 2) | (sign << 3) | (sign << 4)
     }
 
     #[inline]
@@ -800,8 +985,7 @@ pub mod kernels {
         } else {
             let i = group - 4;
             unsafe {
-                (*w.get_unchecked(blk + 12 + i) & 15)
-                    | ((*w.get_unchecked(blk + 4 + i) >> 6) << 4)
+                (*w.get_unchecked(blk + 12 + i) & 15) | ((*w.get_unchecked(blk + 4 + i) >> 6) << 4)
             }
         }
     }
@@ -813,20 +997,14 @@ pub mod kernels {
         } else {
             let i = group - 4;
             unsafe {
-                (*w.get_unchecked(blk + 12 + i) >> 4)
-                    | ((*w.get_unchecked(blk + 8 + i) >> 6) << 4)
+                (*w.get_unchecked(blk + 12 + i) >> 4) | ((*w.get_unchecked(blk + 8 + i) >> 6) << 4)
             }
         }
     }
 
     #[inline]
     fn q4k_q8_chunk(w: &[u8], blk: usize, j: usize, xp: u32, sx: i32, xs: f32) -> f32 {
-        let qp = u32::from_le_bytes([
-            q4k_quant(w, blk, j) as u8,
-            q4k_quant(w, blk, j + 1) as u8,
-            q4k_quant(w, blk, j + 2) as u8,
-            q4k_quant(w, blk, j + 3) as u8,
-        ]);
+        let qp = q4k_signed4(w, blk, j);
         let dot = dp4a_s32(qp, xp, 0) + 8 * sx;
         let d = f16_to_f32(u16::from_le_bytes(unsafe {
             [*w.get_unchecked(blk), *w.get_unchecked(blk + 1)]
@@ -851,11 +1029,12 @@ pub mod kernels {
         batch_rows: u32,
         mut out: DisjointSlice<f32>,
     ) {
-        static mut PARTIAL: SharedArray<f32, 128> = SharedArray::UNINIT;
         let lane = thread::threadIdx_x() as usize;
         let groups = (out_dim as usize + 3) / 4;
         let group = thread::blockIdx_x() as usize;
-        if group >= groups * batch_rows as usize { return; }
+        if group >= groups * batch_rows as usize {
+            return;
+        }
         let batch = group / groups;
         let row0 = (group % groups) * 4;
         let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
@@ -870,55 +1049,241 @@ pub mod kernels {
             while half < 2 {
                 let j = half * 128 + lane * 4;
                 let xi = x_base + block * 256 + j;
-                let x0 = unsafe { *qx.get_unchecked(xi) };
-                let x1 = unsafe { *qx.get_unchecked(xi + 1) };
-                let x2 = unsafe { *qx.get_unchecked(xi + 2) };
-                let x3 = unsafe { *qx.get_unchecked(xi + 3) };
-                let xp = u32::from_le_bytes([x0 as u8, x1 as u8, x2 as u8, x3 as u8]);
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
                 let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
                 let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
                 if row0 < out_dim as usize {
-                    sum0 += q4k_q8_chunk(w, row0 * row_bytes + block * Q4K_BLOCK_BYTES as usize, j, xp, sx, xs);
+                    sum0 += q4k_q8_chunk(
+                        w,
+                        row0 * row_bytes + block * Q4K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        sx,
+                        xs,
+                    );
                 }
                 if row0 + 1 < out_dim as usize {
-                    sum1 += q4k_q8_chunk(w, (row0 + 1) * row_bytes + block * Q4K_BLOCK_BYTES as usize, j, xp, sx, xs);
+                    sum1 += q4k_q8_chunk(
+                        w,
+                        (row0 + 1) * row_bytes + block * Q4K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        sx,
+                        xs,
+                    );
                 }
                 if row0 + 2 < out_dim as usize {
-                    sum2 += q4k_q8_chunk(w, (row0 + 2) * row_bytes + block * Q4K_BLOCK_BYTES as usize, j, xp, sx, xs);
+                    sum2 += q4k_q8_chunk(
+                        w,
+                        (row0 + 2) * row_bytes + block * Q4K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        sx,
+                        xs,
+                    );
                 }
                 if row0 + 3 < out_dim as usize {
-                    sum3 += q4k_q8_chunk(w, (row0 + 3) * row_bytes + block * Q4K_BLOCK_BYTES as usize, j, xp, sx, xs);
+                    sum3 += q4k_q8_chunk(
+                        w,
+                        (row0 + 3) * row_bytes + block * Q4K_BLOCK_BYTES as usize,
+                        j,
+                        xp,
+                        sx,
+                        xs,
+                    );
                 }
                 half += 1;
             }
             block += 1;
         }
-        unsafe {
-            PARTIAL[lane] = sum0;
-            PARTIAL[32 + lane] = sum1;
-            PARTIAL[64 + lane] = sum2;
-            PARTIAL[96 + lane] = sum3;
-        }
-        thread::sync_threads();
-        let mut stride = 16usize;
+        let mut stride = 16u32;
         while stride > 0 {
-            if lane < stride {
-                unsafe {
-                    PARTIAL[lane] += PARTIAL[lane + stride];
-                    PARTIAL[32 + lane] += PARTIAL[32 + lane + stride];
-                    PARTIAL[64 + lane] += PARTIAL[64 + lane + stride];
-                    PARTIAL[96 + lane] += PARTIAL[96 + lane + stride];
-                }
-            }
-            thread::sync_threads(); stride /= 2;
+            sum0 += warp::shuffle_down_f32(sum0, stride);
+            sum1 += warp::shuffle_down_f32(sum1, stride);
+            sum2 += warp::shuffle_down_f32(sum2, stride);
+            sum3 += warp::shuffle_down_f32(sum3, stride);
+            stride /= 2;
         }
         if lane == 0 {
             let base = batch * out_dim as usize + row0;
             unsafe {
-                if row0 < out_dim as usize { *out.get_unchecked_mut(base) = PARTIAL[0]; }
-                if row0 + 1 < out_dim as usize { *out.get_unchecked_mut(base + 1) = PARTIAL[32]; }
-                if row0 + 2 < out_dim as usize { *out.get_unchecked_mut(base + 2) = PARTIAL[64]; }
-                if row0 + 3 < out_dim as usize { *out.get_unchecked_mut(base + 3) = PARTIAL[96]; }
+                if row0 < out_dim as usize {
+                    *out.get_unchecked_mut(base) = sum0;
+                }
+                if row0 + 1 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 1) = sum1;
+                }
+                if row0 + 2 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 2) = sum2;
+                }
+                if row0 + 3 < out_dim as usize {
+                    *out.get_unchecked_mut(base + 3) = sum3;
+                }
+            }
+        }
+    }
+
+    /// Ada decode MMVQ policy: four warps cooperate on one output row.
+    /// Each warp walks a disjoint set of Q4_K super-blocks, which exposes
+    /// enough independent global-memory requests to hide quant metadata and
+    /// DP4A latency. This follows llama.cpp's one-row/four-warp decode policy.
+    #[kernel]
+    pub fn q4k_q8_gemv_multiwarp(
+        w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        residual: &[f32],
+        fuse_residual: u32,
+        out_dim: u32,
+        n_blocks: u32,
+        batch_rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let nwarps = (thread::blockDim_x() as usize) >> 5;
+        let linear_row = thread::blockIdx_x() as usize;
+        if linear_row >= out_dim as usize * batch_rows as usize || warp_id >= nwarps {
+            return;
+        }
+        let row = linear_row % out_dim as usize;
+        let batch = linear_row / out_dim as usize;
+        let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
+        let x_base = batch * n_blocks as usize * Q4K_BLOCK_ELEMS as usize;
+        let mut sum = 0.0f32;
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let blk = row * row_bytes + block * Q4K_BLOCK_BYTES as usize;
+            let mut half = 0usize;
+            while half < 2 {
+                let j = half * 128 + lane * 4;
+                let xi = x_base + block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
+                let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                sum += q4k_q8_chunk(w, blk, j, xp, sx, xs);
+                half += 1;
+            }
+            block += nwarps;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            sum += warp::shuffle_down_f32(sum, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe { WARP_SUMS[warp_id] = sum };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut total = if lane < nwarps {
+                unsafe { WARP_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut width = 16u32;
+            while width > 0 {
+                total += warp::shuffle_down_f32(total, width);
+                width /= 2;
+            }
+            if lane == 0 {
+                let skip = if fuse_residual != 0 {
+                    unsafe { *residual.get_unchecked(linear_row) }
+                } else {
+                    0.0
+                };
+                unsafe { *out.get_unchecked_mut(linear_row) = total + skip };
+            }
+        }
+    }
+
+    /// Packed gate/up Q4_K MMVQ with a register SwiGLU epilogue.
+    #[kernel]
+    pub fn q4k_gate_up_swiglu_multiwarp(
+        gate_w: &[u8],
+        up_w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        out_dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut GATE_SUMS: SharedArray<f32, 4> = SharedArray::UNINIT;
+        static mut UP_SUMS: SharedArray<f32, 4> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let row = thread::blockIdx_x() as usize;
+        if row >= out_dim as usize || warp_id >= 4 {
+            return;
+        }
+        let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
+        let mut gate = 0.0f32;
+        let mut up = 0.0f32;
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let gate_blk = row * row_bytes + block * Q4K_BLOCK_BYTES as usize;
+            let up_blk = gate_blk;
+            let mut half = 0usize;
+            while half < 2 {
+                let j = half * 128 + lane * 4;
+                let xi = block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
+                let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                gate += q4k_q8_chunk(gate_w, gate_blk, j, xp, sx, xs);
+                up += q4k_q8_chunk(up_w, up_blk, j, xp, sx, xs);
+                half += 1;
+            }
+            block += 4;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            gate += warp::shuffle_down_f32(gate, stride);
+            up += warp::shuffle_down_f32(up, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                GATE_SUMS[warp_id] = gate;
+                UP_SUMS[warp_id] = up;
+            }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut gate_total = if lane < 4 {
+                unsafe { GATE_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut up_total = if lane < 4 {
+                unsafe { UP_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut width = 16u32;
+            while width > 0 {
+                gate_total += warp::shuffle_down_f32(gate_total, width);
+                up_total += warp::shuffle_down_f32(up_total, width);
+                width /= 2;
+            }
+            if lane == 0 {
+                let silu = gate_total / (1.0 + (-gate_total).exp());
+                unsafe { *out.get_unchecked_mut(row) = silu * up_total };
             }
         }
     }
@@ -1892,6 +2257,16 @@ pub mod kernels {
         }
     }
 
+    /// In-place residual epilogue used by quantized projections.
+    #[kernel]
+    pub fn add_inplace_f32(residual: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o += residual[i];
+        }
+    }
+
     #[kernel]
     pub fn mul_f32(a: &[f32], b: &[f32], mut out: DisjointSlice<f32>) {
         let idx = thread::index_1d();
@@ -2640,6 +3015,141 @@ pub mod kernels {
                     *out.get_unchecked_mut(out_base + d) *= inv_l;
                 }
                 d += 1;
+            }
+        }
+    }
+
+    /// Decode attention with one cooperative warp per query head.
+    ///
+    /// Lanes split `head_dim`, reduce Q·K cooperatively, and retain up to four
+    /// V accumulators in registers (head dimensions through 128). This replaces
+    /// the old one-thread-per-head decode path on supported model shapes.
+    #[kernel]
+    pub fn attention_paged_warp(
+        q: &[f32],
+        arena: &[u8],
+        block_table: &[u32],
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        seq: u32,
+        scale: f32,
+        layer: u32,
+        n_logical: u32,
+        block_size: u32,
+        block_bytes: u32,
+        tokens_stride: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let lane = thread::threadIdx_x() as usize;
+        let head = thread::blockIdx_x() as u32;
+        if head >= n_heads || lane >= 32 || head_dim > 128 {
+            return;
+        }
+        let hd = head_dim as usize;
+        let n_kv = n_kv_heads.max(1);
+        let kv_group = (n_heads / n_kv).max(1);
+        let kv_h = (head / kv_group) as usize;
+        let stride = tokens_stride as usize;
+        let bs = block_size as usize;
+        let bb = block_bytes as usize;
+        let row_bytes = stride * 2;
+        let v_off0 = bs * row_bytes;
+        let q_base = head as usize * hd;
+
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut running_max = 0.0f32;
+        let mut running_sum = 0.0f32;
+        let mut t = 0usize;
+        while t < seq as usize {
+            let logical = t / bs;
+            let slot = t % bs;
+            let table_idx = layer as usize * n_logical as usize + logical;
+            let phys = unsafe { *block_table.get_unchecked(table_idx) } as usize;
+            let k_base = phys * bb + slot * row_bytes + kv_h * hd * 2;
+            let mut dot = 0.0f32;
+            let mut d = lane;
+            while d < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(k_base + d * 2) as u16
+                        | ((*arena.get_unchecked(k_base + d * 2 + 1) as u16) << 8)
+                };
+                dot += unsafe { *q.get_unchecked(q_base + d) } * f16_to_f32(bits);
+                d += 32;
+            }
+            let mut width = 16u32;
+            while width != 0 {
+                dot += warp::shuffle_down_f32(dot, width);
+                width /= 2;
+            }
+            let score = warp::shuffle_f32(dot, 0) * scale;
+            let (new_max, alpha) = if t == 0 {
+                (score, 0.0)
+            } else if score > running_max {
+                (score, (running_max - score).exp())
+            } else {
+                (running_max, 1.0)
+            };
+            let probability = (score - new_max).exp();
+            running_sum = running_sum * alpha + probability;
+            running_max = new_max;
+            let v_base = phys * bb + v_off0 + slot * row_bytes + kv_h * hd * 2;
+            let d0 = lane;
+            if d0 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d0 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d0 * 2 + 1) as u16) << 8)
+                };
+                a0 = a0 * alpha + probability * f16_to_f32(bits);
+            }
+            let d1 = lane + 32;
+            if d1 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d1 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d1 * 2 + 1) as u16) << 8)
+                };
+                a1 = a1 * alpha + probability * f16_to_f32(bits);
+            }
+            let d2 = lane + 64;
+            if d2 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d2 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d2 * 2 + 1) as u16) << 8)
+                };
+                a2 = a2 * alpha + probability * f16_to_f32(bits);
+            }
+            let d3 = lane + 96;
+            if d3 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d3 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d3 * 2 + 1) as u16) << 8)
+                };
+                a3 = a3 * alpha + probability * f16_to_f32(bits);
+            }
+            t += 1;
+        }
+        let inv_l = 1.0 / running_sum;
+        if lane < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane) = a0 * inv_l;
+            }
+        }
+        if lane + 32 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 32) = a1 * inv_l;
+            }
+        }
+        if lane + 64 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 64) = a2 * inv_l;
+            }
+        }
+        if lane + 96 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 96) = a3 * inv_l;
             }
         }
     }

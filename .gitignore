@@ -5,3 +5,10 @@ Cargo.lock.bak
 .DS_Store
 
 .*
+
+# cuda-oxide / LLVM build artifacts
+*.linked.ll
+*.linked.bc
+*.bc
+*.ptx
+*.cubin

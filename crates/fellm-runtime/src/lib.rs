@@ -2,6 +2,7 @@ pub mod architecture;
 pub mod backend_select;
 pub mod block_diffusion;
 pub mod compiled;
+pub mod cuda_lowering;
 pub mod engine;
 pub mod executor;
 pub mod hybrid_state;

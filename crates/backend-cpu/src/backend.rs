@@ -153,6 +153,12 @@ impl Backend for CpuBackend {
                     Some(DType::F32)
                 )
             ),
+            OpKind::GateUpSwiGlu => matches!(
+                (input_dtypes.first(), input_dtypes.get(1), input_dtypes.get(2)),
+                (Some(gate), Some(up), Some(DType::F32))
+                    if is_supported_matvec_weight_dtype(*gate)
+                        && is_supported_matvec_weight_dtype(*up)
+            ),
             OpKind::Embedding => input_dtypes
                 .first()
                 .map(|d| {
@@ -262,6 +268,7 @@ impl Backend for CpuBackend {
         let op = decode_handle(handle)?;
         match op {
             OpKind::MatMul => launch_matmul(attrs, inputs, outputs),
+            OpKind::GateUpSwiGlu => launch_gate_up_swiglu(inputs, outputs),
             OpKind::Embedding => launch_embedding(inputs, outputs),
             OpKind::RmsNorm => launch_rmsnorm(attrs, inputs, outputs),
             OpKind::Rope => launch_rope(attrs, inputs, outputs),
@@ -312,6 +319,7 @@ fn decode_handle(h: KernelHandle) -> Result<OpKind> {
         x if x == u64::from(OpKind::ShortConv.raw()) => Ok(OpKind::ShortConv),
         x if x == u64::from(OpKind::MoE.raw()) => Ok(OpKind::MoE),
         x if x == u64::from(OpKind::WeightedEmbedding.raw()) => Ok(OpKind::WeightedEmbedding),
+        x if x == u64::from(OpKind::GateUpSwiGlu.raw()) => Ok(OpKind::GateUpSwiGlu),
         _ => Err(FellmError::other(format!("bad kernel handle {h:?}"))),
     }
 }
@@ -397,11 +405,54 @@ fn launch_matmul(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut
         }
         other => return Err(FellmError::UnsupportedDType(other)),
     }
+    if let Some(residual) = inputs.get(2) {
+        let residual = as_f32_slice(residual)?;
+        if residual.len() != y_slice.len() {
+            return Err(FellmError::other(
+                "matmul residual epilogue: shape mismatch",
+            ));
+        }
+        for (value, skip) in y_slice.iter_mut().zip(residual) {
+            *value += *skip;
+        }
+    }
     if attrs.softcap > 0.0 {
         let cap = attrs.softcap;
         for value in y_slice {
             *value = cap * (*value / cap).tanh();
         }
+    }
+    Ok(())
+}
+
+fn launch_gate_up_swiglu(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+    if inputs.len() != 3 || outputs.is_empty() {
+        return Err(FellmError::other("gate_up_swiglu: bad arity"));
+    }
+    let x = as_f32_slice(&inputs[2])?;
+    let out = as_f32_slice_mut(&mut outputs[0])?;
+    let rows = inputs[0].dims_slice()[0] as usize;
+    let cols = inputs[0].dims_slice()[1] as usize;
+    if inputs[1].dims_slice() != inputs[0].dims_slice() || x.len() != cols || out.len() != rows {
+        return Err(FellmError::other("gate_up_swiglu: shape mismatch"));
+    }
+    let mut gate = vec![0.0f32; rows];
+    let project = |weight: &TensorRef, dst: &mut [f32]| -> Result<()> {
+        let dtype = weight
+            .dtype()
+            .ok_or_else(|| FellmError::other("gate_up_swiglu: weight dtype"))?;
+        match dtype {
+            DType::F32 => matmul::matmul_f32_batch(as_f32_slice(weight)?, x, dst, 1, rows, cols),
+            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+                matmul::matvec_quant(as_bytes_slice(weight), dtype, x, dst, rows, cols)
+            }
+            other => Err(FellmError::UnsupportedDType(other)),
+        }
+    };
+    project(&inputs[0], &mut gate)?;
+    project(&inputs[1], out)?;
+    for (value, gate) in out.iter_mut().zip(gate) {
+        *value *= gate / (1.0 + (-gate).exp());
     }
     Ok(())
 }

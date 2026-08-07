@@ -49,6 +49,8 @@ impl OpKind {
     pub const MoE: Self = Self(15);
     /// Softmax-weighted embedding projection used by diffusion self-conditioning.
     pub const WeightedEmbedding: Self = Self(16);
+    /// Packed gate/up quantized projection with SwiGLU epilogue.
+    pub const GateUpSwiGlu: Self = Self(17);
 
     const CUSTOM_TAG: u32 = 0x8000_0000;
 
@@ -85,7 +87,7 @@ impl OpKind {
     /// Reconstruct from the C-ABI `u32` discriminant.
     #[must_use]
     pub fn from_u32(v: u32) -> Option<Self> {
-        if v <= Self::WeightedEmbedding.raw() || v & Self::CUSTOM_TAG != 0 {
+        if v <= Self::GateUpSwiGlu.raw() || v & Self::CUSTOM_TAG != 0 {
             Some(Self(v))
         } else {
             None
@@ -113,6 +115,7 @@ impl OpKind {
             Self::ShortConv => "shortconv",
             Self::MoE => "moe",
             Self::WeightedEmbedding => "weighted_embedding",
+            Self::GateUpSwiGlu => "gate_up_swiglu",
             _ if self.is_custom() => "custom",
             _ => "unknown",
         }
@@ -209,6 +212,7 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(OpKind::from_u32(a.raw()), Some(a));
         assert_eq!(a.name(), "custom");
-        assert!(OpKind::from_u32(17).is_none());
+        assert_eq!(OpKind::from_u32(17), Some(OpKind::GateUpSwiGlu));
+        assert!(OpKind::from_u32(18).is_none());
     }
 }

@@ -5,6 +5,8 @@ use crate::architecture::{
 };
 use crate::backend_select::{BackendPreference, BackendSelect};
 use crate::compiled::CompiledStep;
+#[cfg(feature = "backend-cuda")]
+use crate::cuda_lowering::{LoweredDecodeGraph, compile_cuda_layout, lower_decode_graph};
 use crate::executor::MutableBinding;
 use crate::hybrid_state::HybridConvState;
 use crate::kv_cache::KvCache;
@@ -17,6 +19,8 @@ use fellm_core::storage::{AlignedBuffer, Storage};
 use fellm_core::tensor::Tensor;
 use fellm_gguf::GgufFile;
 use fellm_graph::Graph;
+#[cfg(feature = "backend-cuda")]
+use fellm_graph::graph::OpValue;
 use fellm_graph::plan::ExecutionPlan;
 use fellm_model::{
     ModelSpec, StepBindings, build_step_graph, collect_step_bindings, parse_assistant_output,
@@ -326,6 +330,10 @@ struct LoadedModel {
     bindings: StepBindings,
     /// Compiled step schedule, built once on first step and reused.
     compiled: Option<CompiledStep>,
+    /// Device-native physical plan. This owns stable decode arena/control
+    /// allocations and is the replacement execution path for `CompiledStep`.
+    #[cfg(feature = "backend-cuda")]
+    cuda_decode: Option<CudaDecodePlan>,
     /// Optional full-canvas graph supplied by an architecture plugin.
     canvas_graph: Option<Graph>,
     canvas_plan: Option<ExecutionPlan>,
@@ -334,6 +342,16 @@ struct LoadedModel {
     /// Reused self-conditioning input storage.  Sparse mode is normally only
     /// a few hundred KiB; dense mode remains available as an explicit fallback.
     self_conditioning_buffer: Option<Rc<RefCell<AlignedBuffer>>>,
+}
+
+#[cfg(feature = "backend-cuda")]
+struct CudaDecodePlan {
+    tensors:
+        std::collections::HashMap<fellm_plugin_abi::PlanTensorId, fellm_plugin_abi::DeviceTensor>,
+    _lowered: LoweredDecodeGraph,
+    _physical: fellm_plugin_abi::PhysicalPlan,
+    _device: backend_cuda::DecodeDeviceState,
+    _model: backend_cuda::ModelImage,
 }
 
 impl Engine {
@@ -878,8 +896,18 @@ impl Engine {
     }
 
     /// Insert a completed prompt into the prefix tree.
-    pub fn insert_prefix(&mut self, ids: &[u32], seq_cache: &SequenceCache) {
+    pub fn insert_prefix(&mut self, ids: &[u32], seq_cache: &SequenceCache) -> Result<()> {
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cuda::CudaBackend>()
+            && cuda.plugins_enabled()
+        {
+            cuda.sync_kv_device_to_host(self.model.cache.pool.arena_bytes_mut())?;
+        }
         self.model.cache.prefix.insert_prompt(ids, seq_cache);
+        Ok(())
     }
 
     /// Ensure `pos` is writable in `seq_cache` (alloc / `CoW`).
@@ -894,6 +922,15 @@ impl Engine {
 
     /// Swap a sequence's blocks to secondary RAM.
     pub fn swap_out_sequence(&mut self, seq_cache: &mut SequenceCache) -> Result<()> {
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cuda::CudaBackend>()
+            && cuda.plugins_enabled()
+        {
+            cuda.sync_kv_device_to_host(self.model.cache.pool.arena_bytes_mut())?;
+        }
         let mut buf = vec![0u8; self.model.cache.pool.block_bytes()];
         for layer in 0..seq_cache.n_layers() {
             for &phys in seq_cache.table(layer).blocks() {
@@ -1062,6 +1099,8 @@ impl LoadedModel {
             step_plan,
             bindings,
             compiled: None,
+            #[cfg(feature = "backend-cuda")]
+            cuda_decode: None,
             canvas_graph,
             canvas_plan,
             canvas_bindings,
@@ -1075,6 +1114,50 @@ impl LoadedModel {
     fn compile_step(&mut self, backend: &dyn Backend) -> Result<()> {
         if self.compiled.is_some() {
             return Ok(());
+        }
+        #[cfg(feature = "backend-cuda")]
+        if self.cuda_decode.is_none()
+            && let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>()
+        {
+            let lowered = lower_decode_graph(&self.step_graph, &self.step_plan)?;
+            let physical = compile_cuda_layout(&lowered)?;
+            let blobs = self
+                .step_plan
+                .order
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &id)| match &self.step_graph.node(id).value {
+                    OpValue::Constant(tensor) => Some(backend_cuda::ModelBlob {
+                        tensor: fellm_plugin_abi::PlanTensorId(index as u32),
+                        bytes: tensor.as_bytes(),
+                        alignment: 128,
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let model = backend_cuda::ModelImage::upload(cuda.device_state(), &blobs)?;
+            for blob in &blobs {
+                let (device_ptr, len) = model.resolve(blob.tensor)?;
+                debug_assert_eq!(len, blob.bytes.len());
+                cuda.register_device_tensor(blob.bytes.as_ptr(), blob.bytes.len(), device_ptr)?;
+            }
+            let device =
+                backend_cuda::DecodeDeviceState::new(cuda.device_state(), physical.arena_bytes)?;
+            let tensors = device.arena.resolve(&physical, &lowered.tensors)?;
+            tracing::info!(
+                arena_bytes = physical.arena_bytes,
+                tensor_count = lowered.tensors.len(),
+                macro_ops = physical.operations.len(),
+                model_image_bytes = model.byte_len(),
+                "compiled device-native CUDA decode layout"
+            );
+            self.cuda_decode = Some(CudaDecodePlan {
+                tensors,
+                _lowered: lowered,
+                _physical: physical,
+                _device: device,
+                _model: model,
+            });
         }
         let mut mutable_inputs: std::collections::HashMap<String, MutableBinding> =
             std::collections::HashMap::new();
@@ -1129,6 +1212,24 @@ impl LoadedModel {
         let compiled =
             CompiledStep::compile(&self.step_graph, &self.step_plan, backend, &mutable_inputs)?;
         self.compiled = Some(compiled);
+        #[cfg(feature = "backend-cuda")]
+        if let (Some(cuda), Some(plan), Some(compiled)) = (
+            backend.as_any().downcast_ref::<backend_cuda::CudaBackend>(),
+            self.cuda_decode.as_ref(),
+            self.compiled.as_ref(),
+        ) {
+            let mut bound = std::collections::HashSet::new();
+            for (id, host_ptr, byte_len) in compiled.arena_bindings() {
+                let Some(device_tensor) = plan.tensors.get(&id) else {
+                    continue;
+                };
+                // In-place semantic nodes share one host allocation. Register it once;
+                // all aliases consequently use exactly one stable device address.
+                if bound.insert(host_ptr as usize) {
+                    cuda.register_device_tensor(host_ptr, byte_len, device_tensor.ptr)?;
+                }
+            }
+        }
         if let (Some(graph), Some(plan)) = (&self.canvas_graph, &self.canvas_plan) {
             self.compiled_canvas = Some(CompiledStep::compile(
                 graph,
@@ -1201,11 +1302,25 @@ impl LoadedModel {
             device_arena_len,
         }));
 
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+            let (kv_write_block, kv_write_slot) = self.seq.table(0).locate(pos);
+            cuda.update_step_params(&fellm_plugin_abi::DeviceStepParams {
+                token_id: tok,
+                position: pos as u32,
+                sequence_length: pos.saturating_add(1) as u32,
+                active_batch: 1,
+                kv_write_block,
+                kv_write_slot: kv_write_slot as u32,
+                ..Default::default()
+            })?;
+        }
+
         backend.begin_step();
         let result = self.step_inner(backend, tok, pos, compute_logits);
-        // Plugin D2H of logits already drains the stream; synchronize is a no-op
-        // when plugins are disabled (see CudaBackend::synchronize).
-        let _ = backend.synchronize();
+        // CUDA launches are stream ordered. The LM-head result download is the
+        // only host-visible boundary and synchronizes that transfer itself;
+        // prefill/body-only steps deliberately remain enqueued.
         backend.end_step();
         set_paged_context(None);
         result
@@ -1247,38 +1362,6 @@ impl LoadedModel {
         }
 
         step.bind_input("token_id", scalar_u32_tensor(tok));
-
-        // B3: optionally capture this decode under a CUDA graph (once per past_len
-        // bucket). Replay is not used yet — kernel attrs (token/past_len) change
-        // every step and need cudaGraphExecKernelNodeSetParams (follow-up).
-        #[cfg(feature = "backend-cuda")]
-        if pos > 0 {
-            if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
-                if backend_cuda::CudaBackend::graphs_enabled() {
-                    let max_ctx = self.max_seq as u32;
-                    let mut captured: Option<Tensor> = None;
-                    let capture_result = cuda.ensure_decode_graph(pos_u32, max_ctx, || {
-                        captured = Some(step.run(backend, compute_logits)?);
-                        Ok(())
-                    });
-                    match capture_result {
-                        Ok(true) => {
-                            if let Some(t) = captured {
-                                return Ok(t);
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::debug!(
-                                error = %e,
-                                past_len = pos_u32,
-                                "CUDA graph capture skipped"
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         step.run(backend, compute_logits)
     }
@@ -1461,7 +1544,40 @@ impl Iterator for TokenStream<'_> {
         }
         let logits_tensor = self.pending_logits.take()?;
         let mut logits_owned = logits_tensor;
-        let tok = if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
+        let device_greedy = self.params.temperature <= 0.0
+            && (self.params.repetition_penalty <= 1.0 || self.generated_tokens.is_empty());
+        let device_token = if device_greedy {
+            match tensor_f32_ffi_views(&mut logits_owned).and_then(|(input, _)| {
+                self.engine.backend.sample_device(
+                    input,
+                    &fellm_plugin_abi::OpAttrs {
+                        temperature: self.params.temperature,
+                        top_k: self.params.top_k,
+                        top_p: self.params.top_p,
+                        seed: self.params.seed.wrapping_add(u64::from(self.emitted)),
+                        ..Default::default()
+                    },
+                )
+            }) {
+                Ok(token) => token,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            }
+        } else {
+            None
+        };
+        if device_token.is_none()
+            && let Ok((input, output)) = tensor_f32_ffi_views(&mut logits_owned)
+            && let Err(error) = self.engine.backend.materialize(input, output)
+        {
+            self.finished = true;
+            return Some(Err(error));
+        }
+        let tok = if let Some(token) = device_token {
+            token
+        } else if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
             sampling::sample(
                 work,
                 self.params.temperature,
@@ -1524,6 +1640,31 @@ impl Iterator for TokenStream<'_> {
         }
         Some(Ok(tok))
     }
+}
+
+fn tensor_f32_ffi_views(
+    tensor: &mut Tensor,
+) -> Result<(fellm_plugin_abi::TensorRef, fellm_plugin_abi::TensorMut)> {
+    if tensor.dtype() != DType::F32 {
+        return Err(FellmError::other("device sampling requires f32 logits"));
+    }
+    let dims = tensor.shape().dims().to_vec();
+    let strides = tensor.shape().row_major_strides().as_slice().to_vec();
+    let values = tensor.as_mut_slice::<f32>()?;
+    let ptr = values.as_mut_ptr();
+    let bytes = core::mem::size_of_val(values);
+    Ok(unsafe {
+        (
+            fellm_plugin_abi::TensorRef::from_raw(
+                DType::F32,
+                &dims,
+                &strides,
+                ptr.cast_const().cast(),
+                bytes,
+            ),
+            fellm_plugin_abi::TensorMut::from_raw(DType::F32, &dims, &strides, ptr.cast(), bytes),
+        )
+    })
 }
 
 fn duration_ms(d: Duration) -> f64 {

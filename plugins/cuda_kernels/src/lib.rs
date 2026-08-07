@@ -9,13 +9,13 @@ mod launchers;
 mod oxide_kernels;
 mod tensor;
 
-use cuda_core::CudaContext;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::{
     HostContext, KernelRegistryVtable, PluginManifest, PluginOpRegistration, abi_hash,
 };
 use fellm_plugin_abi::op::OpKind;
-use fellm_plugin_abi::{ABI_VERSION, AbiVersion, PagedKvSnapshot};
+use fellm_plugin_abi::{ABI_VERSION, AbiVersion, DeviceStepParams, PagedKvSnapshot};
 use oxide_kernels::kernels;
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_void};
@@ -60,10 +60,69 @@ pub(crate) fn host_paged_snapshot() -> Option<PagedKvSnapshot> {
 }
 
 static OXIDE_CTX: OnceLock<Arc<CudaContext>> = OnceLock::new();
+static OXIDE_STREAM: OnceLock<Arc<CudaStream>> = OnceLock::new();
+static STEP_PARAMS: Mutex<Option<DeviceBuffer<u8>>> = Mutex::new(None);
 static OXIDE_MODULE: OnceLock<kernels::LoadedModule> = OnceLock::new();
 
 pub(crate) fn oxide_ctx() -> &'static Arc<CudaContext> {
     OXIDE_CTX.get_or_init(|| CudaContext::new(0).expect("cuda_kernels: CudaContext::new(0)"))
+}
+
+/// Non-blocking compute stream owned by the CUDA plan/plugin.
+/// Legacy stream 0 cannot be captured by CUDA Graphs.
+pub(crate) fn oxide_stream() -> &'static Arc<CudaStream> {
+    OXIDE_STREAM.get_or_init(|| {
+        oxide_ctx()
+            .new_stream()
+            .expect("cuda_kernels: create non-blocking compute stream")
+    })
+}
+
+/// Upload the only values permitted to vary between decode graph replays.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_update_step_params(
+    params: *const DeviceStepParams,
+) -> c_int {
+    if params.is_null() {
+        return -1;
+    }
+    let params = unsafe { *params };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(&params).cast::<u8>(),
+            core::mem::size_of::<DeviceStepParams>(),
+        )
+    };
+    let stream = oxide_stream();
+    let mut guard = match STEP_PARAMS.lock() {
+        Ok(guard) => guard,
+        Err(_) => return -30,
+    };
+    let result = if let Some(buffer) = guard.as_mut() {
+        buffer.copy_from_host(stream, bytes)
+    } else {
+        match DeviceBuffer::from_host(stream, bytes) {
+            Ok(buffer) => {
+                *guard = Some(buffer);
+                return 0;
+            }
+            Err(_) => return -3,
+        }
+    };
+    if result.is_ok() { 0 } else { -3 }
+}
+
+/// Register a stable tensor address from the host-owned packed model image.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_register_device_tensor(
+    host_ptr: *const u8,
+    nbytes: usize,
+    device_ptr: u64,
+) -> c_int {
+    match buffers::register_external_weight(host_ptr, nbytes, device_ptr) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
 }
 
 /// Path of this loaded `.so` (oxide embeds PTX in `.oxart` here, not in the host exe).
@@ -197,6 +256,27 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         let q8_0 = DType::Q8_0;
         let u32 = DType::U32;
 
+        if register_one(
+            vt,
+            OpKind::Sample,
+            &[f32],
+            f32,
+            launchers::launch_sample_greedy,
+        ) != 0
+        {
+            return -27;
+        }
+        if register_one(
+            vt,
+            OpKind::Cast,
+            &[f32],
+            f32,
+            launchers::launch_materialize_f32,
+        ) != 0
+        {
+            return -28;
+        }
+
         // RmsNorm: [x f32, w f32] → f32
         if register_one(
             vt,
@@ -247,12 +327,62 @@ pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVta
         if register_one(
             vt,
             OpKind::MatMul,
+            &[q4k, f32, f32],
+            f32,
+            launchers::launch_q4k_matmul,
+        ) != 0
+        {
+            return -29;
+        }
+        if register_one(
+            vt,
+            OpKind::MatMul,
+            &[q6k, f32, f32],
+            f32,
+            launchers::launch_q6k_matmul,
+        ) != 0
+        {
+            return -30;
+        }
+        if register_one(
+            vt,
+            OpKind::GateUpSwiGlu,
+            &[q4k, q4k, f32],
+            f32,
+            launchers::launch_q4k_gate_up_swiglu,
+        ) != 0
+        {
+            return -31;
+        }
+        if register_one(
+            vt,
+            OpKind::GateUpSwiGlu,
+            &[q8_0, q8_0, f32],
+            f32,
+            launchers::launch_q8_0_gate_up_swiglu,
+        ) != 0
+        {
+            return -32;
+        }
+        if register_one(
+            vt,
+            OpKind::MatMul,
             &[q8_0, f32],
             f32,
             launchers::launch_q8_0_matmul,
         ) != 0
         {
             return -16;
+        }
+        if register_one(
+            vt,
+            OpKind::MatMul,
+            &[q8_0, f32, f32],
+            f32,
+            launchers::launch_q8_0_matmul,
+        ) != 0
+        {
+            return -33;
         }
         if register_one(
             vt,

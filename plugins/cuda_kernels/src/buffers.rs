@@ -39,9 +39,45 @@ fn weight_cache() -> &'static Mutex<WeightCache> {
     })
 }
 
+fn external_weights() -> &'static Mutex<HashMap<usize, (u64, usize)>> {
+    static EXTERNAL: OnceLock<Mutex<HashMap<usize, (u64, usize)>>> = OnceLock::new();
+    EXTERNAL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn external_tensor(host_ptr: usize) -> Result<Option<(u64, usize)>, i32> {
+    Ok(external_weights()
+        .lock()
+        .map_err(|_| -30)?
+        .get(&host_ptr)
+        .copied())
+}
+
+/// Bind a host GGUF view to a stable address inside the host-owned model image.
+pub fn register_external_weight(
+    host_ptr: *const u8,
+    len: usize,
+    device_ptr: u64,
+) -> Result<(), i32> {
+    if host_ptr.is_null() || len == 0 || device_ptr == 0 {
+        return Err(-1);
+    }
+    external_weights()
+        .lock()
+        .map_err(|_| -30)?
+        .insert(host_ptr as usize, (device_ptr, len));
+    Ok(())
+}
+
 /// Ensure `host` weights are resident in VRAM; return the cache key (host ptr).
 pub fn ensure_weight(stream: &CudaStream, host: &[u8]) -> Result<usize, i32> {
     let key = host.as_ptr() as usize;
+    if external_weights()
+        .lock()
+        .map_err(|_| -30)?
+        .contains_key(&key)
+    {
+        return Ok(key);
+    }
     let mut guard = weight_cache().lock().map_err(|_| -30)?;
     guard.clock = guard.clock.wrapping_add(1);
     let stamp = guard.clock;
@@ -68,6 +104,22 @@ pub fn ensure_weight(stream: &CudaStream, host: &[u8]) -> Result<usize, i32> {
 
 /// Run `f` with a shared reference to the cached weight buffer.
 pub fn with_weight<R>(key: usize, f: impl FnOnce(&DeviceBuffer<u8>) -> R) -> Result<R, i32> {
+    // Do not let the mutex guard temporary live across `f`. Multi-weight
+    // macro-kernels nest `with_weight` calls and would otherwise self-deadlock.
+    let external = {
+        external_weights()
+            .lock()
+            .map_err(|_| -30)?
+            .get(&key)
+            .copied()
+    };
+    if let Some((ptr, len)) = external {
+        let buffer =
+            unsafe { DeviceBuffer::<u8>::from_raw_parts(ptr, len, crate::oxide_ctx().clone()) };
+        let result = f(&buffer);
+        let _ = buffer.into_raw_parts();
+        return Ok(result);
+    }
     let mut guard = weight_cache().lock().map_err(|_| -30)?;
     guard.clock = guard.clock.wrapping_add(1);
     let stamp = guard.clock;
@@ -95,18 +147,50 @@ fn f32_cache() -> &'static Mutex<HashMap<BufferKey, F32Entry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn f32_versions() -> &'static Mutex<HashMap<BufferKey, u64>> {
+    static VERSIONS: OnceLock<Mutex<HashMap<BufferKey, u64>>> = OnceLock::new();
+    VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bump_f32_version(key: BufferKey) -> Result<(), i32> {
+    let mut versions = f32_versions().lock().map_err(|_| -30)?;
+    let version = versions.entry(key).or_default();
+    *version = version.wrapping_add(1).max(1);
+    Ok(())
+}
+
+/// Content generation of a cached activation.
+pub fn f32_version(key: BufferKey) -> Result<u64, i32> {
+    Ok(*f32_versions()
+        .lock()
+        .map_err(|_| -30)?
+        .entry(key)
+        .or_insert(1))
+}
+
 /// Ensure `host` is resident on device. Reuses allocations; skips H2D when the
 /// cached buffer already matches `len` and is `device_valid` (unless `force_upload`).
-pub fn ensure_f32(
-    stream: &CudaStream,
-    host: &[f32],
-    force_upload: bool,
-) -> Result<BufferKey, i32> {
+pub fn ensure_f32(stream: &CudaStream, host: &[f32], force_upload: bool) -> Result<BufferKey, i32> {
     let len = host.len();
     let key = BufferKey {
         ptr: host.as_ptr() as usize,
         len,
     };
+    if let Some((_, bytes)) = external_tensor(key.ptr)? {
+        if bytes != len * core::mem::size_of::<f32>() {
+            return Err(-2);
+        }
+        if force_upload {
+            let (ptr, _) = external_tensor(key.ptr)?.ok_or(-31)?;
+            let mut buffer = unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(ptr, len, crate::oxide_ctx().clone())
+            };
+            buffer.copy_from_host(stream, host).map_err(|_| -3)?;
+            let _ = buffer.into_raw_parts();
+            bump_f32_version(key)?;
+        }
+        return Ok(key);
+    }
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
     if let Some(e) = guard.get_mut(&key) {
         if e.len == len && !force_upload && e.device_valid {
@@ -119,6 +203,8 @@ pub fn ensure_f32(
             e.buf.copy_from_host(stream, host).map_err(|_| -3)?;
         }
         e.device_valid = true;
+        drop(guard);
+        bump_f32_version(key)?;
         return Ok(key);
     }
     let buf = DeviceBuffer::from_host(stream, host).map_err(|_| -3)?;
@@ -130,6 +216,8 @@ pub fn ensure_f32(
             device_valid: true,
         },
     );
+    drop(guard);
+    bump_f32_version(key)?;
     Ok(key)
 }
 
@@ -159,6 +247,13 @@ pub fn ensure_f32_out(stream: &CudaStream, host: &mut [f32]) -> Result<BufferKey
         ptr: host.as_ptr() as usize,
         len,
     };
+    if let Some((_, bytes)) = external_tensor(key.ptr)? {
+        return if bytes == len * core::mem::size_of::<f32>() {
+            Ok(key)
+        } else {
+            Err(-2)
+        };
+    }
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
     if let Some(e) = guard.get_mut(&key) {
         if e.len != len {
@@ -182,14 +277,80 @@ pub fn ensure_f32_out(stream: &CudaStream, host: &mut [f32]) -> Result<BufferKey
 
 /// Mark the device buffer for `key` as matching host (after a successful kernel write).
 pub fn mark_valid(key: BufferKey) -> Result<(), i32> {
+    if external_tensor(key.ptr)?.is_some() {
+        return bump_f32_version(key);
+    }
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
     let e = guard.get_mut(&key).ok_or(-31)?;
     e.device_valid = true;
+    drop(guard);
+    bump_f32_version(key)?;
     Ok(())
+}
+
+// --- reusable Q8_1 activation transforms -----------------------------------
+
+struct Q8ActivationEntry {
+    quantized: DeviceBuffer<i8>,
+    scales: DeviceBuffer<f32>,
+    source_version: u64,
+}
+
+fn q8_activations() -> &'static Mutex<HashMap<BufferKey, Q8ActivationEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<BufferKey, Q8ActivationEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Quantize an activation at most once per content generation, then reuse it
+/// across packed-projection siblings such as Q/K/V and gate/up.
+pub fn with_q8_activation<R>(
+    stream: &CudaStream,
+    key: BufferKey,
+    len: usize,
+    quantize: impl FnOnce(&mut DeviceBuffer<i8>, &mut DeviceBuffer<f32>) -> Result<(), i32>,
+    use_activation: impl FnOnce(&DeviceBuffer<i8>, &DeviceBuffer<f32>) -> R,
+) -> Result<R, i32> {
+    let version = f32_version(key)?;
+    let mut cache = q8_activations().lock().map_err(|_| -30)?;
+    if !cache.contains_key(&key) {
+        cache.insert(
+            key,
+            Q8ActivationEntry {
+                quantized: DeviceBuffer::<i8>::zeroed(stream, len).map_err(|_| -3)?,
+                scales: DeviceBuffer::<f32>::zeroed(stream, len.div_ceil(32)).map_err(|_| -3)?,
+                source_version: 0,
+            },
+        );
+    }
+    let entry = cache.get_mut(&key).ok_or(-31)?;
+    if entry.quantized.len() != len {
+        entry.quantized = DeviceBuffer::<i8>::zeroed(stream, len).map_err(|_| -3)?;
+        entry.scales = DeviceBuffer::<f32>::zeroed(stream, len.div_ceil(32)).map_err(|_| -3)?;
+        entry.source_version = 0;
+    }
+    if entry.source_version != version {
+        quantize(&mut entry.quantized, &mut entry.scales)?;
+        entry.source_version = version;
+    }
+    Ok(use_activation(&entry.quantized, &entry.scales))
 }
 
 /// Download device buffer to host (keeps host coherent for CPU fallback / sampling).
 pub fn download_to(stream: &CudaStream, key: BufferKey, host: &mut [f32]) -> Result<(), i32> {
+    if let Some((ptr, bytes)) = external_tensor(key.ptr)? {
+        if bytes != host.len() * core::mem::size_of::<f32>() {
+            return Err(-2);
+        }
+        let buffer = unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(ptr, host.len(), crate::oxide_ctx().clone())
+        };
+        let result = buffer.copy_to_host(stream, host).map_err(|error| {
+            eprintln!("cuda_kernels: D2H failed after kernel launch: {error}");
+            -5
+        });
+        let _ = buffer.into_raw_parts();
+        return result;
+    }
     let guard = f32_cache().lock().map_err(|_| -30)?;
     let e = guard.get(&key).ok_or(-31)?;
     if e.buf.len() != host.len() {
@@ -203,6 +364,15 @@ pub fn download_to(stream: &CudaStream, key: BufferKey, host: &mut [f32]) -> Res
 
 /// Take ownership of an f32 cache entry (caller must [`put_f32`] later).
 pub fn take_f32(key: BufferKey) -> Result<(DeviceBuffer<f32>, bool), i32> {
+    if let Some((ptr, bytes)) = external_tensor(key.ptr)? {
+        if bytes != key.len * core::mem::size_of::<f32>() {
+            return Err(-2);
+        }
+        let buffer = unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(ptr, key.len, crate::oxide_ctx().clone())
+        };
+        return Ok((buffer, true));
+    }
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
     let e = guard.remove(&key).ok_or(-31)?;
     Ok((e.buf, e.device_valid))
@@ -210,6 +380,13 @@ pub fn take_f32(key: BufferKey) -> Result<(DeviceBuffer<f32>, bool), i32> {
 
 /// Return an f32 buffer previously taken with [`take_f32`].
 pub fn put_f32(key: BufferKey, buf: DeviceBuffer<f32>, device_valid: bool) -> Result<(), i32> {
+    if external_tensor(key.ptr)?.is_some() {
+        let _ = buf.into_raw_parts();
+        if device_valid {
+            bump_f32_version(key)?;
+        }
+        return Ok(());
+    }
     let len = buf.len();
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
     guard.insert(
@@ -232,11 +409,6 @@ fn f32_scratch() -> &'static Mutex<HashMap<usize, Vec<DeviceBuffer<f32>>>> {
 
 fn u32_scratch() -> &'static Mutex<HashMap<usize, Vec<DeviceBuffer<u32>>>> {
     static POOL: OnceLock<Mutex<HashMap<usize, Vec<DeviceBuffer<u32>>>>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn i8_scratch() -> &'static Mutex<HashMap<usize, Vec<DeviceBuffer<i8>>>> {
-    static POOL: OnceLock<Mutex<HashMap<usize, Vec<DeviceBuffer<i8>>>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -278,29 +450,6 @@ pub fn take_scratch_u32(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<
 
 pub fn put_scratch_u32(buffer: DeviceBuffer<u32>) -> Result<(), i32> {
     u32_scratch()
-        .lock()
-        .map_err(|_| -30)?
-        .entry(buffer.len())
-        .or_default()
-        .push(buffer);
-    Ok(())
-}
-
-pub fn take_scratch_i8(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<i8>, i32> {
-    if let Some(buffer) = i8_scratch()
-        .lock()
-        .map_err(|_| -30)?
-        .entry(len)
-        .or_default()
-        .pop()
-    {
-        return Ok(buffer);
-    }
-    DeviceBuffer::<i8>::zeroed(stream, len).map_err(|_| -3)
-}
-
-pub fn put_scratch_i8(buffer: DeviceBuffer<i8>) -> Result<(), i32> {
-    i8_scratch()
         .lock()
         .map_err(|_| -30)?
         .entry(buffer.len())

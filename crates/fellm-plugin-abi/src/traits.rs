@@ -304,6 +304,22 @@ pub trait Backend: Send + Sync + 'static {
     /// per-step scratch-cache lifetime.
     fn end_step(&self) {}
 
+    /// Sample directly from a device-resident logit tensor when supported.
+    /// Returns `None` when the requested sampling policy needs the host path.
+    fn sample_device(
+        &self,
+        _logits: TensorRef,
+        _attrs: &crate::op::OpAttrs,
+    ) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
+    /// Make a device-resident tensor's host storage coherent on an explicit
+    /// fallback/debug boundary.
+    fn materialize(&self, _tensor: TensorRef, _host: TensorMut) -> Result<()> {
+        Ok(())
+    }
+
     /// Downcast to a concrete backend (CUDA graph / VRAM hooks).
     fn as_any(&self) -> &dyn Any;
 

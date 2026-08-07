@@ -83,6 +83,27 @@ pub struct CompiledStep {
 }
 
 impl CompiledStep {
+    /// Stable host identities used only once while binding the CUDA static arena.
+    /// The hot path uses the corresponding device addresses registered at compile time.
+    #[cfg(feature = "backend-cuda")]
+    pub(crate) fn arena_bindings(&self) -> Vec<(fellm_plugin_abi::PlanTensorId, *const u8, usize)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match &node.kind {
+                SlotKind::Buffer(buffer) => {
+                    let borrow = buffer.borrow();
+                    Some((
+                        fellm_plugin_abi::PlanTensorId(index as u32),
+                        borrow.as_slice().as_ptr(),
+                        borrow.len(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Compile a step schedule from a fixed graph + plan + backend.
     ///
     /// `mutable_inputs` supplies the stable shared buffers for KV / conv slots;
@@ -383,6 +404,11 @@ impl CompiledStep {
 
             let attrs = self.attr_patches.get(&i).copied().unwrap_or(rt.attrs);
             let out_mut = self.tensor_mut(i)?;
+            // Profiling must bracket completed GPU work. Merely timing the host
+            // launch attributes all queued work to the eventual D2H boundary.
+            if profile_ops {
+                backend.synchronize()?;
+            }
             let started = profile_ops.then(Instant::now);
 
             if rt.op == OpKind::ShortConv {
@@ -422,6 +448,7 @@ impl CompiledStep {
                     })?;
             }
             if let Some(started) = started {
+                backend.synchronize()?;
                 let shape = node
                     .dims
                     .iter()

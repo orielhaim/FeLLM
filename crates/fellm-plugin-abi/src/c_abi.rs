@@ -115,7 +115,7 @@ impl PluginManifest {
 pub const fn abi_hash() -> u64 {
     // FNV-1a 64-bit over "fellm-abi-{major}.{minor}.{patch}"
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = b"fellm-abi-0.4.0";
+    let bytes = b"fellm-abi-0.6.0";
     let mut i = 0;
     while i < bytes.len() {
         hash ^= bytes[i] as u64;
@@ -231,6 +231,12 @@ pub type PluginShutdownFn = unsafe extern "C" fn();
 ///
 /// `ptr` is the host `*const f32`; `nbytes` is the byte length of the slice.
 pub type PluginInvalidateF32Fn = unsafe extern "C" fn(ptr: *const f32, nbytes: usize);
+/// Optional device-plan entry: update the one device-resident step parameter block.
+pub type PluginUpdateStepParamsFn =
+    unsafe extern "C" fn(params: *const crate::DeviceStepParams) -> c_int;
+/// Optional device-plan entry: bind a host constant to a packed device address.
+pub type PluginRegisterDeviceTensorFn =
+    unsafe extern "C" fn(host_ptr: *const u8, nbytes: usize, device_ptr: u64) -> c_int;
 
 /// Symbol names resolved by the host loader.
 pub mod symbols {
@@ -248,4 +254,8 @@ pub mod symbols {
     pub const SHUTDOWN: &[u8] = b"_fellm_plugin_shutdown\0";
     /// `_fellm_plugin_invalidate_f32` (optional)
     pub const INVALIDATE_F32: &[u8] = b"_fellm_plugin_invalidate_f32\0";
+    /// `_fellm_plugin_update_step_params` (optional)
+    pub const UPDATE_STEP_PARAMS: &[u8] = b"_fellm_plugin_update_step_params\0";
+    /// `_fellm_plugin_register_device_tensor` (optional)
+    pub const REGISTER_DEVICE_TENSOR: &[u8] = b"_fellm_plugin_register_device_tensor\0";
 }

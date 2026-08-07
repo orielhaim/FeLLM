@@ -253,6 +253,11 @@ impl PhysicalPool {
         self.arena.as_slice()
     }
 
+    /// Mutable arena bytes for explicit device snapshots (prefix/swap/debug).
+    pub fn arena_bytes_mut(&mut self) -> &mut [u8] {
+        self.arena.as_mut_slice()
+    }
+
     /// Mutable pointer to the arena base (for paged kernel context).
     #[must_use]
     pub fn arena_ptr_mut(&mut self) -> (*mut u8, usize) {

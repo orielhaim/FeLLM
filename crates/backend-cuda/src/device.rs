@@ -63,7 +63,7 @@ impl CudaDeviceState {
     pub fn device_handle(&self) -> DeviceHandle {
         #[cfg(feature = "cuda")]
         {
-            Arc::as_ptr(&self.context) as DeviceHandle
+            self.context.cu_ctx() as usize as DeviceHandle
         }
         #[cfg(not(feature = "cuda"))]
         {

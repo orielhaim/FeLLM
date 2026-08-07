@@ -1,7 +1,6 @@
 //! [`CudaBackend`]: prefers CUDA plugins, falls back to [`CpuBackend`] per op.
 
 use crate::device::CudaDeviceState;
-use crate::graph::{GraphBucket, GraphCache};
 use crate::pinned_swap::PinnedSwapArena;
 use crate::vram_pool::DeviceKvArena;
 use backend_cpu::CpuBackend;
@@ -72,8 +71,6 @@ pub struct CudaBackend {
     kv_arena: Mutex<Option<DeviceKvArena>>,
     /// Optional pinned swap.
     swap: Mutex<Option<PinnedSwapArena>>,
-    /// Bucketed CUDA graphs for decode.
-    graphs: Mutex<GraphCache>,
     caps: BackendCaps,
     /// Whether oxide plugin kernels are used (default on when registry non-empty).
     use_plugins: bool,
@@ -86,6 +83,27 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// Update the fixed device control block before enqueueing one decode step.
+    pub fn update_step_params(&self, params: &fellm_plugin_abi::DeviceStepParams) -> Result<()> {
+        self.plugins.update_step_params(params)
+    }
+
+    /// Register one immutable tensor already resident in the packed model image.
+    pub fn register_device_tensor(
+        &self,
+        host_ptr: *const u8,
+        nbytes: usize,
+        device_ptr: fellm_plugin_abi::DevicePtr,
+    ) -> Result<()> {
+        self.plugins
+            .register_device_tensor(host_ptr, nbytes, device_ptr.0)
+    }
+    /// Device/context owner used while creating backend physical plans.
+    #[must_use]
+    pub fn device_state(&self) -> &CudaDeviceState {
+        &self.device
+    }
+
     /// Initialize GPU 0 and load plugins from `plugins/` (or `FELLM_PLUGIN_DIR`).
     pub fn new() -> Result<Self> {
         Self::with_ordinal(0)
@@ -141,7 +159,6 @@ impl CudaBackend {
             cpu,
             kv_arena: Mutex::new(None),
             swap: Mutex::new(None),
-            graphs: Mutex::new(GraphCache::new()),
             caps,
             use_plugins,
             kv_host_dirty: AtomicBool::new(false),
@@ -308,73 +325,6 @@ impl CudaBackend {
         }
     }
 
-    /// Graph cache (inference thread only).
-    pub fn graphs(&self) -> &Mutex<GraphCache> {
-        &self.graphs
-    }
-
-    /// Whether `FELLM_CUDA_GRAPHS=1` is set.
-    #[must_use]
-    pub fn graphs_enabled() -> bool {
-        std::env::var_os("FELLM_CUDA_GRAPHS")
-            .is_some_and(|v| v != "0" && v != "false" && v != "off")
-    }
-
-    /// Capture a decode graph for `bucket` by running `body` under stream capture.
-    #[cfg(feature = "cuda")]
-    pub fn capture_decode_graph<F>(&self, bucket: GraphBucket, body: F) -> Result<()>
-    where
-        F: FnOnce() -> Result<()>,
-    {
-        let mut graphs = self.graphs.lock().expect("graphs lock");
-        graphs.capture(&self.device, bucket, body)
-    }
-
-    /// Capture decode for the bucket containing `past_len` if not already present.
-    pub fn ensure_decode_graph<F>(&self, past_len: u32, max_ctx: u32, body: F) -> Result<bool>
-    where
-        F: FnOnce() -> Result<()>,
-    {
-        if !Self::graphs_enabled() {
-            return Ok(false);
-        }
-        let bucket = GraphBucket::buckets_for_ctx(max_ctx)
-            .into_iter()
-            .find(|b| b.contains(past_len))
-            .ok_or_else(|| FellmError::other("no graph bucket for past_len"))?;
-        {
-            let graphs = self.graphs.lock().expect("graphs lock");
-            if graphs.has(past_len) {
-                return Ok(false);
-            }
-        }
-        #[cfg(feature = "cuda")]
-        {
-            self.capture_decode_graph(bucket, body)?;
-            tracing::info!(
-                past_len,
-                min = bucket.min_past,
-                max = bucket.max_past,
-                "captured CUDA decode graph"
-            );
-            return Ok(true);
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = (bucket, body);
-            Ok(false)
-        }
-    }
-
-    /// Launch a previously captured graph for `past_len`, if one exists.
-    pub fn try_launch_graph(&self, past_len: u32) -> Result<bool> {
-        if !Self::graphs_enabled() {
-            return Ok(false);
-        }
-        let graphs = self.graphs.lock().expect("graphs lock");
-        graphs.launch(past_len)
-    }
-
     /// Plugin host.
     #[must_use]
     pub fn plugins(&self) -> &PluginHost {
@@ -416,6 +366,44 @@ impl Backend for CudaBackend {
 
     fn end_step(&self) {
         self.cpu.end_step();
+    }
+
+    fn sample_device(&self, logits: TensorRef, attrs: &OpAttrs) -> Result<Option<u32>> {
+        let Some(descriptor) = self.resolve_kernel(OpKind::Sample, &[DType::F32], DType::F32)
+        else {
+            return Ok(None);
+        };
+        let mut token = [0.0f32];
+        let mut output = unsafe {
+            TensorMut::from_raw(
+                DType::F32,
+                &[1],
+                &[1],
+                token.as_mut_ptr().cast(),
+                core::mem::size_of::<f32>(),
+            )
+        };
+        self.launch(
+            descriptor.handle,
+            attrs,
+            &[logits],
+            std::slice::from_mut(&mut output),
+            self.device.stream_handle(),
+        )?;
+        Ok(Some(token[0] as u32))
+    }
+
+    fn materialize(&self, tensor: TensorRef, mut host: TensorMut) -> Result<()> {
+        let descriptor = self
+            .resolve_kernel(OpKind::Cast, &[DType::F32], DType::F32)
+            .ok_or_else(|| FellmError::other("CUDA f32 materialization kernel is unavailable"))?;
+        self.launch(
+            descriptor.handle,
+            &OpAttrs::default(),
+            &[tensor],
+            std::slice::from_mut(&mut host),
+            self.device.stream_handle(),
+        )
     }
 
     fn resolve_kernel(

@@ -619,19 +619,26 @@ fn build_layer(
         format!("blk.{i}.attn_norm_op"),
     );
 
+    let mix_is_fused = matches!(layer.mix, MixKind::Attention { .. });
     let mix = match layer.mix {
         MixKind::ShortConv => build_shortconv(gb, gguf, spec, layer, x_norm)?,
-        MixKind::Attention { .. } => build_attention(gb, gguf, spec, layer, x_norm, inv_freqs)?,
+        MixKind::Attention { .. } => {
+            build_attention(gb, gguf, spec, layer, x_norm, inv_freqs, x_in)?
+        }
     };
 
-    let x_after_mix = gb.op(
-        OpKind::Add,
-        OpAttrs::default(),
-        DType::F32,
-        Shape::new(&[d_model as u64])?,
-        &[x_in, mix],
-        format!("blk.{i}.residual1"),
-    );
+    let x_after_mix = if mix_is_fused {
+        mix
+    } else {
+        gb.op(
+            OpKind::Add,
+            OpAttrs::default(),
+            DType::F32,
+            Shape::new(&[d_model as u64])?,
+            &[x_in, mix],
+            format!("blk.{i}.residual1"),
+        )
+    };
 
     let ffn_x_norm = gb.op(
         OpKind::RmsNorm,
@@ -644,17 +651,20 @@ fn build_layer(
 
     let ffn_out = match layer.ffn {
         FfnKind::MoE => build_moe(gb, gguf, spec, layer, ffn_x_norm)?,
-        FfnKind::Dense => build_dense_ffn(gb, gguf, spec, layer, ffn_x_norm)?,
+        FfnKind::Dense => build_dense_ffn(gb, gguf, spec, layer, ffn_x_norm, x_after_mix)?,
     };
-
-    Ok(gb.op(
-        OpKind::Add,
-        OpAttrs::default(),
-        DType::F32,
-        Shape::new(&[d_model as u64])?,
-        &[x_after_mix, ffn_out],
-        format!("blk.{i}.residual2"),
-    ))
+    if matches!(layer.ffn, FfnKind::Dense) {
+        Ok(ffn_out)
+    } else {
+        Ok(gb.op(
+            OpKind::Add,
+            OpAttrs::default(),
+            DType::F32,
+            Shape::new(&[d_model as u64])?,
+            &[x_after_mix, ffn_out],
+            format!("blk.{i}.residual2"),
+        ))
+    }
 }
 
 fn build_shortconv(
@@ -706,6 +716,7 @@ fn build_attention(
     layer: &crate::probe::LayerSpec,
     x_norm: NodeId,
     inv_freqs: NodeId,
+    residual: NodeId,
 ) -> Result<NodeId> {
     let MixKind::Attention {
         n_kv_heads: n_kv,
@@ -901,8 +912,8 @@ fn build_attention(
         OpAttrs::default(),
         DType::F32,
         Shape::new(&[d_model as u64])?,
-        &[wo, attn_out],
-        format!("blk.{i}.o_proj"),
+        &[wo, attn_out, residual],
+        format!("blk.{i}.o_proj_residual"),
     ))
 }
 
@@ -912,6 +923,7 @@ fn build_dense_ffn(
     spec: &ModelSpec,
     layer: &crate::probe::LayerSpec,
     x: NodeId,
+    residual: NodeId,
 ) -> Result<NodeId> {
     let i = layer.index;
     let d_model = spec.d_model;
@@ -928,37 +940,21 @@ fn build_dense_ffn(
         format!("blk.{i}.ffn_down"),
         gguf.tensor(&format!("blk.{i}.ffn_down.weight"))?,
     );
-    let gate = gb.op(
-        OpKind::MatMul,
-        OpAttrs::default(),
-        DType::F32,
-        Shape::new(&[d_ff as u64])?,
-        &[w_gate, x],
-        format!("blk.{i}.ffn_gate_proj"),
-    );
-    let up = gb.op(
-        OpKind::MatMul,
-        OpAttrs::default(),
-        DType::F32,
-        Shape::new(&[d_ff as u64])?,
-        &[w_up, x],
-        format!("blk.{i}.ffn_up_proj"),
-    );
     let gated = gb.op(
-        OpKind::SiluGate,
+        OpKind::GateUpSwiGlu,
         OpAttrs::default(),
         DType::F32,
         Shape::new(&[d_ff as u64])?,
-        &[gate, up],
-        format!("blk.{i}.swiglu"),
+        &[w_gate, w_up, x],
+        format!("blk.{i}.gate_up_swiglu"),
     );
     Ok(gb.op(
         OpKind::MatMul,
         OpAttrs::default(),
         DType::F32,
         Shape::new(&[d_model as u64])?,
-        &[w_down, gated],
-        format!("blk.{i}.ffn_down_proj"),
+        &[w_down, gated, residual],
+        format!("blk.{i}.ffn_down_residual"),
     ))
 }
 

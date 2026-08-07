@@ -295,7 +295,7 @@ impl Scheduler {
                 seq.pending_logits = Some(logits);
                 seq.prompt_tokens = seq.prompt_ids.len() as u32;
                 // Insert prefix into radix tree for sharing.
-                engine.insert_prefix(&seq.prompt_ids, &seq.seq_cache);
+                engine.insert_prefix(&seq.prompt_ids, &seq.seq_cache)?;
             }
             return Ok(None);
         }
