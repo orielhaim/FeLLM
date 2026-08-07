@@ -131,6 +131,11 @@ impl CudaBackend {
         }
         let cpu = CpuBackend::new();
         let mode = CudaExecutionMode::from_env()?;
+        // Capability flags from compute capability — never product names.
+        let (cc_major, cc_minor) = device.compute_capability();
+        let has_ampere_ada = cc_major >= 8 && cc_major < 9;
+        let has_hopper = cc_major >= 9 && cc_major < 10;
+        let has_blackwell = cc_major >= 10;
         let caps = BackendCaps {
             device_kind: DeviceKind::Gpu,
             supports_persistent_device_state: true,
@@ -143,6 +148,12 @@ impl CudaBackend {
             supports_bidirectional_attention: plugin_ops_supports(&plugins, OpKind::Attention),
             supports_batched_quantized_gemm: plugin_ops_supports(&plugins, OpKind::MatMul),
             supports_custom_operations: true,
+            compute_major: cc_major,
+            compute_minor: cc_minor,
+            smem_per_sm: device.smem_per_sm(),
+            has_ampere_ada_features: has_ampere_ada || has_hopper || has_blackwell,
+            has_hopper_features: has_hopper || has_blackwell,
+            has_blackwell_features: has_blackwell,
             ..BackendCaps::default()
         };
         let plugin_ops = plugins.registry().len();

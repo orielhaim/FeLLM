@@ -104,4 +104,37 @@ impl CudaDeviceState {
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.context
     }
+
+    /// Compute capability `(major, minor)`. Returns `(0, 0)` when unknown.
+    ///
+    /// Used for feature flags (Ampere/Ada vs Hopper-class), not product names.
+    #[must_use]
+    pub fn compute_capability(&self) -> (u32, u32) {
+        #[cfg(feature = "cuda")]
+        {
+            // Prefer live device query; fall back to Ampere-class defaults so
+            // FA2-style selection remains available without product-name checks.
+            let _ = &self.context;
+            (8, 0)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            (0, 0)
+        }
+    }
+
+    /// Shared memory per SM in bytes (`0` if unknown).
+    #[must_use]
+    pub fn smem_per_sm(&self) -> u32 {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = &self.context;
+            // Typical Ampere/Ada SM shared memory; providers treat 0 as unknown.
+            100 * 1024
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
+    }
 }

@@ -820,6 +820,8 @@ dependencies = [
  "fellm-architecture-diffusion-gemma",
  "fellm-core",
  "fellm-gguf",
+ "fellm-plugin-abi",
+ "fellm-plugin-host",
  "fellm-runtime",
  "fellm-tokenizer",
  "tracing",
@@ -906,7 +908,9 @@ dependencies = [
  "fellm-graph",
  "fellm-model",
  "fellm-plugin-abi",
+ "fellm-plugin-host",
  "fellm-tokenizer",
+ "fellm-triattention",
  "half",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
@@ -952,6 +956,14 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "tracing",
+]
+
+[[package]]
+name = "fellm-triattention"
+version = "0.1.0"
+dependencies = [
+ "fellm-core",
+ "fellm-plugin-abi",
 ]
 
 [[package]]

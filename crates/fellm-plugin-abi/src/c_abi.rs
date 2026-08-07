@@ -115,7 +115,7 @@ impl PluginManifest {
 pub const fn abi_hash() -> u64 {
     // FNV-1a 64-bit over "fellm-abi-{major}.{minor}.{patch}"
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = b"fellm-abi-0.6.0";
+    let bytes = b"fellm-abi-0.7.0";
     let mut i = 0;
     while i < bytes.len() {
         hash ^= bytes[i] as u64;
@@ -225,6 +225,9 @@ pub type PluginRegisterFn = unsafe extern "C" fn(registry: *mut KernelRegistryVt
 /// complete providers using the exact current contract.
 pub type PluginRegisterArchitecturesFn =
     unsafe extern "C" fn(registry: *mut ArchitectureRegistryVtable) -> c_int;
+/// Optional multi-capability registration (attention, KV policy, etc.).
+pub type PluginRegisterCapabilitiesFn =
+    unsafe extern "C" fn(registry: *mut CapabilityRegistryVtable) -> c_int;
 /// Required plugin entry: tear down plugin state.
 pub type PluginShutdownFn = unsafe extern "C" fn();
 /// Optional: invalidate a host f32 buffer's device mirror after a CPU write.
@@ -238,6 +241,97 @@ pub type PluginUpdateStepParamsFn =
 pub type PluginRegisterDeviceTensorFn =
     unsafe extern "C" fn(host_ptr: *const u8, nbytes: usize, device_ptr: u64) -> c_int;
 
+/// Maximum free-form features listed in a C capability registration.
+pub const PLUGIN_MAX_FEATURES: usize = 32;
+/// Maximum metadata key/value pairs in a C capability registration.
+pub const PLUGIN_MAX_META: usize = 8;
+/// Maximum length of a metadata key or value including NUL.
+pub const PLUGIN_META_VALUE_MAX: usize = 64;
+
+/// One capability/provider registration filled during
+/// `_fellm_plugin_register_capabilities`.
+///
+/// The host reconstructs a Rust [`crate::ProviderDescriptor`] from this POD
+/// record. Feature ids are [`crate::FeatureId`] raw values.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PluginCapabilityRegistration {
+    /// NUL-terminated provider name (e.g. `kv.triattention`).
+    pub name: [c_char; PLUGIN_NAME_MAX],
+    /// [`crate::CapabilityKind`] as `u16`.
+    pub capability: u16,
+    /// Provider semver major.
+    pub version_major: u16,
+    /// Provider semver minor.
+    pub version_minor: u16,
+    /// Provider semver patch.
+    pub version_patch: u16,
+    /// Auto-selection priority.
+    pub priority: i32,
+    /// Number of valid `provides` entries.
+    pub n_provides: u32,
+    /// Feature ids this provider supplies.
+    pub provides: [u32; PLUGIN_MAX_FEATURES],
+    /// Number of valid `requires` entries.
+    pub n_requires: u32,
+    /// Feature ids this provider requires.
+    pub requires: [u32; PLUGIN_MAX_FEATURES],
+    /// Number of metadata pairs.
+    pub n_meta: u32,
+    /// Metadata keys (NUL-terminated).
+    pub meta_keys: [[c_char; PLUGIN_META_VALUE_MAX]; PLUGIN_MAX_META],
+    /// Metadata values (NUL-terminated).
+    pub meta_values: [[c_char; PLUGIN_META_VALUE_MAX]; PLUGIN_MAX_META],
+    /// Optional summary (NUL-terminated, truncated).
+    pub summary: [c_char; PLUGIN_META_VALUE_MAX],
+}
+
+impl PluginCapabilityRegistration {
+    /// Zeroed registration record.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            name: [0; PLUGIN_NAME_MAX],
+            capability: 0,
+            version_major: 0,
+            version_minor: 0,
+            version_patch: 0,
+            priority: 0,
+            n_provides: 0,
+            provides: [0; PLUGIN_MAX_FEATURES],
+            n_requires: 0,
+            requires: [0; PLUGIN_MAX_FEATURES],
+            n_meta: 0,
+            meta_keys: [[0; PLUGIN_META_VALUE_MAX]; PLUGIN_MAX_META],
+            meta_values: [[0; PLUGIN_META_VALUE_MAX]; PLUGIN_MAX_META],
+            summary: [0; PLUGIN_META_VALUE_MAX],
+        }
+    }
+
+    /// Write a NUL-terminated string into a fixed `c_char` buffer.
+    pub fn write_cstr(buf: &mut [c_char], s: &str) {
+        let max = buf.len().saturating_sub(1);
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        for (dst, src) in buf.iter_mut().zip(s.bytes()).take(max) {
+            *dst = src as c_char;
+        }
+    }
+}
+
+/// Vtable for multi-capability registration.
+#[repr(C)]
+pub struct CapabilityRegistryVtable {
+    /// Opaque host registry pointer.
+    pub registry: *mut c_void,
+    /// Register one capability provider descriptor. Returns `0` on success.
+    pub register_capability: unsafe extern "C" fn(
+        registry: *mut c_void,
+        registration: *const PluginCapabilityRegistration,
+    ) -> c_int,
+}
+
 /// Symbol names resolved by the host loader.
 pub mod symbols {
     /// `_fellm_plugin_abi_version`
@@ -248,6 +342,8 @@ pub mod symbols {
     pub const INIT: &[u8] = b"_fellm_plugin_init\0";
     /// `_fellm_plugin_register`
     pub const REGISTER: &[u8] = b"_fellm_plugin_register\0";
+    /// `_fellm_plugin_register_capabilities`
+    pub const REGISTER_CAPABILITIES: &[u8] = b"_fellm_plugin_register_capabilities\0";
     /// `_fellm_plugin_register_architectures` (optional for kernel-only plugins)
     pub const REGISTER_ARCHITECTURES: &[u8] = b"_fellm_plugin_register_architectures\0";
     /// `_fellm_plugin_shutdown`

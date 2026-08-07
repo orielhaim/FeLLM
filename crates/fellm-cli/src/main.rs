@@ -3,13 +3,16 @@
 use clap::{Parser, Subcommand};
 use fellm_architecture_diffusion_gemma::DiffusionGemmaPlugin;
 use fellm_gguf::GgufFile;
+use fellm_plugin_abi::c_abi::HostContext;
+use fellm_plugin_abi::capability::{CapabilityKind, PluginConfig, ProviderSelection};
+use fellm_plugin_host::PluginHost;
 use fellm_runtime::{BackendPreference, BackendSelect, Engine, EngineSettings, GenParams};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "fellm", version, about = "FeLLM inference engine (Phase 1)")]
+#[command(name = "fellm", version, about = "FeLLM inference engine")]
 struct Cli {
     #[arg(long, default_value = "info", global = true)]
     log: String,
@@ -20,8 +23,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Run generation on a GGUF model.
     Run(RunArgs),
+    /// Inspect GGUF metadata and tensors.
     Inspect(InspectArgs),
+    /// Discover and inspect dynamically loaded plugins / providers.
+    Plugins(PluginsCmd),
 }
 
 #[derive(clap::Args, Debug)]
@@ -60,24 +67,34 @@ struct RunArgs {
     /// Pass `0` to use the model's GGUF-reported maximum context length.
     #[arg(long = "ctx-size", short = 'c', default_value_t = 8192)]
     ctx_size: usize,
-    /// Evaluation batch size (`n_batch`): max prompt tokens to schedule during
-    /// prompt processing. Larger may improve performance but uses more memory.
+    /// Evaluation batch size (`n_batch`).
     #[arg(long = "batch-size", short = 'b', default_value_t = 2048)]
     batch_size: usize,
-    /// Physical batch size (`n_ubatch`): max prompt tokens processed in one
-    /// compute chunk. Larger may improve performance but uses more memory.
+    /// Physical batch size (`n_ubatch`).
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: usize,
     /// Optional max sequence length override (alias of `--ctx-size`).
     #[arg(long, hide = true)]
     max_seq: Option<usize>,
-    /// Compute backend: `auto` (default), `cpu`, or `cuda`.
-    /// Also set via `FELLM_BACKEND`. CUDA requires a binary built with
-    /// `--features backend-cuda` (WSL).
+    /// Compute backend provider preference: `auto`, `cpu`, or `cuda`.
+    /// Also set via `FELLM_BACKEND`.
     #[arg(long, default_value = "auto")]
     backend: String,
+    /// Explicit attention provider name (e.g. `attention.host_tiled`).
+    /// Fails if missing or unsupported — never silently substitutes.
+    #[arg(long)]
+    attention: Option<String>,
+    /// Explicit sequence-state / KV policy provider (e.g. `kv.full`, `kv.triattention`).
+    #[arg(long = "kv-policy")]
+    kv_policy: Option<String>,
+    /// Plugin-specific configuration as `key=value` or `provider.key=value`.
+    /// Repeatable. Validated before inference.
+    #[arg(long = "plugin-config", value_name = "KEY=VALUE")]
+    plugin_config: Vec<String>,
+    /// Directory of dynamic plugins (default: `plugins/` or `FELLM_PLUGIN_DIR`).
+    #[arg(long = "plugin-dir")]
+    plugin_dir: Option<PathBuf>,
     /// Disable CPU fallback when CUDA is requested/auto but unavailable.
-    /// Also set via `FELLM_CPU_FALLBACK=0`.
     #[arg(long, default_value_t = false)]
     no_cpu_fallback: bool,
 }
@@ -89,6 +106,33 @@ struct InspectArgs {
     model: PathBuf,
 }
 
+#[derive(clap::Args, Debug)]
+struct PluginsCmd {
+    #[command(subcommand)]
+    action: PluginsAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum PluginsAction {
+    /// List discovered plugins and capability providers.
+    List {
+        /// Optional plugin directory.
+        #[arg(long = "plugin-dir")]
+        plugin_dir: Option<PathBuf>,
+        /// Filter by capability (`attention`, `sequence_state_policy`, …).
+        #[arg(long)]
+        capability: Option<String>,
+    },
+    /// Inspect one provider by name.
+    Inspect {
+        /// Provider name (e.g. `attention.host_tiled`, `kv.triattention`).
+        name: String,
+        /// Optional plugin directory.
+        #[arg(long = "plugin-dir")]
+        plugin_dir: Option<PathBuf>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     init_tracing(&cli.log);
@@ -96,6 +140,7 @@ fn main() {
     let result = match cli.cmd {
         Cmd::Run(a) => run(a),
         Cmd::Inspect(a) => inspect(a),
+        Cmd::Plugins(p) => plugins_cmd(p),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -121,13 +166,34 @@ fn init_tracing(filter: &str) {
     fmt().with_env_filter(filter).with_target(false).init();
 }
 
+fn build_selection(args: &RunArgs) -> fellm_core::error::Result<ProviderSelection> {
+    let mut sel = ProviderSelection::new();
+    if let Some(a) = &args.attention {
+        sel.attention = Some(a.clone());
+    }
+    if let Some(k) = &args.kv_policy {
+        sel.kv_policy = Some(k.clone());
+    }
+    if !args.plugin_config.is_empty() {
+        sel.config = PluginConfig::from_pairs(&args.plugin_config)
+            .map_err(|e| fellm_core::error::FellmError::other(e))?;
+    }
+    Ok(sel)
+}
+
 fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     let preference = BackendPreference::parse(&args.backend)?;
     let select = BackendSelect::new(preference, !args.no_cpu_fallback);
+    let providers = build_selection(&args)?;
     let mut settings = EngineSettings::default()
         .batch_size(args.batch_size)
         .ubatch_size(args.ubatch_size)
-        .backend_select(select);
+        .backend_select(select)
+        .providers(providers);
+
+    if let Some(dir) = &args.plugin_dir {
+        settings = settings.plugin_dir(dir.clone());
+    }
 
     let ctx = args.max_seq.unwrap_or(args.ctx_size);
     settings = if ctx == 0 {
@@ -141,6 +207,14 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
         settings,
         Some(Arc::new(DiffusionGemmaPlugin)),
     )?;
+
+    if let Some(prep) = engine.providers().prepared() {
+        eprintln!(
+            "providers: attention={} (id={}) kv-policy={} (id={})",
+            prep.attention_name, prep.attention_id.0, prep.kv_policy_name, prep.kv_policy_id.0
+        );
+    }
+
     let params = GenParams {
         max_tokens: args.max_tokens,
         temperature: args.temperature,
@@ -152,7 +226,6 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
 
     let use_chat = !args.completion && engine.tokenizer().chat_template().is_some();
 
-    // Echo the user-visible prompt (not the templated internals).
     print!("{}", args.prompt);
     std::io::stdout().flush().ok();
 
@@ -178,7 +251,6 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     let mut byte_buf: Vec<u8> = Vec::new();
     while let Some(tok_result) = stream.next() {
         let tok = tok_result?;
-        // Stop tokens decode to empty; skip echoing them.
         if stop_ids.contains(&tok) {
             continue;
         }
@@ -253,4 +325,89 @@ fn inspect(args: InspectArgs) -> fellm_core::error::Result<()> {
         );
     }
     Ok(())
+}
+
+fn open_plugin_host(dir: Option<&PathBuf>) -> fellm_core::error::Result<PluginHost> {
+    let mut host = PluginHost::new();
+    let ctx = HostContext::new(0, 0, std::ptr::null_mut(), "cpu");
+    host.load_dir(dir.map(PathBuf::as_path), &ctx)?;
+    Ok(host)
+}
+
+fn plugins_cmd(cmd: PluginsCmd) -> fellm_core::error::Result<()> {
+    match cmd.action {
+        PluginsAction::List {
+            plugin_dir,
+            capability,
+        } => {
+            let host = open_plugin_host(plugin_dir.as_ref())?;
+            let cap_filter = capability
+                .as_deref()
+                .map(|s| {
+                    CapabilityKind::parse(s).ok_or_else(|| {
+                        fellm_core::error::FellmError::other(format!(
+                            "unknown capability '{s}' (try attention, sequence_state_policy, backend, …)"
+                        ))
+                    })
+                })
+                .transpose()?;
+
+            println!("loaded dynamic libraries: {}", host.plugin_count());
+            for p in host.plugin_paths() {
+                println!("  lib: {}", p.display());
+            }
+            println!();
+            println!(
+                "{:<32} {:<22} {:<10} {:>8}  {}",
+                "NAME", "CAPABILITY", "VERSION", "PRIORITY", "SUMMARY"
+            );
+            println!("{}", "-".repeat(100));
+            let mut list = host.capabilities().list();
+            list.sort_by_key(|p| (p.descriptor.capability.name(), p.descriptor.name.as_str()));
+            for p in list {
+                if let Some(cf) = cap_filter {
+                    if p.descriptor.capability != cf {
+                        continue;
+                    }
+                }
+                println!(
+                    "{:<32} {:<22} {:<10} {:>8}  {}",
+                    p.descriptor.name,
+                    p.descriptor.capability.name(),
+                    p.descriptor.version.to_string(),
+                    p.descriptor.priority,
+                    p.descriptor.summary
+                );
+            }
+            Ok(())
+        }
+        PluginsAction::Inspect { name, plugin_dir } => {
+            let host = open_plugin_host(plugin_dir.as_ref())?;
+            let Some(p) = host.capabilities().get(&name) else {
+                return Err(fellm_core::error::FellmError::other(format!(
+                    "provider '{name}' not found; run `fellm plugins list`"
+                )));
+            };
+            let d = &p.descriptor;
+            println!("name        : {}", d.name);
+            println!("capability  : {}", d.capability);
+            println!("version     : {}", d.version);
+            println!("priority    : {}", d.priority);
+            println!("prepared_id : {}", p.id.0);
+            println!(
+                "source      : {}",
+                p.source.as_deref().unwrap_or("dynamic/unknown")
+            );
+            println!("summary     : {}", d.summary);
+            println!("provides    : {}", d.provides);
+            println!("requires    : {}", d.requires);
+            if !d.metadata.is_empty() {
+                println!("metadata:");
+                for (k, v) in &d.metadata {
+                    println!("  {k} = {v}");
+                }
+            }
+            Ok(())
+        }
+    }
 }

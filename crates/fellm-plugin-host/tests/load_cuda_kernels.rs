@@ -7,6 +7,13 @@ use fellm_plugin_abi::op::OpKind;
 use fellm_plugin_abi::{OpAttrs, TensorMut, TensorRef};
 use fellm_plugin_host::PluginHost;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+
+/// The numerical CUDA tests load the plugin and launch kernels on the shared
+/// device context. Running them concurrently races on that context
+/// (`plugin kernel launch failed (code -3)`), so they serialize on one lock.
+#[cfg(target_os = "linux")]
+static CUDA_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn candidate_paths() -> Vec<PathBuf> {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

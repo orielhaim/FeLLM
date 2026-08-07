@@ -50,14 +50,6 @@ impl CpuBackend {
                 }
             });
         let threads = requested_threads.unwrap_or(physical).clamp(1, logical);
-        tracing::info!(
-            target = "fellm::cpu",
-            physical,
-            logical,
-            threads,
-            requested = requested_threads,
-            "CPU execution pool configured"
-        );
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("fellm-matmul-{i}"))
@@ -90,6 +82,12 @@ impl CpuBackend {
                 supports_bidirectional_attention: true,
                 supports_batched_quantized_gemm: true,
                 supports_custom_operations: true,
+                compute_major: 0,
+                compute_minor: 0,
+                smem_per_sm: 0,
+                has_ampere_ada_features: false,
+                has_hopper_features: false,
+                has_blackwell_features: false,
             },
             profile,
             simd: PulpDispatch::new(),
@@ -626,6 +624,23 @@ fn launch_rope(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut])
     let inv_freqs = as_f32_slice(&inputs[1])?;
     let x_out = as_f32_slice_mut(y_out)?;
     x_out.copy_from_slice(x_in);
+    // Pre-RoPE key snapshot for sequence-state policies (custom_op_id=1).
+    if attrs.custom_op_id == 1 {
+        let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
+        if row_width > 0 && !x_in.is_empty() {
+            // One decode row (or last row of a multi-row tile).
+            let row = if x_in.len() >= row_width {
+                &x_in[x_in.len() - row_width..]
+            } else {
+                x_in
+            };
+            fellm_plugin_abi::pre_rope_write(
+                attrs.layer_ord as usize,
+                attrs.position as usize,
+                row,
+            );
+        }
+    }
     let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
     if row_width == 0 || x_in.len().is_multiple_of(row_width) {
         for (row, values) in x_out.chunks_exact_mut(row_width).enumerate() {
@@ -701,11 +716,54 @@ fn launch_attention(
     };
 
     let use_paged = attrs.block_size > 0 && paged_ctx::has_paged_context();
+    let path = fellm_plugin_abi::resolve_path(attrs.query_len.max(1), attrs.custom_op_id);
+    let use_fa2_host = matches!(
+        path,
+        fellm_plugin_abi::AttentionKernelPath::HostFa2
+            | fellm_plugin_abi::AttentionKernelPath::Fa2Decode
+            | fellm_plugin_abi::AttentionKernelPath::Fa2Prefill
+            | fellm_plugin_abi::AttentionKernelPath::Auto
+    );
+    let dispatch = fellm_plugin_abi::attention_dispatch();
+    let br = dispatch.q_tile.max(4) as usize;
+    let bc = dispatch.kv_tile.max(16) as usize;
 
     if use_paged {
         let layer = attrs.layer_ord as usize;
-        // Gather from paged arena on this thread, then run tiled attention
-        // inside the Rayon pool (contiguous buffers are Send).
+        if use_fa2_host {
+            // Prepared FA2-style path over paged storage (host).
+            let seq = past + 1;
+            let window = attrs.attention_window as usize;
+            let causal = attrs.attention_mode == 0;
+            let ctx = paged_ctx::snapshot_paged_context()
+                .ok_or_else(|| FellmError::other("attention: missing paged ctx"))?;
+            fellm_plugin_abi::fa2_style_attention_paged_f32(
+                q,
+                out,
+                n_heads,
+                n_kv,
+                head_dim,
+                seq,
+                scale,
+                causal,
+                window,
+                br,
+                bc,
+                |t, is_v, row| {
+                    let full = unsafe {
+                        if is_v {
+                            ctx.v_row(layer, t)
+                        } else {
+                            ctx.k_row(layer, t)
+                        }
+                    };
+                    for (d, &s) in row.iter_mut().zip(full.iter()) {
+                        *d = s.to_f32();
+                    }
+                },
+            );
+            return Ok(());
+        }
         attention_step_paged(
             q,
             out,
@@ -718,8 +776,6 @@ fn launch_attention(
             &backend.profile,
             backend.simd,
         );
-        // Re-run the contiguous kernel under the pool for parallel heads.
-        // attention_step_paged already calls attention_step which uses the pool.
         return Ok(());
     }
 
@@ -736,6 +792,15 @@ fn launch_attention(
     }
     let k = &k_full[..kv_elems];
     let v = &v_full[..kv_elems];
+    if use_fa2_host {
+        let window = attrs.attention_window as usize;
+        let causal = attrs.attention_mode == 0;
+        let q_len = attrs.query_len.max(1) as usize;
+        fellm_plugin_abi::fa2_style_attention_f32(
+            q, k, v, out, n_heads, n_kv, head_dim, q_len, seq, scale, causal, window, br, bc,
+        );
+        return Ok(());
+    }
     backend.pool.install(|| {
         attention_step(
             q,

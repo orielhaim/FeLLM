@@ -1,0 +1,18 @@
+[package]
+name = "fellm-triattention"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TriAttention KV retention policy as a first-party dynamic FeLLM plugin"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "fellm_triattention"
+
+[dependencies]
+fellm-plugin-abi.workspace = true
+fellm-core.workspace = true
+
+[lints]
+workspace = true

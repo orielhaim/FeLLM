@@ -3,8 +3,15 @@ source_filename = "llvm-link"
 target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
-@__shared_mem_16 = local_unnamed_addr addrspace(3) global [4 x float] zeroinitializer, align 4
-@__shared_mem_15 = local_unnamed_addr addrspace(3) global [4 x float] zeroinitializer, align 4
+@__shared_mem_23 = local_unnamed_addr addrspace(3) global [4 x float] zeroinitializer, align 4
+@__shared_mem_22 = local_unnamed_addr addrspace(3) global [4 x float] zeroinitializer, align 4
+@__shared_mem_21 = local_unnamed_addr addrspace(3) global [2048 x float] zeroinitializer, align 4
+@__shared_mem_20 = local_unnamed_addr addrspace(3) global [2048 x float] zeroinitializer, align 4
+@__shared_mem_19 = local_unnamed_addr addrspace(3) global [2048 x float] zeroinitializer, align 4
+@__shared_mem_18 = local_unnamed_addr addrspace(3) global [2048 x float] zeroinitializer, align 4
+@__shared_mem_17 = local_unnamed_addr addrspace(3) global [4096 x float] zeroinitializer, align 4
+@__shared_mem_16 = local_unnamed_addr addrspace(3) global [4096 x float] zeroinitializer, align 4
+@__shared_mem_15 = local_unnamed_addr addrspace(3) global [2 x i32] zeroinitializer, align 4
 @__shared_mem_14 = local_unnamed_addr addrspace(3) global [256 x float] zeroinitializer, align 4
 @__shared_mem_13 = local_unnamed_addr addrspace(3) global [32 x float] zeroinitializer, align 4
 @__shared_mem_12 = local_unnamed_addr addrspace(3) global [32 x float] zeroinitializer, align 4
@@ -23,7 +30,7 @@ target triple = "nvptx64-nvidia-cuda"
 @.str = private unnamed_addr constant [11 x i8] c"__CUDA_FTZ\00", align 1
 @.str.2 = private unnamed_addr constant [17 x i8] c"__CUDA_PREC_SQRT\00", align 1
 @__cudart_i2opi_f = internal unnamed_addr addrspace(1) constant [6 x i32] [i32 1011060801, i32 -614296167, i32 -181084736, i32 -64530479, i32 1313084713, i32 -1560706194], align 4
-@llvm.used = appending global [51 x ptr] [ptr @add_f32, ptr @add_in_place_f32, ptr @add_inplace_f32, ptr @argmax_token, ptr @attention_canvas_heads, ptr @attention_canvas_paged_heads, ptr @attention_heads, ptr @attention_paged_heads, ptr @attention_paged_warp, ptr @embedding_f32, ptr @embedding_q4k_row, ptr @embedding_q6k_row, ptr @embedding_q6k_rows, ptr @embedding_q8_0_row, ptr @fill_u32, ptr @kv_write_row, ptr @moe_count_assignments, ptr @moe_prefix_offsets, ptr @moe_q4k_project, ptr @moe_q4k_project_warp, ptr @moe_q5_0_project, ptr @moe_q5_0_project_warp, ptr @moe_q6k_project, ptr @moe_q8_0_project, ptr @moe_q8_0_project_warp, ptr @moe_route_topk, ptr @moe_scatter_assignments, ptr @moe_weighted_reduce, ptr @mul_f32, ptr @q4k_gate_up_swiglu_multiwarp, ptr @q4k_gemm_warp, ptr @q4k_gemv_row, ptr @q4k_gemv_row_tiled, ptr @q4k_q8_gemv_multiwarp, ptr @q4k_q8_gemv_warp4, ptr @q5_0_gemm_element, ptr @q5_0_gemm_warp, ptr @q6k_gemm_warp, ptr @q6k_gemv_row, ptr @q6k_gemv_warp4, ptr @q6k_q8_gemv_multiwarp, ptr @q6k_q8_gemv_warp4, ptr @q8_0_gemm_element, ptr @q8_0_gemm_warp, ptr @quantize_q8_32, ptr @rmsnorm_group, ptr @rope, ptr @scale_f32, ptr @shortconv_mix, ptr @silu_gate, ptr @weighted_embedding_q6k_topk], section "llvm.metadata"
+@llvm.used = appending global [54 x ptr] [ptr @add_f32, ptr @add_in_place_f32, ptr @add_inplace_f32, ptr @argmax_token, ptr @attention_canvas_heads, ptr @attention_canvas_paged_heads, ptr @attention_fa2_decode_paged, ptr @attention_fa2_prefill_paged, ptr @attention_fa3_decode_paged, ptr @attention_heads, ptr @attention_paged_heads, ptr @attention_paged_warp, ptr @embedding_f32, ptr @embedding_q4k_row, ptr @embedding_q6k_row, ptr @embedding_q6k_rows, ptr @embedding_q8_0_row, ptr @fill_u32, ptr @kv_write_row, ptr @moe_count_assignments, ptr @moe_prefix_offsets, ptr @moe_q4k_project, ptr @moe_q4k_project_warp, ptr @moe_q5_0_project, ptr @moe_q5_0_project_warp, ptr @moe_q6k_project, ptr @moe_q8_0_project, ptr @moe_q8_0_project_warp, ptr @moe_route_topk, ptr @moe_scatter_assignments, ptr @moe_weighted_reduce, ptr @mul_f32, ptr @q4k_gate_up_swiglu_multiwarp, ptr @q4k_gemm_warp, ptr @q4k_gemv_row, ptr @q4k_gemv_row_tiled, ptr @q4k_q8_gemv_multiwarp, ptr @q4k_q8_gemv_warp4, ptr @q5_0_gemm_element, ptr @q5_0_gemm_warp, ptr @q6k_gemm_warp, ptr @q6k_gemv_row, ptr @q6k_gemv_warp4, ptr @q6k_q8_gemv_multiwarp, ptr @q6k_q8_gemv_warp4, ptr @q8_0_gemm_element, ptr @q8_0_gemm_warp, ptr @quantize_q8_32, ptr @rmsnorm_group, ptr @rope, ptr @scale_f32, ptr @shortconv_mix, ptr @silu_gate, ptr @weighted_embedding_q6k_topk], section "llvm.metadata"
 
 ; Function Attrs: convergent nounwind memory(argmem: readwrite, inaccessiblemem: write)
 define ptx_kernel void @add_f32(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr writeonly captures(address_is_null) %v4, i64 %v5) #0 {
@@ -1413,6 +1420,1594 @@ bb77:                                             ; preds = %bb49
   unreachable
 }
 
+; Function Attrs: convergent nounwind
+define ptx_kernel void @attention_fa2_decode_paged(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, float %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, i32 %v15, ptr writeonly captures(none) %v16, i64 %v17) #3 {
+entry:
+  %v40 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #19
+  %v41 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
+  %v42 = and i32 %v41, 31
+  %v43 = zext nneg i32 %v42 to i64
+  %v44.not = icmp ult i32 %v40, %v6
+  %v48 = icmp ult i32 %v8, 129
+  %or.cond1 = select i1 %v44.not, i1 %v48, i1 false
+  br i1 %or.cond1, label %bb6, label %bb74
+
+bb6:                                              ; preds = %entry
+  %v50 = zext nneg i32 %v8 to i64
+  %v60 = zext i32 %v13 to i64
+  %v61 = zext i32 %v14 to i64
+  %v62 = zext i32 %v15 to i64
+  %v63 = shl nuw nsw i64 %v62, 1
+  %v65 = zext nneg i32 %v40 to i64
+  %v66 = mul nuw nsw i64 %v50, %v65
+  %v75.not96.not = icmp eq i32 %v9, 0
+  br i1 %v75.not96.not, label %bb58, label %bb12.lr.ph
+
+bb12.lr.ph:                                       ; preds = %bb6
+  %factor.op.mul95 = shl nuw nsw i64 %v50, 1
+  %v64 = mul i64 %v63, %v60
+  %v12.i = tail call range(i32 1, 0) i32 @llvm.umax.i32(i32 %v7, i32 1)
+  %v54 = udiv i32 %v6, %v12.i
+  %v12.i14 = tail call range(i32 1, 0) i32 @llvm.umax.i32(i32 %v54, i32 1)
+  %v58 = udiv i32 %v40, %v12.i14
+  %v59 = zext nneg i32 %v58 to i64
+  %v84 = zext nneg i32 %v41 to i64
+  %factor.op.mul.reass = mul nuw nsw i64 %factor.op.mul95, %v59
+  %invariant.gep = getelementptr i8, ptr %v2, i64 %v64
+  %v89.not = icmp eq i32 %v8, 0
+  %v95.not = icmp eq i32 %v13, 0
+  %v99 = zext i32 %v11 to i64
+  %v100 = zext i32 %v12 to i64
+  %v101 = mul nuw i64 %v100, %v99
+  %0 = getelementptr i32, ptr %v4, i64 %v101
+  %invariant.gep71 = getelementptr float, ptr addrspace(3) @__shared_mem_19, i64 %v43
+  %v172.not66 = icmp samesign ult i32 %v42, %v8
+  %1 = getelementptr float, ptr %v0, i64 %v66
+  %v212 = or disjoint i64 %v43, 32
+  %v213.not = icmp samesign ult i64 %v212, %v50
+  %v225 = or disjoint i64 %v43, 64
+  %v226.not = icmp samesign ult i64 %v225, %v50
+  %v238 = or disjoint i64 %v43, 96
+  %v239.not = icmp samesign ult i64 %v238, %v50
+  br label %bb12
+
+bb12:                                             ; preds = %bb12.lr.ph, %bb56
+  %v74104 = phi i32 [ 0, %bb12.lr.ph ], [ %v81, %bb56 ]
+  %v73103 = phi i1 [ false, %bb12.lr.ph ], [ %v166.lcssa, %bb56 ]
+  %v72102 = phi float [ 0.000000e+00, %bb12.lr.ph ], [ %v165.lcssa, %bb56 ]
+  %v71101 = phi float [ 0.000000e+00, %bb12.lr.ph ], [ %v164.lcssa, %bb56 ]
+  %v70100 = phi float [ 0.000000e+00, %bb12.lr.ph ], [ %v163.lcssa, %bb56 ]
+  %v6999 = phi float [ 0.000000e+00, %bb12.lr.ph ], [ %v162.lcssa, %bb56 ]
+  %v6898 = phi float [ 0.000000e+00, %bb12.lr.ph ], [ %v161.lcssa, %bb56 ]
+  %v6797 = phi float [ 0.000000e+00, %bb12.lr.ph ], [ %v160.lcssa, %bb56 ]
+  %v77 = add i32 %v74104, 16
+  %v81 = tail call i32 @llvm.umin.i32(i32 %v77, i32 %v9)
+  %v82 = sub i32 %v81, %v74104
+  %v83 = zext i32 %v82 to i64
+  %v86 = mul nuw nsw i64 %v83, %v50
+  %v87.not64 = icmp samesign ugt i64 %v86, %v84
+  br i1 %v87.not64, label %bb17.lr.ph, label %bb24
+
+bb17.lr.ph:                                       ; preds = %bb12
+  %v93 = zext i32 %v74104 to i64
+  br i1 %v89.not, label %bb81, label %bb17.lr.ph.split
+
+bb17.lr.ph.split:                                 ; preds = %bb17.lr.ph
+  br i1 %v95.not, label %bb82, label %bb17
+
+bb17:                                             ; preds = %bb17.lr.ph.split, %cuda_kernels__oxide_kernels__f16_to_f32.exit51
+  %v8565 = phi i64 [ %v158, %cuda_kernels__oxide_kernels__f16_to_f32.exit51 ], [ %v84, %bb17.lr.ph.split ]
+  %v8565.frozen = freeze i64 %v8565
+  %v50.frozen = freeze i64 %v50
+  %v91 = udiv i64 %v8565.frozen, %v50.frozen
+  %v94 = add i64 %v91, %v93
+  %2 = mul i64 %v91, %v50.frozen
+  %v92.decomposed = sub i64 %v8565.frozen, %2
+  %v94.frozen = freeze i64 %v94
+  %v60.frozen = freeze i64 %v60
+  %v97 = udiv i64 %v94.frozen, %v60.frozen
+  %3 = mul i64 %v97, %v60.frozen
+  %v98.decomposed = sub i64 %v94.frozen, %3
+  %v106 = getelementptr i32, ptr %0, i64 %v97
+  %v107 = load i32, ptr %v106, align 4
+  %v108 = zext i32 %v107 to i64
+  %v109 = mul nuw i64 %v108, %v61
+  %v110 = mul i64 %v98.decomposed, %v63
+  %v118 = shl nuw nsw i64 %v92.decomposed, 1
+  %4 = getelementptr i8, ptr %v2, i64 %v109
+  %5 = getelementptr i8, ptr %4, i64 %v110
+  %6 = getelementptr i8, ptr %5, i64 %factor.op.mul.reass
+  %v123 = getelementptr i8, ptr %6, i64 %v118
+  %v124 = load i8, ptr %v123, align 1
+  %v125 = zext i8 %v124 to i16
+  %v129 = getelementptr i8, ptr %v123, i64 1
+  %v130 = load i8, ptr %v129, align 1
+  %v131 = zext i8 %v130 to i16
+  %v134 = shl nuw i16 %v131, 8
+  %gep = getelementptr i8, ptr %invariant.gep, i64 %v109
+  %7 = getelementptr i8, ptr %gep, i64 %v110
+  %8 = getelementptr i8, ptr %7, i64 %factor.op.mul.reass
+  %v139 = getelementptr i8, ptr %8, i64 %v118
+  %v140 = load i8, ptr %v139, align 1
+  %v141 = zext i8 %v140 to i16
+  %v145 = getelementptr i8, ptr %v139, i64 1
+  %v146 = load i8, ptr %v145, align 1
+  %v147 = zext i8 %v146 to i16
+  %v150 = shl nuw i16 %v147, 8
+  %v4.i = lshr i16 %v131, 7
+  %v6.i = zext nneg i16 %v4.i to i32
+  %v9.i = lshr i16 %v131, 2
+  %v10.i = and i16 %v9.i, 31
+  %v134.masked = and i16 %v134, 768
+  %v12.i15 = or disjoint i16 %v134.masked, %v125
+  %v13.i = zext nneg i16 %v12.i15 to i32
+  switch i16 %v10.i, label %bb10.i [
+    i16 0, label %bb1.i
+    i16 31, label %bb9.i
+  ]
+
+bb1.i:                                            ; preds = %bb17
+  %v15.i = icmp eq i16 %v12.i15, 0
+  br i1 %v15.i, label %bb2.i, label %bb6.i
+
+bb2.i:                                            ; preds = %bb1.i
+  %v17.i = shl nuw i32 %v6.i, 31
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb6.i:                                            ; preds = %bb1.i
+  %v13.masked.numleadingzeros.i = tail call range(i32 22, 33) i32 @llvm.ctlz.i32(i32 %v13.i, i1 true)
+  %v13.masked.leadingonepos.i = xor i32 %v13.masked.numleadingzeros.i, 31
+  %bb5.tripcount.i = sub nuw nsw i32 10, %v13.masked.leadingonepos.i
+  %v23.i = shl nuw nsw i32 %v13.i, %bb5.tripcount.i
+  %v27.i = shl nuw i32 %v6.i, 31
+  %9 = shl nuw nsw i32 %v13.masked.numleadingzeros.i, 23
+  %reass.sub = sub i32 %v27.i, %9
+  %v31.i = add i32 %reass.sub, 1124073472
+  %v25.i = shl i32 %v23.i, 13
+  %v33.i = and i32 %v25.i, 8380416
+  %v34.i = or disjoint i32 %v33.i, %v31.i
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb9.i:                                            ; preds = %bb17
+  %v38.i = shl nuw i32 %v6.i, 31
+  %v41.i = shl nuw nsw i32 %v13.i, 13
+  %v39.i = or disjoint i32 %v41.i, %v38.i
+  %v42.i = or disjoint i32 %v39.i, 2139095040
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb10.i:                                           ; preds = %bb17
+  %v44.i = shl nuw i32 %v6.i, 31
+  %10 = add nuw nsw i16 %v10.i, 112
+  %v46.i = zext nneg i16 %10 to i32
+  %v48.i = shl nuw nsw i32 %v46.i, 23
+  %v49.i = or disjoint i32 %v48.i, %v44.i
+  %v51.i = shl nuw nsw i32 %v13.i, 13
+  %v52.i = or disjoint i32 %v49.i, %v51.i
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+cuda_kernels__oxide_kernels__f16_to_f32.exit:     ; preds = %bb2.i, %bb6.i, %bb9.i, %bb10.i
+  %v54.i = phi i32 [ %v34.i, %bb6.i ], [ %v17.i, %bb2.i ], [ %v42.i, %bb9.i ], [ %v52.i, %bb10.i ]
+  %v153 = shl i64 %v91, 7
+  %v154 = add nuw i64 %v153, %v92.decomposed
+  %v155 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_18, i64 %v154
+  store i32 %v54.i, ptr addrspace(3) %v155, align 4
+  %v4.i16 = lshr i16 %v147, 7
+  %v6.i17 = zext nneg i16 %v4.i16 to i32
+  %v9.i18 = lshr i16 %v147, 2
+  %v10.i19 = and i16 %v9.i18, 31
+  %v150.masked = and i16 %v150, 768
+  %v12.i20 = or disjoint i16 %v150.masked, %v141
+  %v13.i21 = zext nneg i16 %v12.i20 to i32
+  switch i16 %v10.i19, label %bb10.i44 [
+    i16 0, label %bb1.i29
+    i16 31, label %bb9.i22
+  ]
+
+bb1.i29:                                          ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v15.i30 = icmp eq i16 %v12.i20, 0
+  br i1 %v15.i30, label %bb2.i42, label %bb6.i31
+
+bb2.i42:                                          ; preds = %bb1.i29
+  %v17.i43 = shl nuw i32 %v6.i17, 31
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit51
+
+bb6.i31:                                          ; preds = %bb1.i29
+  %v13.masked.numleadingzeros.i32 = tail call range(i32 22, 33) i32 @llvm.ctlz.i32(i32 %v13.i21, i1 true)
+  %v13.masked.leadingonepos.i33 = xor i32 %v13.masked.numleadingzeros.i32, 31
+  %bb5.tripcount.i34 = sub nuw nsw i32 10, %v13.masked.leadingonepos.i33
+  %v23.i35 = shl nuw nsw i32 %v13.i21, %bb5.tripcount.i34
+  %v27.i36 = shl nuw i32 %v6.i17, 31
+  %11 = shl nuw nsw i32 %v13.masked.numleadingzeros.i32, 23
+  %reass.sub111 = sub i32 %v27.i36, %11
+  %v31.i38 = add i32 %reass.sub111, 1124073472
+  %v25.i39 = shl i32 %v23.i35, 13
+  %v33.i40 = and i32 %v25.i39, 8380416
+  %v34.i41 = or disjoint i32 %v33.i40, %v31.i38
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit51
+
+bb9.i22:                                          ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v38.i23 = shl nuw i32 %v6.i17, 31
+  %v41.i24 = shl nuw nsw i32 %v13.i21, 13
+  %v39.i25 = or disjoint i32 %v41.i24, %v38.i23
+  %v42.i26 = or disjoint i32 %v39.i25, 2139095040
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit51
+
+bb10.i44:                                         ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v44.i45 = shl nuw i32 %v6.i17, 31
+  %12 = add nuw nsw i16 %v10.i19, 112
+  %v46.i46 = zext nneg i16 %12 to i32
+  %v48.i47 = shl nuw nsw i32 %v46.i46, 23
+  %v49.i48 = or disjoint i32 %v48.i47, %v44.i45
+  %v51.i49 = shl nuw nsw i32 %v13.i21, 13
+  %v52.i50 = or disjoint i32 %v49.i48, %v51.i49
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit51
+
+cuda_kernels__oxide_kernels__f16_to_f32.exit51:   ; preds = %bb2.i42, %bb6.i31, %bb9.i22, %bb10.i44
+  %v54.i27 = phi i32 [ %v34.i41, %bb6.i31 ], [ %v17.i43, %bb2.i42 ], [ %v42.i26, %bb9.i22 ], [ %v52.i50, %bb10.i44 ]
+  %v157 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_19, i64 %v154
+  store i32 %v54.i27, ptr addrspace(3) %v157, align 4
+  %v158 = add nuw i64 %v8565, 32
+  %v87.not = icmp ult i64 %v158, %v86
+  br i1 %v87.not, label %bb17, label %bb24
+
+bb24:                                             ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit51, %bb12
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v168.not79.not = icmp eq i32 %v81, %v74104
+  br i1 %v168.not79.not, label %bb56, label %bb28.preheader
+
+bb28.preheader:                                   ; preds = %bb24, %bb55
+  %v16787 = phi i64 [ %v251, %bb55 ], [ 0, %bb24 ]
+  %v16686 = phi i1 [ true, %bb55 ], [ %v73103, %bb24 ]
+  %v16585 = phi float [ %v292, %bb55 ], [ %v72102, %bb24 ]
+  %v16484 = phi float [ %v199, %bb55 ], [ %v71101, %bb24 ]
+  %v16383 = phi float [ %v250, %bb55 ], [ %v70100, %bb24 ]
+  %v16282 = phi float [ %v237, %bb55 ], [ %v6999, %bb24 ]
+  %v16181 = phi float [ %v224, %bb55 ], [ %v6898, %bb24 ]
+  %v16080 = phi float [ %v211, %bb55 ], [ %v6797, %bb24 ]
+  br i1 %v172.not66, label %bb29.lr.ph, label %bb32.preheader
+
+bb29.lr.ph:                                       ; preds = %bb28.preheader
+  %.idx = shl i64 %v16787, 9
+  %13 = getelementptr i8, ptr addrspace(3) @__shared_mem_18, i64 %.idx
+  br label %bb29
+
+bb32.preheader:                                   ; preds = %bb29, %bb28.preheader
+  %v170.lcssa = phi float [ 0.000000e+00, %bb28.preheader ], [ %v186, %bb29 ]
+  %v191 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v170.lcssa, i32 16, i32 31) #19
+  %v287 = fadd contract float %v170.lcssa, %v191
+  %v191.1 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v287, i32 8, i32 31) #19
+  %v287.1 = fadd contract float %v287, %v191.1
+  %v191.2 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v287.1, i32 4, i32 31) #19
+  %v287.2 = fadd contract float %v287.1, %v191.2
+  %v191.3 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v287.2, i32 2, i32 31) #19
+  %v287.3 = fadd contract float %v287.2, %v191.3
+  %v191.4 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v287.3, i32 1, i32 31) #19
+  %v287.4 = fadd contract float %v287.3, %v191.4
+  %v192 = tail call float @llvm.nvvm.shfl.sync.idx.f32(i32 -1, float %v287.4, i32 0, i32 31) #19
+  %v289 = fmul contract float %v10, %v192
+  br i1 %v16686, label %bb36, label %bb40
+
+bb29:                                             ; preds = %bb29.lr.ph, %bb29
+  %v17168 = phi i64 [ %v43, %bb29.lr.ph ], [ %v187, %bb29 ]
+  %v17067 = phi float [ 0.000000e+00, %bb29.lr.ph ], [ %v186, %bb29 ]
+  %v177 = getelementptr float, ptr addrspace(3) %13, i64 %v17168
+  %v178 = load float, ptr addrspace(3) %v177, align 4
+  %v183 = getelementptr float, ptr %1, i64 %v17168
+  %v184 = load float, ptr %v183, align 4
+  %v185 = fmul contract float %v178, %v184
+  %v186 = fadd contract float %v17067, %v185
+  %v187 = add nuw nsw i64 %v17168, 32
+  %v172.not = icmp samesign ult i64 %v187, %v50
+  br i1 %v172.not, label %bb29, label %bb32.preheader
+
+bb36:                                             ; preds = %bb32.preheader
+  %v193 = fcmp ule float %v289, %v16484
+  br i1 %v193, label %bb40, label %bb37
+
+bb37:                                             ; preds = %bb36
+  %v195 = fsub contract float %v16484, %v289
+  %14 = tail call i32 @__nvvm_reflect(ptr nonnull @.str) #20
+  %.not.i = icmp eq i32 %14, 0
+  %15 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v195, float 0x3F777313A0000000, float 5.000000e-01) #20
+  %16 = tail call float @llvm.fma.f32(float %v195, float 0x3F777313A0000000, float 5.000000e-01)
+  %.02.i = select i1 %.not.i, float %16, float %15
+  %17 = tail call float @llvm.nvvm.saturate.ftz.f(float %.02.i) #20
+  %18 = tail call float @llvm.nvvm.saturate.f(float %.02.i) #20
+  %.03.i = select i1 %.not.i, float %18, float %17
+  %19 = tail call float @llvm.nvvm.fma.rm.ftz.f(float %.03.i, float 2.520000e+02, float 0x4168000020000000) #20
+  %20 = tail call float @llvm.nvvm.fma.rm.f(float %.03.i, float 2.520000e+02, float 0x4168000020000000) #20
+  %.04.i = select i1 %.not.i, float %20, float %19
+  %21 = fadd float %.04.i, 0xC168000FE0000000
+  %22 = fneg float %21
+  %23 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v195, float 0x3FF7154760000000, float %22) #20
+  %24 = tail call float @llvm.fma.f32(float %v195, float 0x3FF7154760000000, float %22)
+  %.0.i = select i1 %.not.i, float %24, float %23
+  %25 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v195, float 0x3E54AE0C00000000, float %.0.i) #20
+  %26 = tail call float @llvm.fma.f32(float %v195, float 0x3E54AE0C00000000, float %.0.i)
+  %.01.i = select i1 %.not.i, float %26, float %25
+  %27 = bitcast float %.04.i to i32
+  %28 = shl i32 %27, 23
+  %29 = bitcast i32 %28 to float
+  %30 = tail call float @llvm.nvvm.ex2.approx.ftz.f32(float %.01.i)
+  %31 = fmul float %30, %29
+  br label %bb40
+
+bb40:                                             ; preds = %bb37, %bb36, %bb32.preheader
+  %v199 = phi float [ %v289, %bb32.preheader ], [ %v289, %bb37 ], [ %v16484, %bb36 ]
+  %v200 = phi float [ 0.000000e+00, %bb32.preheader ], [ %31, %bb37 ], [ 1.000000e+00, %bb36 ]
+  %v201 = fsub contract float %v289, %v199
+  %32 = tail call i32 @__nvvm_reflect(ptr nonnull @.str) #20
+  %.not.i8 = icmp eq i32 %32, 0
+  %33 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v201, float 0x3F777313A0000000, float 5.000000e-01) #20
+  %34 = tail call float @llvm.fma.f32(float %v201, float 0x3F777313A0000000, float 5.000000e-01)
+  %.02.i9 = select i1 %.not.i8, float %34, float %33
+  %35 = tail call float @llvm.nvvm.saturate.ftz.f(float %.02.i9) #20
+  %36 = tail call float @llvm.nvvm.saturate.f(float %.02.i9) #20
+  %.03.i10 = select i1 %.not.i8, float %36, float %35
+  %37 = tail call float @llvm.nvvm.fma.rm.ftz.f(float %.03.i10, float 2.520000e+02, float 0x4168000020000000) #20
+  %38 = tail call float @llvm.nvvm.fma.rm.f(float %.03.i10, float 2.520000e+02, float 0x4168000020000000) #20
+  %.04.i11 = select i1 %.not.i8, float %38, float %37
+  %39 = fadd float %.04.i11, 0xC168000FE0000000
+  %40 = fneg float %39
+  %41 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v201, float 0x3FF7154760000000, float %40) #20
+  %42 = tail call float @llvm.fma.f32(float %v201, float 0x3FF7154760000000, float %40)
+  %.0.i12 = select i1 %.not.i8, float %42, float %41
+  %43 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v201, float 0x3E54AE0C00000000, float %.0.i12) #20
+  %44 = tail call float @llvm.fma.f32(float %v201, float 0x3E54AE0C00000000, float %.0.i12)
+  %.01.i13 = select i1 %.not.i8, float %44, float %43
+  %45 = bitcast float %.04.i11 to i32
+  %46 = shl i32 %45, 23
+  %47 = bitcast i32 %46 to float
+  %48 = tail call float @llvm.nvvm.ex2.approx.ftz.f32(float %.01.i13)
+  %49 = fmul float %48, %47
+  %v291 = fmul contract float %v16585, %v200
+  %v292 = fadd contract float %v291, %49
+  br i1 %v172.not66, label %bb41, label %bb43
+
+bb41:                                             ; preds = %bb40
+  %v208 = fmul contract float %v16080, %v200
+  %.idx4 = shl i64 %v16787, 9
+  %gep72 = getelementptr i8, ptr addrspace(3) %invariant.gep71, i64 %.idx4
+  %v207 = load float, ptr addrspace(3) %gep72, align 4
+  %v209 = fmul contract float %49, %v207
+  %v210 = fadd contract float %v208, %v209
+  br label %bb43
+
+bb43:                                             ; preds = %bb40, %bb41
+  %v211 = phi float [ %v210, %bb41 ], [ %v16080, %bb40 ]
+  br i1 %v213.not, label %bb44, label %bb47
+
+bb44:                                             ; preds = %bb43
+  %v221 = fmul contract float %v16181, %v200
+  %.idx5 = shl i64 %v16787, 9
+  %gep74 = getelementptr i8, ptr addrspace(3) %invariant.gep71, i64 %.idx5
+  %v219 = getelementptr i8, ptr addrspace(3) %gep74, i64 128
+  %v220 = load float, ptr addrspace(3) %v219, align 4
+  %v222 = fmul contract float %49, %v220
+  %v223 = fadd contract float %v221, %v222
+  br label %bb47
+
+bb47:                                             ; preds = %bb43, %bb44
+  %v224 = phi float [ %v223, %bb44 ], [ %v16181, %bb43 ]
+  br i1 %v226.not, label %bb48, label %bb51
+
+bb48:                                             ; preds = %bb47
+  %v234 = fmul contract float %v16282, %v200
+  %.idx6 = shl i64 %v16787, 9
+  %gep76 = getelementptr i8, ptr addrspace(3) %invariant.gep71, i64 %.idx6
+  %v232 = getelementptr i8, ptr addrspace(3) %gep76, i64 256
+  %v233 = load float, ptr addrspace(3) %v232, align 4
+  %v235 = fmul contract float %49, %v233
+  %v236 = fadd contract float %v234, %v235
+  br label %bb51
+
+bb51:                                             ; preds = %bb47, %bb48
+  %v237 = phi float [ %v236, %bb48 ], [ %v16282, %bb47 ]
+  br i1 %v239.not, label %bb52, label %bb55
+
+bb52:                                             ; preds = %bb51
+  %v247 = fmul contract float %v16383, %v200
+  %.idx7 = shl i64 %v16787, 9
+  %gep78 = getelementptr i8, ptr addrspace(3) %invariant.gep71, i64 %.idx7
+  %v245 = getelementptr i8, ptr addrspace(3) %gep78, i64 384
+  %v246 = load float, ptr addrspace(3) %v245, align 4
+  %v248 = fmul contract float %49, %v246
+  %v249 = fadd contract float %v247, %v248
+  br label %bb55
+
+bb55:                                             ; preds = %bb51, %bb52
+  %v250 = phi float [ %v249, %bb52 ], [ %v16383, %bb51 ]
+  %v251 = add nuw nsw i64 %v16787, 1
+  %exitcond.not = icmp eq i64 %v251, %v83
+  br i1 %exitcond.not, label %bb56, label %bb28.preheader
+
+bb56:                                             ; preds = %bb55, %bb24
+  %v160.lcssa = phi float [ %v6797, %bb24 ], [ %v211, %bb55 ]
+  %v161.lcssa = phi float [ %v6898, %bb24 ], [ %v224, %bb55 ]
+  %v162.lcssa = phi float [ %v6999, %bb24 ], [ %v237, %bb55 ]
+  %v163.lcssa = phi float [ %v70100, %bb24 ], [ %v250, %bb55 ]
+  %v164.lcssa = phi float [ %v71101, %bb24 ], [ %v199, %bb55 ]
+  %v165.lcssa = phi float [ %v72102, %bb24 ], [ %v292, %bb55 ]
+  %v166.lcssa = phi i1 [ %v73103, %bb24 ], [ true, %bb55 ]
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v75.not = icmp ult i32 %v77, %v9
+  br i1 %v75.not, label %bb12, label %bb58
+
+bb58:                                             ; preds = %bb56, %bb6
+  %v67.lcssa = phi float [ 0.000000e+00, %bb6 ], [ %v160.lcssa, %bb56 ]
+  %v68.lcssa = phi float [ 0.000000e+00, %bb6 ], [ %v161.lcssa, %bb56 ]
+  %v69.lcssa = phi float [ 0.000000e+00, %bb6 ], [ %v162.lcssa, %bb56 ]
+  %v70.lcssa = phi float [ 0.000000e+00, %bb6 ], [ %v163.lcssa, %bb56 ]
+  %v72.lcssa = phi float [ 0.000000e+00, %bb6 ], [ %v165.lcssa, %bb56 ]
+  %v73.lcssa = phi i1 [ false, %bb6 ], [ %v166.lcssa, %bb56 ]
+  %v254 = fcmp ogt float %v72.lcssa, 0.000000e+00
+  %or.cond2.not = select i1 %v73.lcssa, i1 %v254, i1 false
+  br i1 %or.cond2.not, label %bb60, label %bb74
+
+bb60:                                             ; preds = %bb58
+  %v256 = fdiv contract float 1.000000e+00, %v72.lcssa
+  %v257.not = icmp ult i32 %v42, %v8
+  br i1 %v257.not, label %bb61, label %bb62
+
+bb61:                                             ; preds = %bb60
+  %v262 = fmul contract float %v67.lcssa, %v256
+  %50 = getelementptr inbounds nuw float, ptr %v16, i64 %v66
+  %v261 = getelementptr inbounds nuw float, ptr %50, i64 %v43
+  store float %v262, ptr %v261, align 4
+  br label %bb62
+
+bb62:                                             ; preds = %bb61, %bb60
+  %v263 = or disjoint i64 %v43, 32
+  %v264.not = icmp samesign ult i64 %v263, %v50
+  br i1 %v264.not, label %bb63, label %bb65
+
+bb63:                                             ; preds = %bb62
+  %v270 = fmul contract float %v68.lcssa, %v256
+  %51 = getelementptr inbounds nuw float, ptr %v16, i64 %v66
+  %52 = getelementptr inbounds nuw float, ptr %51, i64 %v43
+  %v269 = getelementptr inbounds nuw i8, ptr %52, i64 128
+  store float %v270, ptr %v269, align 4
+  br label %bb65
+
+bb65:                                             ; preds = %bb62, %bb63
+  %v271 = or disjoint i64 %v43, 64
+  %v272.not = icmp samesign ult i64 %v271, %v50
+  br i1 %v272.not, label %bb66, label %bb68
+
+bb66:                                             ; preds = %bb65
+  %v278 = fmul contract float %v69.lcssa, %v256
+  %53 = getelementptr inbounds nuw float, ptr %v16, i64 %v66
+  %54 = getelementptr inbounds nuw float, ptr %53, i64 %v43
+  %v277 = getelementptr inbounds nuw i8, ptr %54, i64 256
+  store float %v278, ptr %v277, align 4
+  br label %bb68
+
+bb68:                                             ; preds = %bb65, %bb66
+  %v279 = or disjoint i64 %v43, 96
+  %v280.not = icmp samesign ult i64 %v279, %v50
+  br i1 %v280.not, label %bb69, label %bb74
+
+bb69:                                             ; preds = %bb68
+  %v286 = fmul contract float %v70.lcssa, %v256
+  %55 = getelementptr inbounds nuw float, ptr %v16, i64 %v66
+  %56 = getelementptr inbounds nuw float, ptr %55, i64 %v43
+  %v285 = getelementptr inbounds nuw i8, ptr %56, i64 384
+  store float %v286, ptr %v285, align 4
+  br label %bb74
+
+bb74:                                             ; preds = %bb58, %bb68, %bb69, %entry
+  ret void
+
+bb81:                                             ; preds = %bb17.lr.ph
+  tail call void @llvm.trap() #19
+  unreachable
+
+bb82:                                             ; preds = %bb17.lr.ph.split
+  tail call void @llvm.trap() #19
+  unreachable
+}
+
+; Function Attrs: convergent nounwind
+define ptx_kernel void @attention_fa2_prefill_paged(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, i32 %v10, float %v11, i32 %v12, i32 %v13, i32 %v14, i32 %v15, i32 %v16, i32 %v17, i32 %v18, i32 %v19, ptr writeonly captures(none) %v20, i64 %v21) #3 {
+entry:
+  %v48 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #19
+  %v49 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #19
+  %v50 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
+  %v51.not = icmp ult i32 %v48, %v6
+  br i1 %v51.not, label %bb5, label %bb96
+
+bb5:                                              ; preds = %entry
+  %v53 = zext i32 %v8 to i64
+  %0 = add i32 %v8, -1
+  %or.cond = icmp ult i32 %0, 128
+  br i1 %or.cond, label %bb7, label %bb96
+
+bb7:                                              ; preds = %bb5
+  %v57 = shl i32 %v49, 2
+  %v58.not = icmp ult i32 %v57, %v9
+  br i1 %v58.not, label %bb10, label %bb96
+
+bb10:                                             ; preds = %bb7
+  %v60 = add i32 %v57, 4
+  %v60.v9 = tail call i32 @llvm.umin.i32(i32 %v60, i32 %v9)
+  %v12.i = tail call range(i32 1, 0) i32 @llvm.umax.i32(i32 %v7, i32 1)
+  %v67 = udiv i32 %v6, %v12.i
+  %v12.i15 = tail call range(i32 1, 0) i32 @llvm.umax.i32(i32 %v67, i32 1)
+  %v71 = udiv i32 %v48, %v12.i15
+  %v73 = zext i32 %v14 to i64
+  %v74 = zext i32 %v15 to i64
+  %v75 = zext i32 %v16 to i64
+  %v76 = shl nuw nsw i64 %v75, 1
+  %v77 = mul i64 %v76, %v73
+  %v783 = lshr i32 %v50, 5
+  %v79 = and i32 %v50, 31
+  %v80 = zext nneg i32 %v79 to i64
+  %v82 = sub i32 %v60.v9, %v57
+  %v84 = icmp uge i32 %v783, %v82
+  br i1 %v84, label %bb19, label %bb18
+
+bb18:                                             ; preds = %bb10
+  %v81 = zext nneg i32 %v783 to i64
+  %v86 = zext i32 %v57 to i64
+  %v87 = add nuw nsw i64 %v86, %v81
+  %v88 = zext nneg i32 %v48 to i64
+  %v89 = zext i32 %v9 to i64
+  %v90 = mul nuw nsw i64 %v89, %v88
+  %v91 = add nuw nsw i64 %v90, %v87
+  %v92 = mul nuw nsw i64 %v91, %v53
+  %1 = trunc i64 %v87 to i32
+  br label %bb19
+
+bb19:                                             ; preds = %bb18, %bb10
+  %v93 = phi i64 [ 0, %bb10 ], [ %v92, %bb18 ]
+  %v94 = phi i32 [ 0, %bb10 ], [ %1, %bb18 ]
+  %v103.not98.not = icmp eq i32 %v10, 0
+  br i1 %v103.not98.not, label %bb79, label %bb21.lr.ph
+
+bb21.lr.ph:                                       ; preds = %bb19
+  %factor.op.mul97 = shl nuw nsw i32 %v8, 1
+  %v112 = zext nneg i32 %v50 to i64
+  %factor.op.mul.reass = mul nuw nsw i32 %factor.op.mul97, %v71
+  %invariant.gep = getelementptr i8, ptr %v2, i64 %v77
+  %v121.not = icmp eq i32 %v14, 0
+  %v125 = zext i32 %v12 to i64
+  %v126 = zext i32 %v13 to i64
+  %v127 = mul nuw i64 %v126, %v125
+  %2 = getelementptr i32, ptr %v4, i64 %v127
+  %v139 = zext nneg i32 %factor.op.mul.reass to i64
+  %invariant.gep66 = getelementptr float, ptr addrspace(3) @__shared_mem_21, i64 %v80
+  %v199 = icmp eq i32 %v17, 0
+  %v200 = sub i32 %v10, %v9
+  %v202 = add i32 %v94, %v200
+  %v214.not61 = icmp samesign ult i32 %v79, %v8
+  %3 = getelementptr float, ptr %v0, i64 %v93
+  %v254 = or disjoint i64 %v80, 32
+  %v255.not = icmp samesign ult i64 %v254, %v53
+  %v267 = or disjoint i64 %v80, 64
+  %v268.not = icmp samesign ult i64 %v267, %v53
+  %v280 = or disjoint i64 %v80, 96
+  %v281.not = icmp samesign ult i64 %v280, %v53
+  %4 = add i32 %v18, -1
+  br label %bb21
+
+bb21:                                             ; preds = %bb21.lr.ph, %bb77
+  %v102106 = phi i32 [ 0, %bb21.lr.ph ], [ %v109, %bb77 ]
+  %v101105 = phi i1 [ false, %bb21.lr.ph ], [ %v307, %bb77 ]
+  %v100104 = phi float [ 0.000000e+00, %bb21.lr.ph ], [ %v306, %bb77 ]
+  %v99103 = phi float [ 0.000000e+00, %bb21.lr.ph ], [ %v305, %bb77 ]
+  %v98102 = phi float [ 0.000000e+00, %bb21.lr.ph ], [ %v304, %bb77 ]
+  %v97101 = phi float [ 0.000000e+00, %bb21.lr.ph ], [ %v303, %bb77 ]
+  %v96100 = phi float [ 0.000000e+00, %bb21.lr.ph ], [ %v302, %bb77 ]
+  %v9599 = phi float [ 0.000000e+00, %bb21.lr.ph ], [ %v301, %bb77 ]
+  %v105 = add i32 %v102106, 16
+  %v109 = tail call i32 @llvm.umin.i32(i32 %v105, i32 %v10)
+  %v110 = sub i32 %v109, %v102106
+  %v111 = zext i32 %v110 to i64
+  %v114 = mul nuw nsw i64 %v111, %v53
+  %v115.not59 = icmp samesign ugt i64 %v114, %v112
+  br i1 %v115.not59, label %bb26.lr.ph, label %bb32
+
+bb26.lr.ph:                                       ; preds = %bb21
+  %v119 = zext i32 %v102106 to i64
+  br i1 %v121.not, label %bb104, label %bb26
+
+bb26:                                             ; preds = %bb26.lr.ph, %cuda_kernels__oxide_kernels__f16_to_f32.exit52
+  %v11360 = phi i64 [ %v184, %cuda_kernels__oxide_kernels__f16_to_f32.exit52 ], [ %v112, %bb26.lr.ph ]
+  %v11360.frozen = freeze i64 %v11360
+  %v53.frozen = freeze i64 %v53
+  %v117 = udiv i64 %v11360.frozen, %v53.frozen
+  %v120 = add i64 %v117, %v119
+  %5 = mul i64 %v117, %v53.frozen
+  %v118.decomposed = sub i64 %v11360.frozen, %5
+  %v120.frozen = freeze i64 %v120
+  %v73.frozen = freeze i64 %v73
+  %v123 = udiv i64 %v120.frozen, %v73.frozen
+  %6 = mul i64 %v123, %v73.frozen
+  %v124.decomposed = sub i64 %v120.frozen, %6
+  %v132 = getelementptr i32, ptr %2, i64 %v123
+  %v133 = load i32, ptr %v132, align 4
+  %v134 = zext i32 %v133 to i64
+  %v135 = mul nuw i64 %v134, %v74
+  %v136 = mul i64 %v124.decomposed, %v76
+  %v144 = shl nuw nsw i64 %v118.decomposed, 1
+  %7 = getelementptr i8, ptr %v2, i64 %v135
+  %8 = getelementptr i8, ptr %7, i64 %v136
+  %9 = getelementptr i8, ptr %8, i64 %v139
+  %v149 = getelementptr i8, ptr %9, i64 %v144
+  %v150 = load i8, ptr %v149, align 1
+  %v151 = zext i8 %v150 to i16
+  %v155 = getelementptr i8, ptr %v149, i64 1
+  %v156 = load i8, ptr %v155, align 1
+  %v157 = zext i8 %v156 to i16
+  %v160 = shl nuw i16 %v157, 8
+  %gep = getelementptr i8, ptr %invariant.gep, i64 %v135
+  %10 = getelementptr i8, ptr %gep, i64 %v136
+  %11 = getelementptr i8, ptr %10, i64 %v139
+  %v165 = getelementptr i8, ptr %11, i64 %v144
+  %v166 = load i8, ptr %v165, align 1
+  %v167 = zext i8 %v166 to i16
+  %v171 = getelementptr i8, ptr %v165, i64 1
+  %v172 = load i8, ptr %v171, align 1
+  %v173 = zext i8 %v172 to i16
+  %v176 = shl nuw i16 %v173, 8
+  %v4.i = lshr i16 %v157, 7
+  %v6.i = zext nneg i16 %v4.i to i32
+  %v9.i = lshr i16 %v157, 2
+  %v10.i = and i16 %v9.i, 31
+  %v160.masked = and i16 %v160, 768
+  %v12.i16 = or disjoint i16 %v160.masked, %v151
+  %v13.i = zext nneg i16 %v12.i16 to i32
+  switch i16 %v10.i, label %bb10.i [
+    i16 0, label %bb1.i
+    i16 31, label %bb9.i
+  ]
+
+bb1.i:                                            ; preds = %bb26
+  %v15.i = icmp eq i16 %v12.i16, 0
+  br i1 %v15.i, label %bb2.i, label %bb6.i
+
+bb2.i:                                            ; preds = %bb1.i
+  %v17.i = shl nuw i32 %v6.i, 31
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb6.i:                                            ; preds = %bb1.i
+  %v13.masked.numleadingzeros.i = tail call range(i32 22, 33) i32 @llvm.ctlz.i32(i32 %v13.i, i1 true)
+  %v13.masked.leadingonepos.i = xor i32 %v13.masked.numleadingzeros.i, 31
+  %bb5.tripcount.i = sub nuw nsw i32 10, %v13.masked.leadingonepos.i
+  %v23.i = shl nuw nsw i32 %v13.i, %bb5.tripcount.i
+  %v27.i = shl nuw i32 %v6.i, 31
+  %12 = shl nuw nsw i32 %v13.masked.numleadingzeros.i, 23
+  %reass.sub = sub i32 %v27.i, %12
+  %v31.i = add i32 %reass.sub, 1124073472
+  %v25.i = shl i32 %v23.i, 13
+  %v33.i = and i32 %v25.i, 8380416
+  %v34.i = or disjoint i32 %v33.i, %v31.i
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb9.i:                                            ; preds = %bb26
+  %v38.i = shl nuw i32 %v6.i, 31
+  %v41.i = shl nuw nsw i32 %v13.i, 13
+  %v39.i = or disjoint i32 %v41.i, %v38.i
+  %v42.i = or disjoint i32 %v39.i, 2139095040
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb10.i:                                           ; preds = %bb26
+  %v44.i = shl nuw i32 %v6.i, 31
+  %13 = add nuw nsw i16 %v10.i, 112
+  %v46.i = zext nneg i16 %13 to i32
+  %v48.i = shl nuw nsw i32 %v46.i, 23
+  %v49.i = or disjoint i32 %v48.i, %v44.i
+  %v51.i = shl nuw nsw i32 %v13.i, 13
+  %v52.i = or disjoint i32 %v49.i, %v51.i
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+cuda_kernels__oxide_kernels__f16_to_f32.exit:     ; preds = %bb2.i, %bb6.i, %bb9.i, %bb10.i
+  %v54.i = phi i32 [ %v34.i, %bb6.i ], [ %v17.i, %bb2.i ], [ %v42.i, %bb9.i ], [ %v52.i, %bb10.i ]
+  %v179 = shl i64 %v117, 7
+  %v180 = add i64 %v179, %v118.decomposed
+  %v181 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_20, i64 %v180
+  store i32 %v54.i, ptr addrspace(3) %v181, align 4
+  %v4.i17 = lshr i16 %v173, 7
+  %v6.i18 = zext nneg i16 %v4.i17 to i32
+  %v9.i19 = lshr i16 %v173, 2
+  %v10.i20 = and i16 %v9.i19, 31
+  %v176.masked = and i16 %v176, 768
+  %v12.i21 = or disjoint i16 %v176.masked, %v167
+  %v13.i22 = zext nneg i16 %v12.i21 to i32
+  switch i16 %v10.i20, label %bb10.i45 [
+    i16 0, label %bb1.i30
+    i16 31, label %bb9.i23
+  ]
+
+bb1.i30:                                          ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v15.i31 = icmp eq i16 %v12.i21, 0
+  br i1 %v15.i31, label %bb2.i43, label %bb6.i32
+
+bb2.i43:                                          ; preds = %bb1.i30
+  %v17.i44 = shl nuw i32 %v6.i18, 31
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit52
+
+bb6.i32:                                          ; preds = %bb1.i30
+  %v13.masked.numleadingzeros.i33 = tail call range(i32 22, 33) i32 @llvm.ctlz.i32(i32 %v13.i22, i1 true)
+  %v13.masked.leadingonepos.i34 = xor i32 %v13.masked.numleadingzeros.i33, 31
+  %bb5.tripcount.i35 = sub nuw nsw i32 10, %v13.masked.leadingonepos.i34
+  %v23.i36 = shl nuw nsw i32 %v13.i22, %bb5.tripcount.i35
+  %v27.i37 = shl nuw i32 %v6.i18, 31
+  %14 = shl nuw nsw i32 %v13.masked.numleadingzeros.i33, 23
+  %reass.sub115 = sub i32 %v27.i37, %14
+  %v31.i39 = add i32 %reass.sub115, 1124073472
+  %v25.i40 = shl i32 %v23.i36, 13
+  %v33.i41 = and i32 %v25.i40, 8380416
+  %v34.i42 = or disjoint i32 %v33.i41, %v31.i39
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit52
+
+bb9.i23:                                          ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v38.i24 = shl nuw i32 %v6.i18, 31
+  %v41.i25 = shl nuw nsw i32 %v13.i22, 13
+  %v39.i26 = or disjoint i32 %v41.i25, %v38.i24
+  %v42.i27 = or disjoint i32 %v39.i26, 2139095040
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit52
+
+bb10.i45:                                         ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v44.i46 = shl nuw i32 %v6.i18, 31
+  %15 = add nuw nsw i16 %v10.i20, 112
+  %v46.i47 = zext nneg i16 %15 to i32
+  %v48.i48 = shl nuw nsw i32 %v46.i47, 23
+  %v49.i49 = or disjoint i32 %v48.i48, %v44.i46
+  %v51.i50 = shl nuw nsw i32 %v13.i22, 13
+  %v52.i51 = or disjoint i32 %v49.i49, %v51.i50
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit52
+
+cuda_kernels__oxide_kernels__f16_to_f32.exit52:   ; preds = %bb2.i43, %bb6.i32, %bb9.i23, %bb10.i45
+  %v54.i28 = phi i32 [ %v34.i42, %bb6.i32 ], [ %v17.i44, %bb2.i43 ], [ %v42.i27, %bb9.i23 ], [ %v52.i51, %bb10.i45 ]
+  %v183 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_21, i64 %v180
+  store i32 %v54.i28, ptr addrspace(3) %v183, align 4
+  %v184 = add nuw i64 %v11360, 128
+  %v115.not = icmp ult i64 %v184, %v114
+  br i1 %v115.not, label %bb26, label %bb32
+
+bb32:                                             ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit52, %bb21
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v195.not74 = icmp eq i32 %v109, %v102106
+  %or.cond113.not = or i1 %v195.not74, %v84
+  br i1 %or.cond113.not, label %bb77, label %bb36
+
+bb36:                                             ; preds = %bb32, %bb75
+  %v19489 = phi i64 [ %v300, %bb75 ], [ 0, %bb32 ]
+  %v19387 = phi i1 [ %v299, %bb75 ], [ %v101105, %bb32 ]
+  %v19285 = phi float [ %v298, %bb75 ], [ %v100104, %bb32 ]
+  %v19183 = phi float [ %v297, %bb75 ], [ %v99103, %bb32 ]
+  %v19081 = phi float [ %v296, %bb75 ], [ %v98102, %bb32 ]
+  %v18979 = phi float [ %v295, %bb75 ], [ %v97101, %bb32 ]
+  %v18877 = phi float [ %v294, %bb75 ], [ %v96100, %bb32 ]
+  %v18775 = phi float [ %v293, %bb75 ], [ %v9599, %bb32 ]
+  br i1 %v199, label %bb47.preheader, label %bb37
+
+bb37:                                             ; preds = %bb36
+  %16 = trunc i64 %v19489 to i32
+  %v203 = add i32 %v102106, %16
+  %v204.not = icmp ugt i32 %v203, %v202
+  %v207 = sub nuw i32 %v202, %v203
+  %17 = freeze i32 %v207
+  %or.cond114.not = icmp ult i32 %4, %17
+  %or.cond116 = select i1 %v204.not, i1 true, i1 %or.cond114.not
+  br i1 %or.cond116, label %bb75, label %bb47.preheader
+
+bb47.preheader:                                   ; preds = %bb37, %bb36
+  br i1 %v214.not61, label %bb48.lr.ph, label %bb51.preheader
+
+bb48.lr.ph:                                       ; preds = %bb47.preheader
+  %.idx = shl i64 %v19489, 9
+  %18 = getelementptr i8, ptr addrspace(3) @__shared_mem_20, i64 %.idx
+  br label %bb48
+
+bb51.preheader:                                   ; preds = %bb48, %bb47.preheader
+  %v212.lcssa = phi float [ 0.000000e+00, %bb47.preheader ], [ %v228, %bb48 ]
+  %v233 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v212.lcssa, i32 16, i32 31) #19
+  %v346 = fadd contract float %v212.lcssa, %v233
+  %v233.1 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v346, i32 8, i32 31) #19
+  %v346.1 = fadd contract float %v346, %v233.1
+  %v233.2 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v346.1, i32 4, i32 31) #19
+  %v346.2 = fadd contract float %v346.1, %v233.2
+  %v233.3 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v346.2, i32 2, i32 31) #19
+  %v346.3 = fadd contract float %v346.2, %v233.3
+  %v233.4 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v346.3, i32 1, i32 31) #19
+  %v346.4 = fadd contract float %v346.3, %v233.4
+  %v234 = tail call float @llvm.nvvm.shfl.sync.idx.f32(i32 -1, float %v346.4, i32 0, i32 31) #19
+  %v348 = fmul contract float %v11, %v234
+  br i1 %v19387, label %bb55, label %bb59
+
+bb48:                                             ; preds = %bb48.lr.ph, %bb48
+  %v21363 = phi i64 [ %v80, %bb48.lr.ph ], [ %v229, %bb48 ]
+  %v21262 = phi float [ 0.000000e+00, %bb48.lr.ph ], [ %v228, %bb48 ]
+  %v219 = getelementptr float, ptr addrspace(3) %18, i64 %v21363
+  %v220 = load float, ptr addrspace(3) %v219, align 4
+  %v225 = getelementptr float, ptr %3, i64 %v21363
+  %v226 = load float, ptr %v225, align 4
+  %v227 = fmul contract float %v220, %v226
+  %v228 = fadd contract float %v21262, %v227
+  %v229 = add nuw nsw i64 %v21363, 32
+  %v214.not = icmp samesign ult i64 %v229, %v53
+  br i1 %v214.not, label %bb48, label %bb51.preheader
+
+bb55:                                             ; preds = %bb51.preheader
+  %v235 = fcmp ule float %v348, %v19183
+  br i1 %v235, label %bb59, label %bb56
+
+bb56:                                             ; preds = %bb55
+  %v237 = fsub contract float %v19183, %v348
+  %19 = tail call i32 @__nvvm_reflect(ptr nonnull @.str) #20
+  %.not.i = icmp eq i32 %19, 0
+  %20 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v237, float 0x3F777313A0000000, float 5.000000e-01) #20
+  %21 = tail call float @llvm.fma.f32(float %v237, float 0x3F777313A0000000, float 5.000000e-01)
+  %.02.i = select i1 %.not.i, float %21, float %20
+  %22 = tail call float @llvm.nvvm.saturate.ftz.f(float %.02.i) #20
+  %23 = tail call float @llvm.nvvm.saturate.f(float %.02.i) #20
+  %.03.i = select i1 %.not.i, float %23, float %22
+  %24 = tail call float @llvm.nvvm.fma.rm.ftz.f(float %.03.i, float 2.520000e+02, float 0x4168000020000000) #20
+  %25 = tail call float @llvm.nvvm.fma.rm.f(float %.03.i, float 2.520000e+02, float 0x4168000020000000) #20
+  %.04.i = select i1 %.not.i, float %25, float %24
+  %26 = fadd float %.04.i, 0xC168000FE0000000
+  %27 = fneg float %26
+  %28 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v237, float 0x3FF7154760000000, float %27) #20
+  %29 = tail call float @llvm.fma.f32(float %v237, float 0x3FF7154760000000, float %27)
+  %.0.i = select i1 %.not.i, float %29, float %28
+  %30 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v237, float 0x3E54AE0C00000000, float %.0.i) #20
+  %31 = tail call float @llvm.fma.f32(float %v237, float 0x3E54AE0C00000000, float %.0.i)
+  %.01.i = select i1 %.not.i, float %31, float %30
+  %32 = bitcast float %.04.i to i32
+  %33 = shl i32 %32, 23
+  %34 = bitcast i32 %33 to float
+  %35 = tail call float @llvm.nvvm.ex2.approx.ftz.f32(float %.01.i)
+  %36 = fmul float %35, %34
+  br label %bb59
+
+bb59:                                             ; preds = %bb56, %bb55, %bb51.preheader
+  %v241 = phi float [ %v348, %bb51.preheader ], [ %v348, %bb56 ], [ %v19183, %bb55 ]
+  %v242 = phi float [ 0.000000e+00, %bb51.preheader ], [ %36, %bb56 ], [ 1.000000e+00, %bb55 ]
+  %v243 = fsub contract float %v348, %v241
+  %37 = tail call i32 @__nvvm_reflect(ptr nonnull @.str) #20
+  %.not.i9 = icmp eq i32 %37, 0
+  %38 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v243, float 0x3F777313A0000000, float 5.000000e-01) #20
+  %39 = tail call float @llvm.fma.f32(float %v243, float 0x3F777313A0000000, float 5.000000e-01)
+  %.02.i10 = select i1 %.not.i9, float %39, float %38
+  %40 = tail call float @llvm.nvvm.saturate.ftz.f(float %.02.i10) #20
+  %41 = tail call float @llvm.nvvm.saturate.f(float %.02.i10) #20
+  %.03.i11 = select i1 %.not.i9, float %41, float %40
+  %42 = tail call float @llvm.nvvm.fma.rm.ftz.f(float %.03.i11, float 2.520000e+02, float 0x4168000020000000) #20
+  %43 = tail call float @llvm.nvvm.fma.rm.f(float %.03.i11, float 2.520000e+02, float 0x4168000020000000) #20
+  %.04.i12 = select i1 %.not.i9, float %43, float %42
+  %44 = fadd float %.04.i12, 0xC168000FE0000000
+  %45 = fneg float %44
+  %46 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v243, float 0x3FF7154760000000, float %45) #20
+  %47 = tail call float @llvm.fma.f32(float %v243, float 0x3FF7154760000000, float %45)
+  %.0.i13 = select i1 %.not.i9, float %47, float %46
+  %48 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v243, float 0x3E54AE0C00000000, float %.0.i13) #20
+  %49 = tail call float @llvm.fma.f32(float %v243, float 0x3E54AE0C00000000, float %.0.i13)
+  %.01.i14 = select i1 %.not.i9, float %49, float %48
+  %50 = bitcast float %.04.i12 to i32
+  %51 = shl i32 %50, 23
+  %52 = bitcast i32 %51 to float
+  %53 = tail call float @llvm.nvvm.ex2.approx.ftz.f32(float %.01.i14)
+  %54 = fmul float %53, %52
+  %v350 = fmul contract float %v19285, %v242
+  %v351 = fadd contract float %v350, %54
+  br i1 %v214.not61, label %bb60, label %bb62
+
+bb60:                                             ; preds = %bb59
+  %v250 = fmul contract float %v18775, %v242
+  %.idx5 = shl i64 %v19489, 9
+  %gep67 = getelementptr i8, ptr addrspace(3) %invariant.gep66, i64 %.idx5
+  %v249 = load float, ptr addrspace(3) %gep67, align 4
+  %v251 = fmul contract float %54, %v249
+  %v252 = fadd contract float %v250, %v251
+  br label %bb62
+
+bb62:                                             ; preds = %bb59, %bb60
+  %v253 = phi float [ %v252, %bb60 ], [ %v18775, %bb59 ]
+  br i1 %v255.not, label %bb63, label %bb66
+
+bb63:                                             ; preds = %bb62
+  %v263 = fmul contract float %v18877, %v242
+  %.idx6 = shl i64 %v19489, 9
+  %gep69 = getelementptr i8, ptr addrspace(3) %invariant.gep66, i64 %.idx6
+  %v261 = getelementptr i8, ptr addrspace(3) %gep69, i64 128
+  %v262 = load float, ptr addrspace(3) %v261, align 4
+  %v264 = fmul contract float %54, %v262
+  %v265 = fadd contract float %v263, %v264
+  br label %bb66
+
+bb66:                                             ; preds = %bb62, %bb63
+  %v266 = phi float [ %v265, %bb63 ], [ %v18877, %bb62 ]
+  br i1 %v268.not, label %bb67, label %bb70
+
+bb67:                                             ; preds = %bb66
+  %v276 = fmul contract float %v18979, %v242
+  %.idx7 = shl i64 %v19489, 9
+  %gep71 = getelementptr i8, ptr addrspace(3) %invariant.gep66, i64 %.idx7
+  %v274 = getelementptr i8, ptr addrspace(3) %gep71, i64 256
+  %v275 = load float, ptr addrspace(3) %v274, align 4
+  %v277 = fmul contract float %54, %v275
+  %v278 = fadd contract float %v276, %v277
+  br label %bb70
+
+bb70:                                             ; preds = %bb66, %bb67
+  %v279 = phi float [ %v278, %bb67 ], [ %v18979, %bb66 ]
+  br i1 %v281.not, label %bb71, label %bb75
+
+bb71:                                             ; preds = %bb70
+  %v289 = fmul contract float %v19081, %v242
+  %.idx8 = shl i64 %v19489, 9
+  %gep73 = getelementptr i8, ptr addrspace(3) %invariant.gep66, i64 %.idx8
+  %v287 = getelementptr i8, ptr addrspace(3) %gep73, i64 384
+  %v288 = load float, ptr addrspace(3) %v287, align 4
+  %v290 = fmul contract float %54, %v288
+  %v291 = fadd contract float %v289, %v290
+  br label %bb75
+
+bb75:                                             ; preds = %bb37, %bb71, %bb70
+  %v293 = phi float [ %v18775, %bb37 ], [ %v253, %bb70 ], [ %v253, %bb71 ]
+  %v294 = phi float [ %v18877, %bb37 ], [ %v266, %bb70 ], [ %v266, %bb71 ]
+  %v295 = phi float [ %v18979, %bb37 ], [ %v279, %bb70 ], [ %v279, %bb71 ]
+  %v296 = phi float [ %v19081, %bb37 ], [ %v19081, %bb70 ], [ %v291, %bb71 ]
+  %v297 = phi float [ %v19183, %bb37 ], [ %v241, %bb70 ], [ %v241, %bb71 ]
+  %v298 = phi float [ %v19285, %bb37 ], [ %v351, %bb70 ], [ %v351, %bb71 ]
+  %v299 = phi i1 [ %v19387, %bb37 ], [ true, %bb70 ], [ true, %bb71 ]
+  %v300 = add nuw nsw i64 %v19489, 1
+  %exitcond.not = icmp eq i64 %v300, %v111
+  br i1 %exitcond.not, label %bb77, label %bb36
+
+bb77:                                             ; preds = %bb75, %bb32
+  %v301 = phi float [ %v9599, %bb32 ], [ %v293, %bb75 ]
+  %v302 = phi float [ %v96100, %bb32 ], [ %v294, %bb75 ]
+  %v303 = phi float [ %v97101, %bb32 ], [ %v295, %bb75 ]
+  %v304 = phi float [ %v98102, %bb32 ], [ %v296, %bb75 ]
+  %v305 = phi float [ %v99103, %bb32 ], [ %v297, %bb75 ]
+  %v306 = phi float [ %v100104, %bb32 ], [ %v298, %bb75 ]
+  %v307 = phi i1 [ %v101105, %bb32 ], [ %v299, %bb75 ]
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v103.not = icmp ult i32 %v105, %v10
+  br i1 %v103.not, label %bb21, label %bb79.loopexit
+
+bb79.loopexit:                                    ; preds = %bb77
+  %55 = xor i1 %v307, true
+  br label %bb79
+
+bb79:                                             ; preds = %bb79.loopexit, %bb19
+  %v95.lcssa = phi float [ 0.000000e+00, %bb19 ], [ %v301, %bb79.loopexit ]
+  %v96.lcssa = phi float [ 0.000000e+00, %bb19 ], [ %v302, %bb79.loopexit ]
+  %v97.lcssa = phi float [ 0.000000e+00, %bb19 ], [ %v303, %bb79.loopexit ]
+  %v98.lcssa = phi float [ 0.000000e+00, %bb19 ], [ %v304, %bb79.loopexit ]
+  %v100.lcssa = phi float [ 0.000000e+00, %bb19 ], [ %v306, %bb79.loopexit ]
+  %v101.lcssa = phi i1 [ true, %bb19 ], [ %55, %bb79.loopexit ]
+  %or.cond1 = select i1 %v84, i1 true, i1 %v101.lcssa
+  %v311 = fcmp ule float %v100.lcssa, 0.000000e+00
+  %or.cond2 = select i1 %or.cond1, i1 true, i1 %v311
+  br i1 %or.cond2, label %bb96, label %bb82
+
+bb82:                                             ; preds = %bb79
+  %v313 = fdiv contract float 1.000000e+00, %v100.lcssa
+  %v314.not = icmp ult i32 %v79, %v8
+  br i1 %v314.not, label %bb83, label %bb84
+
+bb83:                                             ; preds = %bb82
+  %v319 = fmul contract float %v95.lcssa, %v313
+  %56 = getelementptr float, ptr %v20, i64 %v93
+  %v318 = getelementptr float, ptr %56, i64 %v80
+  store float %v319, ptr %v318, align 4
+  br label %bb84
+
+bb84:                                             ; preds = %bb83, %bb82
+  %v320 = or disjoint i64 %v80, 32
+  %v321.not = icmp samesign ult i64 %v320, %v53
+  br i1 %v321.not, label %bb85, label %bb87
+
+bb85:                                             ; preds = %bb84
+  %v327 = fmul contract float %v96.lcssa, %v313
+  %57 = getelementptr float, ptr %v20, i64 %v93
+  %58 = getelementptr float, ptr %57, i64 %v80
+  %v326 = getelementptr i8, ptr %58, i64 128
+  store float %v327, ptr %v326, align 4
+  br label %bb87
+
+bb87:                                             ; preds = %bb84, %bb85
+  %v328 = or disjoint i64 %v80, 64
+  %v329.not = icmp samesign ult i64 %v328, %v53
+  br i1 %v329.not, label %bb88, label %bb90
+
+bb88:                                             ; preds = %bb87
+  %v335 = fmul contract float %v97.lcssa, %v313
+  %59 = getelementptr float, ptr %v20, i64 %v93
+  %60 = getelementptr float, ptr %59, i64 %v80
+  %v334 = getelementptr i8, ptr %60, i64 256
+  store float %v335, ptr %v334, align 4
+  br label %bb90
+
+bb90:                                             ; preds = %bb87, %bb88
+  %v336 = or disjoint i64 %v80, 96
+  %v337.not = icmp samesign ult i64 %v336, %v53
+  br i1 %v337.not, label %bb91, label %bb96
+
+bb91:                                             ; preds = %bb90
+  %v343 = fmul contract float %v98.lcssa, %v313
+  %61 = getelementptr float, ptr %v20, i64 %v93
+  %62 = getelementptr float, ptr %61, i64 %v80
+  %v342 = getelementptr i8, ptr %62, i64 384
+  store float %v343, ptr %v342, align 4
+  br label %bb96
+
+bb96:                                             ; preds = %bb79, %bb90, %bb91, %bb7, %bb5, %entry
+  ret void
+
+bb104:                                            ; preds = %bb26.lr.ph
+  tail call void @llvm.trap() #19
+  unreachable
+}
+
+; Function Attrs: convergent nounwind
+define ptx_kernel void @attention_fa3_decode_paged(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, float %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, i32 %v15, i32 %v16, ptr writeonly captures(none) %v17, i64 %v18) #3 {
+entry:
+  %v42 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #19
+  %v43 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
+  %v44 = and i32 %v43, 31
+  %v45 = zext nneg i32 %v44 to i64
+  %v467 = lshr i32 %v43, 5
+  %v47 = icmp ult i32 %v42, %v6
+  %0 = add i32 %v8, -1
+  %1 = icmp ult i32 %0, 128
+  %or.cond1 = select i1 %v47, i1 %1, i1 false
+  br i1 %or.cond1, label %bb6, label %bb110
+
+bb6:                                              ; preds = %entry
+  %v52 = zext nneg i32 %v8 to i64
+  %v12.i = tail call range(i32 1, 0) i32 @llvm.umax.i32(i32 %v7, i32 1)
+  %v56 = udiv i32 %v6, %v12.i
+  %v12.i22 = tail call range(i32 1, 0) i32 @llvm.umax.i32(i32 %v56, i32 1)
+  %v60 = udiv i32 %v42, %v12.i22
+  %v61 = zext nneg i32 %v60 to i64
+  %v62 = zext i32 %v13 to i64
+  %v63 = zext i32 %v14 to i64
+  %v64 = zext i32 %v15 to i64
+  %v65 = shl nuw nsw i64 %v64, 1
+  %v66 = mul i64 %v65, %v62
+  %v67 = zext nneg i32 %v42 to i64
+  %v68 = mul nuw nsw i64 %v52, %v67
+  %v73 = icmp ne i32 %v467, 0
+  %v75 = icmp samesign ugt i32 %v43, 1
+  br i1 %v75, label %bb16, label %bb14
+
+bb14:                                             ; preds = %bb6
+  %v77 = zext nneg i32 %v43 to i64
+  %v78 = getelementptr inbounds nuw i32, ptr addrspace(3) @__shared_mem_15, i64 %v77
+  store i32 0, ptr addrspace(3) %v78, align 4
+  br label %bb16
+
+bb16:                                             ; preds = %bb14, %bb6
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v81 = add i32 %v9, 15
+  %v829 = lshr i32 %v81, 4
+  %factor.op.mul115 = shl nuw nsw i64 %v52, 1
+  %invariant.gep116 = getelementptr float, ptr addrspace(3) @__shared_mem_17, i64 %v45
+  %factor.op.mul.reass = mul nuw nsw i64 %factor.op.mul115, %v61
+  %invariant.gep = getelementptr i8, ptr %v2, i64 %v66
+  %v124.not = icmp eq i32 %v13, 0
+  %v128 = zext i32 %v11 to i64
+  %v129 = zext i32 %v12 to i64
+  %v130 = mul nuw i64 %v129, %v128
+  %2 = getelementptr i32, ptr %v4, i64 %v130
+  %v191 = shl nuw nsw i64 %v52, 4
+  %v204 = icmp eq i32 %v44, 0
+  %v210 = icmp eq i32 %v467, 1
+  %v236.not85 = icmp samesign ult i32 %v44, %v8
+  %3 = getelementptr float, ptr %v0, i64 %v68
+  %v278 = or disjoint i64 %v45, 32
+  %v279.not = icmp samesign ult i64 %v278, %v52
+  %v292 = or disjoint i64 %v45, 64
+  %v293.not = icmp samesign ult i64 %v292, %v52
+  %v306 = or disjoint i64 %v45, 96
+  %v307.not = icmp samesign ult i64 %v306, %v52
+  %4 = add nuw nsw i32 %v829, 1
+  br label %bb19
+
+bb19:                                             ; preds = %bb16, %bb91
+  %v90131 = phi i32 [ 0, %bb16 ], [ %v331, %bb91 ]
+  %v89130 = phi i1 [ false, %bb16 ], [ %v329, %bb91 ]
+  %v88129 = phi float [ 0.000000e+00, %bb16 ], [ %v328, %bb91 ]
+  %v87128 = phi float [ 0.000000e+00, %bb16 ], [ %v327, %bb91 ]
+  %v86127 = phi float [ 0.000000e+00, %bb16 ], [ %v326, %bb91 ]
+  %v85126 = phi float [ 0.000000e+00, %bb16 ], [ %v325, %bb91 ]
+  %v84125 = phi float [ 0.000000e+00, %bb16 ], [ %v324, %bb91 ]
+  %v83124 = phi float [ 0.000000e+00, %bb16 ], [ %v323, %bb91 ]
+  %umax = tail call i32 @llvm.umax.i32(i32 %v90131, i32 1)
+  %5 = shl i32 %umax, 4
+  %6 = add i32 %5, -16
+  %umin = tail call i32 @llvm.umin.i32(i32 %v9, i32 %6)
+  %7 = add i32 %umin, 32
+  %8 = sub i32 %7, %5
+  %9 = tail call i32 @llvm.umax.i32(i32 %8, i32 1)
+  %umax133 = zext i32 %9 to i64
+  %v97 = add nsw i32 %umax, -2
+  %v99 = icmp samesign uge i32 %v90131, %v829
+  %or.cond2 = or i1 %v73, %v99
+  br i1 %or.cond2, label %bb47, label %bb25
+
+bb25:                                             ; preds = %bb19
+  %v103 = and i32 %v90131, 1
+  %v104 = zext nneg i32 %v103 to i64
+  %v105 = shl nuw i32 %v90131, 4
+  %v106 = add nuw i32 %v105, 16
+  %v106.v9 = tail call i32 @llvm.umin.i32(i32 %v106, i32 %v9)
+  %v110 = sub i32 %v106.v9, %v105
+  %v111 = zext i32 %v110 to i64
+  %v113 = shl nuw nsw i64 %v104, 11
+  %v115 = mul nuw nsw i64 %v111, %v52
+  %v116.not81 = icmp samesign ugt i64 %v115, %v45
+  br i1 %v116.not81, label %bb30.lr.ph, label %bb37
+
+bb30.lr.ph:                                       ; preds = %bb25
+  %v122 = zext i32 %v105 to i64
+  br i1 %v124.not, label %bb119, label %bb30
+
+bb30:                                             ; preds = %bb30.lr.ph, %cuda_kernels__oxide_kernels__f16_to_f32.exit60
+  %v11482 = phi i64 [ %v188, %cuda_kernels__oxide_kernels__f16_to_f32.exit60 ], [ %v45, %bb30.lr.ph ]
+  %v11482.frozen = freeze i64 %v11482
+  %v52.frozen = freeze i64 %v52
+  %v120 = udiv i64 %v11482.frozen, %v52.frozen
+  %v123 = add i64 %v120, %v122
+  %10 = mul i64 %v120, %v52.frozen
+  %v121.decomposed = sub i64 %v11482.frozen, %10
+  %v123.frozen = freeze i64 %v123
+  %v62.frozen = freeze i64 %v62
+  %v126 = udiv i64 %v123.frozen, %v62.frozen
+  %11 = mul i64 %v126, %v62.frozen
+  %v127.decomposed = sub i64 %v123.frozen, %11
+  %v135 = getelementptr i32, ptr %2, i64 %v126
+  %v136 = load i32, ptr %v135, align 4
+  %v137 = zext i32 %v136 to i64
+  %v138 = mul nuw i64 %v137, %v63
+  %v139 = mul i64 %v127.decomposed, %v65
+  %v147 = shl nuw nsw i64 %v121.decomposed, 1
+  %12 = getelementptr i8, ptr %v2, i64 %v138
+  %13 = getelementptr i8, ptr %12, i64 %v139
+  %14 = getelementptr i8, ptr %13, i64 %factor.op.mul.reass
+  %v152 = getelementptr i8, ptr %14, i64 %v147
+  %v153 = load i8, ptr %v152, align 1
+  %v154 = zext i8 %v153 to i16
+  %v158 = getelementptr i8, ptr %v152, i64 1
+  %v159 = load i8, ptr %v158, align 1
+  %v160 = zext i8 %v159 to i16
+  %v163 = shl nuw i16 %v160, 8
+  %gep = getelementptr i8, ptr %invariant.gep, i64 %v138
+  %15 = getelementptr i8, ptr %gep, i64 %v139
+  %16 = getelementptr i8, ptr %15, i64 %factor.op.mul.reass
+  %v168 = getelementptr i8, ptr %16, i64 %v147
+  %v169 = load i8, ptr %v168, align 1
+  %v170 = zext i8 %v169 to i16
+  %v174 = getelementptr i8, ptr %v168, i64 1
+  %v175 = load i8, ptr %v174, align 1
+  %v176 = zext i8 %v175 to i16
+  %v179 = shl nuw i16 %v176, 8
+  %v4.i = lshr i16 %v160, 7
+  %v6.i = zext nneg i16 %v4.i to i32
+  %v9.i = lshr i16 %v160, 2
+  %v10.i = and i16 %v9.i, 31
+  %v163.masked = and i16 %v163, 768
+  %v12.i24 = or disjoint i16 %v163.masked, %v154
+  %v13.i = zext nneg i16 %v12.i24 to i32
+  switch i16 %v10.i, label %bb10.i [
+    i16 0, label %bb1.i
+    i16 31, label %bb9.i
+  ]
+
+bb1.i:                                            ; preds = %bb30
+  %v15.i = icmp eq i16 %v12.i24, 0
+  br i1 %v15.i, label %bb2.i, label %bb6.i
+
+bb2.i:                                            ; preds = %bb1.i
+  %v17.i = shl nuw i32 %v6.i, 31
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb6.i:                                            ; preds = %bb1.i
+  %v13.masked.numleadingzeros.i = tail call range(i32 22, 33) i32 @llvm.ctlz.i32(i32 %v13.i, i1 true)
+  %v13.masked.leadingonepos.i = xor i32 %v13.masked.numleadingzeros.i, 31
+  %bb5.tripcount.i = sub nuw nsw i32 10, %v13.masked.leadingonepos.i
+  %v23.i = shl nuw nsw i32 %v13.i, %bb5.tripcount.i
+  %v27.i = shl nuw i32 %v6.i, 31
+  %17 = shl nuw nsw i32 %v13.masked.numleadingzeros.i, 23
+  %reass.sub = sub i32 %v27.i, %17
+  %v31.i = add i32 %reass.sub, 1124073472
+  %v25.i = shl i32 %v23.i, 13
+  %v33.i = and i32 %v25.i, 8380416
+  %v34.i = or disjoint i32 %v33.i, %v31.i
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb9.i:                                            ; preds = %bb30
+  %v38.i = shl nuw i32 %v6.i, 31
+  %v41.i = shl nuw nsw i32 %v13.i, 13
+  %v39.i = or disjoint i32 %v41.i, %v38.i
+  %v42.i = or disjoint i32 %v39.i, 2139095040
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+bb10.i:                                           ; preds = %bb30
+  %v44.i = shl nuw i32 %v6.i, 31
+  %18 = add nuw nsw i16 %v10.i, 112
+  %v46.i = zext nneg i16 %18 to i32
+  %v48.i = shl nuw nsw i32 %v46.i, 23
+  %v49.i = or disjoint i32 %v48.i, %v44.i
+  %v51.i = shl nuw nsw i32 %v13.i, 13
+  %v52.i = or disjoint i32 %v49.i, %v51.i
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit
+
+cuda_kernels__oxide_kernels__f16_to_f32.exit:     ; preds = %bb2.i, %bb6.i, %bb9.i, %bb10.i
+  %v54.i = phi i32 [ %v34.i, %bb6.i ], [ %v17.i, %bb2.i ], [ %v42.i, %bb9.i ], [ %v52.i, %bb10.i ]
+  %v182 = shl i64 %v120, 7
+  %v183 = add i64 %v182, %v113
+  %v184 = add i64 %v183, %v121.decomposed
+  %v185 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_16, i64 %v184
+  store i32 %v54.i, ptr addrspace(3) %v185, align 4
+  %v4.i25 = lshr i16 %v176, 7
+  %v6.i26 = zext nneg i16 %v4.i25 to i32
+  %v9.i27 = lshr i16 %v176, 2
+  %v10.i28 = and i16 %v9.i27, 31
+  %v179.masked = and i16 %v179, 768
+  %v12.i29 = or disjoint i16 %v179.masked, %v170
+  %v13.i30 = zext nneg i16 %v12.i29 to i32
+  switch i16 %v10.i28, label %bb10.i53 [
+    i16 0, label %bb1.i38
+    i16 31, label %bb9.i31
+  ]
+
+bb1.i38:                                          ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v15.i39 = icmp eq i16 %v12.i29, 0
+  br i1 %v15.i39, label %bb2.i51, label %bb6.i40
+
+bb2.i51:                                          ; preds = %bb1.i38
+  %v17.i52 = shl nuw i32 %v6.i26, 31
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit60
+
+bb6.i40:                                          ; preds = %bb1.i38
+  %v13.masked.numleadingzeros.i41 = tail call range(i32 22, 33) i32 @llvm.ctlz.i32(i32 %v13.i30, i1 true)
+  %v13.masked.leadingonepos.i42 = xor i32 %v13.masked.numleadingzeros.i41, 31
+  %bb5.tripcount.i43 = sub nuw nsw i32 10, %v13.masked.leadingonepos.i42
+  %v23.i44 = shl nuw nsw i32 %v13.i30, %bb5.tripcount.i43
+  %v27.i45 = shl nuw i32 %v6.i26, 31
+  %19 = shl nuw nsw i32 %v13.masked.numleadingzeros.i41, 23
+  %reass.sub132 = sub i32 %v27.i45, %19
+  %v31.i47 = add i32 %reass.sub132, 1124073472
+  %v25.i48 = shl i32 %v23.i44, 13
+  %v33.i49 = and i32 %v25.i48, 8380416
+  %v34.i50 = or disjoint i32 %v33.i49, %v31.i47
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit60
+
+bb9.i31:                                          ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v38.i32 = shl nuw i32 %v6.i26, 31
+  %v41.i33 = shl nuw nsw i32 %v13.i30, 13
+  %v39.i34 = or disjoint i32 %v41.i33, %v38.i32
+  %v42.i35 = or disjoint i32 %v39.i34, 2139095040
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit60
+
+bb10.i53:                                         ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit
+  %v44.i54 = shl nuw i32 %v6.i26, 31
+  %20 = add nuw nsw i16 %v10.i28, 112
+  %v46.i55 = zext nneg i16 %20 to i32
+  %v48.i56 = shl nuw nsw i32 %v46.i55, 23
+  %v49.i57 = or disjoint i32 %v48.i56, %v44.i54
+  %v51.i58 = shl nuw nsw i32 %v13.i30, 13
+  %v52.i59 = or disjoint i32 %v49.i57, %v51.i58
+  br label %cuda_kernels__oxide_kernels__f16_to_f32.exit60
+
+cuda_kernels__oxide_kernels__f16_to_f32.exit60:   ; preds = %bb2.i51, %bb6.i40, %bb9.i31, %bb10.i53
+  %v54.i36 = phi i32 [ %v34.i50, %bb6.i40 ], [ %v17.i52, %bb2.i51 ], [ %v42.i35, %bb9.i31 ], [ %v52.i59, %bb10.i53 ]
+  %v187 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_17, i64 %v184
+  store i32 %v54.i36, ptr addrspace(3) %v187, align 4
+  %v188 = add nuw i64 %v11482, 32
+  %v116.not = icmp ult i64 %v188, %v115
+  br i1 %v116.not, label %bb30, label %bb37
+
+bb37:                                             ; preds = %cuda_kernels__oxide_kernels__f16_to_f32.exit60, %bb25
+  %v189 = add nuw nsw i64 %v115, %v45
+  %v192.not83 = icmp samesign ult i64 %v189, %v191
+  br i1 %v192.not83, label %bb39, label %bb43
+
+bb39:                                             ; preds = %bb37, %bb39
+  %v19084 = phi i64 [ %v203, %bb39 ], [ %v189, %bb37 ]
+  %v19084.frozen = freeze i64 %v19084
+  %v52.frozen135 = freeze i64 %v52
+  %v196 = udiv i64 %v19084.frozen, %v52.frozen135
+  %21 = mul i64 %v196, %v52.frozen135
+  %v197.decomposed = sub i64 %v19084.frozen, %21
+  %v198 = shl i64 %v196, 7
+  %v199 = add i64 %v198, %v113
+  %v200 = add i64 %v199, %v197.decomposed
+  %v201 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_16, i64 %v200
+  store float 0.000000e+00, ptr addrspace(3) %v201, align 4
+  %v202 = getelementptr inbounds float, ptr addrspace(3) @__shared_mem_17, i64 %v200
+  store float 0.000000e+00, ptr addrspace(3) %v202, align 4
+  %v203 = add nuw nsw i64 %v19084, 32
+  %v192.not = icmp samesign ult i64 %v203, %v191
+  br i1 %v192.not, label %bb39, label %bb43
+
+bb43:                                             ; preds = %bb39, %bb37
+  br i1 %v204, label %bb44, label %bb47
+
+bb44:                                             ; preds = %bb43
+  %v205 = getelementptr inbounds nuw i32, ptr addrspace(3) @__shared_mem_15, i64 %v104
+  store i32 1, ptr addrspace(3) %v205, align 4
+  br label %bb47
+
+bb47:                                             ; preds = %bb43, %bb44, %bb19
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v208 = icmp ult i32 %v97, %v829
+  %or.cond5 = and i1 %v210, %v208
+  br i1 %or.cond5, label %bb52, label %bb91
+
+bb52:                                             ; preds = %bb47
+  %v213 = and i32 %umax, 1
+  %v214 = zext nneg i32 %v213 to i64
+  %v215 = shl nuw i32 %v97, 4
+  %v232.not91.not = icmp eq i32 %v9, %v215
+  br i1 %v232.not91.not, label %bb86, label %bb58.preheader.lr.ph
+
+bb58.preheader.lr.ph:                             ; preds = %bb52
+  %v223 = shl nuw nsw i64 %v214, 11
+  %22 = getelementptr float, ptr addrspace(3) @__shared_mem_16, i64 %v223
+  %gep117 = getelementptr float, ptr addrspace(3) %invariant.gep116, i64 %v223
+  br label %bb58.preheader
+
+bb58.preheader:                                   ; preds = %bb58.preheader.lr.ph, %bb85
+  %v23199 = phi i64 [ 0, %bb58.preheader.lr.ph ], [ %v320, %bb85 ]
+  %v23098 = phi i1 [ %v89130, %bb58.preheader.lr.ph ], [ true, %bb85 ]
+  %v22997 = phi float [ %v88129, %bb58.preheader.lr.ph ], [ %v372, %bb85 ]
+  %v22896 = phi float [ %v87128, %bb58.preheader.lr.ph ], [ %v264, %bb85 ]
+  %v22795 = phi float [ %v86127, %bb58.preheader.lr.ph ], [ %v319, %bb85 ]
+  %v22694 = phi float [ %v85126, %bb58.preheader.lr.ph ], [ %v305, %bb85 ]
+  %v22593 = phi float [ %v84125, %bb58.preheader.lr.ph ], [ %v291, %bb85 ]
+  %v22492 = phi float [ %v83124, %bb58.preheader.lr.ph ], [ %v277, %bb85 ]
+  br i1 %v236.not85, label %bb59.lr.ph, label %bb62.preheader
+
+bb59.lr.ph:                                       ; preds = %bb58.preheader
+  %.idx = shl i64 %v23199, 9
+  %23 = getelementptr i8, ptr addrspace(3) %22, i64 %.idx
+  br label %bb59
+
+bb62.preheader:                                   ; preds = %bb59, %bb58.preheader
+  %v234.lcssa = phi float [ 0.000000e+00, %bb58.preheader ], [ %v251, %bb59 ]
+  %v256 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v234.lcssa, i32 16, i32 31) #19
+  %v367 = fadd contract float %v234.lcssa, %v256
+  %v256.1 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v367, i32 8, i32 31) #19
+  %v367.1 = fadd contract float %v367, %v256.1
+  %v256.2 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v367.1, i32 4, i32 31) #19
+  %v367.2 = fadd contract float %v367.1, %v256.2
+  %v256.3 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v367.2, i32 2, i32 31) #19
+  %v367.3 = fadd contract float %v367.2, %v256.3
+  %v256.4 = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %v367.3, i32 1, i32 31) #19
+  %v367.4 = fadd contract float %v367.3, %v256.4
+  %v257 = tail call float @llvm.nvvm.shfl.sync.idx.f32(i32 -1, float %v367.4, i32 0, i32 31) #19
+  %v369 = fmul contract float %v10, %v257
+  br i1 %v23098, label %bb66, label %bb70
+
+bb59:                                             ; preds = %bb59.lr.ph, %bb59
+  %v23587 = phi i64 [ %v45, %bb59.lr.ph ], [ %v252, %bb59 ]
+  %v23486 = phi float [ 0.000000e+00, %bb59.lr.ph ], [ %v251, %bb59 ]
+  %v242 = getelementptr float, ptr addrspace(3) %23, i64 %v23587
+  %v243 = load float, ptr addrspace(3) %v242, align 4
+  %v248 = getelementptr float, ptr %3, i64 %v23587
+  %v249 = load float, ptr %v248, align 4
+  %v250 = fmul contract float %v243, %v249
+  %v251 = fadd contract float %v23486, %v250
+  %v252 = add nuw nsw i64 %v23587, 32
+  %v236.not = icmp samesign ult i64 %v252, %v52
+  br i1 %v236.not, label %bb59, label %bb62.preheader
+
+bb66:                                             ; preds = %bb62.preheader
+  %v258 = fcmp ule float %v369, %v22896
+  br i1 %v258, label %bb70, label %bb67
+
+bb67:                                             ; preds = %bb66
+  %v260 = fsub contract float %v22896, %v369
+  %24 = tail call i32 @__nvvm_reflect(ptr nonnull @.str) #20
+  %.not.i = icmp eq i32 %24, 0
+  %25 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v260, float 0x3F777313A0000000, float 5.000000e-01) #20
+  %26 = tail call float @llvm.fma.f32(float %v260, float 0x3F777313A0000000, float 5.000000e-01)
+  %.02.i = select i1 %.not.i, float %26, float %25
+  %27 = tail call float @llvm.nvvm.saturate.ftz.f(float %.02.i) #20
+  %28 = tail call float @llvm.nvvm.saturate.f(float %.02.i) #20
+  %.03.i = select i1 %.not.i, float %28, float %27
+  %29 = tail call float @llvm.nvvm.fma.rm.ftz.f(float %.03.i, float 2.520000e+02, float 0x4168000020000000) #20
+  %30 = tail call float @llvm.nvvm.fma.rm.f(float %.03.i, float 2.520000e+02, float 0x4168000020000000) #20
+  %.04.i = select i1 %.not.i, float %30, float %29
+  %31 = fadd float %.04.i, 0xC168000FE0000000
+  %32 = fneg float %31
+  %33 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v260, float 0x3FF7154760000000, float %32) #20
+  %34 = tail call float @llvm.fma.f32(float %v260, float 0x3FF7154760000000, float %32)
+  %.0.i = select i1 %.not.i, float %34, float %33
+  %35 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v260, float 0x3E54AE0C00000000, float %.0.i) #20
+  %36 = tail call float @llvm.fma.f32(float %v260, float 0x3E54AE0C00000000, float %.0.i)
+  %.01.i = select i1 %.not.i, float %36, float %35
+  %37 = bitcast float %.04.i to i32
+  %38 = shl i32 %37, 23
+  %39 = bitcast i32 %38 to float
+  %40 = tail call float @llvm.nvvm.ex2.approx.ftz.f32(float %.01.i)
+  %41 = fmul float %40, %39
+  br label %bb70
+
+bb70:                                             ; preds = %bb67, %bb66, %bb62.preheader
+  %v264 = phi float [ %v369, %bb62.preheader ], [ %v369, %bb67 ], [ %v22896, %bb66 ]
+  %v265 = phi float [ 0.000000e+00, %bb62.preheader ], [ %41, %bb67 ], [ 1.000000e+00, %bb66 ]
+  %v266 = fsub contract float %v369, %v264
+  %42 = tail call i32 @__nvvm_reflect(ptr nonnull @.str) #20
+  %.not.i16 = icmp eq i32 %42, 0
+  %43 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v266, float 0x3F777313A0000000, float 5.000000e-01) #20
+  %44 = tail call float @llvm.fma.f32(float %v266, float 0x3F777313A0000000, float 5.000000e-01)
+  %.02.i17 = select i1 %.not.i16, float %44, float %43
+  %45 = tail call float @llvm.nvvm.saturate.ftz.f(float %.02.i17) #20
+  %46 = tail call float @llvm.nvvm.saturate.f(float %.02.i17) #20
+  %.03.i18 = select i1 %.not.i16, float %46, float %45
+  %47 = tail call float @llvm.nvvm.fma.rm.ftz.f(float %.03.i18, float 2.520000e+02, float 0x4168000020000000) #20
+  %48 = tail call float @llvm.nvvm.fma.rm.f(float %.03.i18, float 2.520000e+02, float 0x4168000020000000) #20
+  %.04.i19 = select i1 %.not.i16, float %48, float %47
+  %49 = fadd float %.04.i19, 0xC168000FE0000000
+  %50 = fneg float %49
+  %51 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v266, float 0x3FF7154760000000, float %50) #20
+  %52 = tail call float @llvm.fma.f32(float %v266, float 0x3FF7154760000000, float %50)
+  %.0.i20 = select i1 %.not.i16, float %52, float %51
+  %53 = tail call float @llvm.nvvm.fma.rn.ftz.f(float %v266, float 0x3E54AE0C00000000, float %.0.i20) #20
+  %54 = tail call float @llvm.fma.f32(float %v266, float 0x3E54AE0C00000000, float %.0.i20)
+  %.01.i21 = select i1 %.not.i16, float %54, float %53
+  %55 = bitcast float %.04.i19 to i32
+  %56 = shl i32 %55, 23
+  %57 = bitcast i32 %56 to float
+  %58 = tail call float @llvm.nvvm.ex2.approx.ftz.f32(float %.01.i21)
+  %59 = fmul float %58, %57
+  %v371 = fmul contract float %v22997, %v265
+  %v372 = fadd contract float %v371, %59
+  br i1 %v236.not85, label %bb71, label %bb73
+
+bb71:                                             ; preds = %bb70
+  %v274 = fmul contract float %v22492, %v265
+  %.idx12 = shl i64 %v23199, 9
+  %gep108 = getelementptr i8, ptr addrspace(3) %gep117, i64 %.idx12
+  %v273 = load float, ptr addrspace(3) %gep108, align 4
+  %v275 = fmul contract float %59, %v273
+  %v276 = fadd contract float %v274, %v275
+  br label %bb73
+
+bb73:                                             ; preds = %bb70, %bb71
+  %v277 = phi float [ %v276, %bb71 ], [ %v22492, %bb70 ]
+  br i1 %v279.not, label %bb74, label %bb77
+
+bb74:                                             ; preds = %bb73
+  %v288 = fmul contract float %v22593, %v265
+  %.idx13 = shl i64 %v23199, 9
+  %gep110 = getelementptr i8, ptr addrspace(3) %gep117, i64 %.idx13
+  %v286 = getelementptr i8, ptr addrspace(3) %gep110, i64 128
+  %v287 = load float, ptr addrspace(3) %v286, align 4
+  %v289 = fmul contract float %59, %v287
+  %v290 = fadd contract float %v288, %v289
+  br label %bb77
+
+bb77:                                             ; preds = %bb73, %bb74
+  %v291 = phi float [ %v290, %bb74 ], [ %v22593, %bb73 ]
+  br i1 %v293.not, label %bb78, label %bb81
+
+bb78:                                             ; preds = %bb77
+  %v302 = fmul contract float %v22694, %v265
+  %.idx14 = shl i64 %v23199, 9
+  %gep112 = getelementptr i8, ptr addrspace(3) %gep117, i64 %.idx14
+  %v300 = getelementptr i8, ptr addrspace(3) %gep112, i64 256
+  %v301 = load float, ptr addrspace(3) %v300, align 4
+  %v303 = fmul contract float %59, %v301
+  %v304 = fadd contract float %v302, %v303
+  br label %bb81
+
+bb81:                                             ; preds = %bb77, %bb78
+  %v305 = phi float [ %v304, %bb78 ], [ %v22694, %bb77 ]
+  br i1 %v307.not, label %bb82, label %bb85
+
+bb82:                                             ; preds = %bb81
+  %v316 = fmul contract float %v22795, %v265
+  %.idx15 = shl i64 %v23199, 9
+  %gep114 = getelementptr i8, ptr addrspace(3) %gep117, i64 %.idx15
+  %v314 = getelementptr i8, ptr addrspace(3) %gep114, i64 384
+  %v315 = load float, ptr addrspace(3) %v314, align 4
+  %v317 = fmul contract float %59, %v315
+  %v318 = fadd contract float %v316, %v317
+  br label %bb85
+
+bb85:                                             ; preds = %bb81, %bb82
+  %v319 = phi float [ %v318, %bb82 ], [ %v22795, %bb81 ]
+  %v320 = add nuw nsw i64 %v23199, 1
+  %exitcond.not = icmp eq i64 %v320, %umax133
+  br i1 %exitcond.not, label %bb86, label %bb58.preheader
+
+bb86:                                             ; preds = %bb85, %bb52
+  %v224.lcssa = phi float [ %v83124, %bb52 ], [ %v277, %bb85 ]
+  %v225.lcssa = phi float [ %v84125, %bb52 ], [ %v291, %bb85 ]
+  %v226.lcssa = phi float [ %v85126, %bb52 ], [ %v305, %bb85 ]
+  %v227.lcssa = phi float [ %v86127, %bb52 ], [ %v319, %bb85 ]
+  %v228.lcssa = phi float [ %v87128, %bb52 ], [ %v264, %bb85 ]
+  %v229.lcssa = phi float [ %v88129, %bb52 ], [ %v372, %bb85 ]
+  %v230.lcssa = phi i1 [ %v89130, %bb52 ], [ true, %bb85 ]
+  br i1 %v204, label %bb87, label %bb91
+
+bb87:                                             ; preds = %bb86
+  %v322 = getelementptr inbounds nuw i32, ptr addrspace(3) @__shared_mem_15, i64 %v214
+  store i32 0, ptr addrspace(3) %v322, align 4
+  br label %bb91
+
+bb91:                                             ; preds = %bb86, %bb87, %bb47
+  %v323 = phi float [ %v83124, %bb47 ], [ %v224.lcssa, %bb87 ], [ %v224.lcssa, %bb86 ]
+  %v324 = phi float [ %v84125, %bb47 ], [ %v225.lcssa, %bb87 ], [ %v225.lcssa, %bb86 ]
+  %v325 = phi float [ %v85126, %bb47 ], [ %v226.lcssa, %bb87 ], [ %v226.lcssa, %bb86 ]
+  %v326 = phi float [ %v86127, %bb47 ], [ %v227.lcssa, %bb87 ], [ %v227.lcssa, %bb86 ]
+  %v327 = phi float [ %v87128, %bb47 ], [ %v228.lcssa, %bb87 ], [ %v228.lcssa, %bb86 ]
+  %v328 = phi float [ %v88129, %bb47 ], [ %v229.lcssa, %bb87 ], [ %v229.lcssa, %bb86 ]
+  %v329 = phi i1 [ %v89130, %bb47 ], [ %v230.lcssa, %bb87 ], [ %v230.lcssa, %bb86 ]
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #19
+  %v331 = add nuw nsw i32 %v90131, 1
+  %exitcond134.not = icmp eq i32 %v90131, %4
+  br i1 %exitcond134.not, label %bb93, label %bb19
+
+bb93:                                             ; preds = %bb91
+  %v332 = icmp ne i32 %v467, 1
+  %v333 = xor i1 %v329, true
+  %or.cond3 = select i1 %v332, i1 true, i1 %v333
+  %v334 = fcmp ule float %v328, 0.000000e+00
+  %or.cond6 = select i1 %or.cond3, i1 true, i1 %v334
+  br i1 %or.cond6, label %bb110, label %bb96
+
+bb96:                                             ; preds = %bb93
+  %v336 = fdiv contract float 1.000000e+00, %v328
+  br i1 %v236.not85, label %bb97, label %bb98
+
+bb97:                                             ; preds = %bb96
+  %v342 = fmul contract float %v323, %v336
+  %60 = getelementptr inbounds nuw float, ptr %v17, i64 %v68
+  %v341 = getelementptr inbounds nuw float, ptr %60, i64 %v45
+  store float %v342, ptr %v341, align 4
+  br label %bb98
+
+bb98:                                             ; preds = %bb97, %bb96
+  br i1 %v279.not, label %bb99, label %bb101
+
+bb99:                                             ; preds = %bb98
+  %v350 = fmul contract float %v324, %v336
+  %61 = getelementptr inbounds nuw float, ptr %v17, i64 %v68
+  %62 = getelementptr inbounds nuw float, ptr %61, i64 %v45
+  %v349 = getelementptr inbounds nuw i8, ptr %62, i64 128
+  store float %v350, ptr %v349, align 4
+  br label %bb101
+
+bb101:                                            ; preds = %bb98, %bb99
+  br i1 %v293.not, label %bb102, label %bb104
+
+bb102:                                            ; preds = %bb101
+  %v358 = fmul contract float %v325, %v336
+  %63 = getelementptr inbounds nuw float, ptr %v17, i64 %v68
+  %64 = getelementptr inbounds nuw float, ptr %63, i64 %v45
+  %v357 = getelementptr inbounds nuw i8, ptr %64, i64 256
+  store float %v358, ptr %v357, align 4
+  br label %bb104
+
+bb104:                                            ; preds = %bb101, %bb102
+  br i1 %v307.not, label %bb105, label %bb110
+
+bb105:                                            ; preds = %bb104
+  %v366 = fmul contract float %v326, %v336
+  %65 = getelementptr inbounds nuw float, ptr %v17, i64 %v68
+  %66 = getelementptr inbounds nuw float, ptr %65, i64 %v45
+  %v365 = getelementptr inbounds nuw i8, ptr %66, i64 384
+  store float %v366, ptr %v365, align 4
+  br label %bb110
+
+bb110:                                            ; preds = %bb93, %bb104, %bb105, %entry
+  ret void
+
+bb119:                                            ; preds = %bb30.lr.ph
+  tail call void @llvm.trap() #19
+  unreachable
+}
+
 ; Function Attrs: convergent nounwind memory(argmem: readwrite, inaccessiblemem: write)
 define ptx_kernel void @attention_heads(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, float %v10, ptr captures(none) %v11, i64 %v12) #0 {
 entry:
@@ -2334,7 +3929,7 @@ bb52:                                             ; preds = %bb30
 }
 
 ; Function Attrs: convergent nounwind memory(argmem: readwrite, inaccessiblemem: readwrite)
-define ptx_kernel void @attention_paged_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, float %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, i32 %v15, ptr writeonly captures(none) %v16, i64 %v17) #3 {
+define ptx_kernel void @attention_paged_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, float %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, i32 %v15, ptr writeonly captures(none) %v16, i64 %v17) #4 {
 entry:
   %v40 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v41 = zext nneg i32 %v40 to i64
@@ -4078,7 +5673,7 @@ bb21:                                             ; preds = %bb7
 }
 
 ; Function Attrs: convergent mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: write)
-define ptx_kernel void @fill_u32(i32 %v0, ptr writeonly captures(address_is_null) %v1, i64 %v2) #4 {
+define ptx_kernel void @fill_u32(i32 %v0, ptr writeonly captures(address_is_null) %v1, i64 %v2) #5 {
 entry:
   %v2.i = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #19
   %v3.i = tail call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #19
@@ -4319,7 +5914,7 @@ bb6:                                              ; preds = %bb2
 }
 
 ; Function Attrs: convergent nofree norecurse nosync nounwind memory(argmem: readwrite)
-define ptx_kernel void @moe_prefix_offsets(ptr readonly captures(none) %v0, i64 %v1, ptr writeonly captures(none) %v2, i64 %v3, ptr writeonly captures(none) %v4, i64 %v5) #5 {
+define ptx_kernel void @moe_prefix_offsets(ptr readonly captures(none) %v0, i64 %v1, ptr writeonly captures(none) %v2, i64 %v3, ptr writeonly captures(none) %v4, i64 %v5) #6 {
 entry:
   %v2.i = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #19
   %v3.i = tail call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #19
@@ -4512,7 +6107,7 @@ bb25:                                             ; preds = %bb5
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @moe_q4k_project_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, ptr writeonly captures(none) %v15, i64 %v16) #6 {
+define ptx_kernel void @moe_q4k_project_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, ptr writeonly captures(none) %v15, i64 %v16) #3 {
 entry:
   %v39 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v40 = zext nneg i32 %v39 to i64
@@ -4981,7 +6576,7 @@ bb43:                                             ; preds = %bb18
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @moe_q5_0_project_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #6 {
+define ptx_kernel void @moe_q5_0_project_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #3 {
 entry:
   %v35 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v36 = zext nneg i32 %v35 to i64
@@ -5648,7 +7243,7 @@ bb33:                                             ; preds = %bb13
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @moe_q8_0_project_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #6 {
+define ptx_kernel void @moe_q8_0_project_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #3 {
 entry:
   %v34 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v35 = zext nneg i32 %v34 to i64
@@ -6831,7 +8426,7 @@ bb15:                                             ; preds = %bb3
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q4k_gate_up_swiglu_multiwarp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, ptr writeonly captures(none) %v10, i64 %v11) #6 {
+define ptx_kernel void @q4k_gate_up_swiglu_multiwarp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, ptr writeonly captures(none) %v10, i64 %v11) #3 {
 entry:
   %v31 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v32 = zext nneg i32 %v31 to i64
@@ -7260,8 +8855,8 @@ bb13:                                             ; preds = %cuda_kernels__oxide
 bb18:                                             ; preds = %bb15.preheader
   %v144.4 = fadd contract float %v144.3, %v143.4
   %v142.4 = fadd contract float %v142.3, %v115.4
-  %v119 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_16, i64 %v36
-  %v118 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_15, i64 %v36
+  %v119 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_23, i64 %v36
+  %v118 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_22, i64 %v36
   store float %v142.4, ptr addrspace(3) %v118, align 4
   store float %v144.4, ptr addrspace(3) %v119, align 4
   br label %bb21
@@ -7276,7 +8871,7 @@ bb23:                                             ; preds = %bb21
   br i1 %v122, label %bb27, label %bb24
 
 bb24:                                             ; preds = %bb23
-  %v125 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_15, i64 %v33
+  %v125 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_22, i64 %v33
   %v126 = load float, ptr addrspace(3) %v125, align 4
   br label %bb27
 
@@ -7285,7 +8880,7 @@ bb27:                                             ; preds = %bb23, %bb24
   br i1 %v122, label %bb31, label %bb28
 
 bb28:                                             ; preds = %bb27
-  %v130 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_16, i64 %v33
+  %v130 = getelementptr inbounds nuw float, ptr addrspace(3) @__shared_mem_23, i64 %v33
   %v131 = load float, ptr addrspace(3) %v130, align 4
   br label %bb31
 
@@ -7351,7 +8946,7 @@ bb38:                                             ; preds = %bb21, %bb35, %bb31,
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q4k_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #6 {
+define ptx_kernel void @q4k_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #3 {
 entry:
   %v21 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v22 = zext nneg i32 %v21 to i64
@@ -8100,7 +9695,7 @@ bb85:                                             ; preds = %bb45
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q4k_gemv_row_tiled(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, ptr writeonly captures(none) %v6, i64 %v7) #6 {
+define ptx_kernel void @q4k_gemv_row_tiled(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, ptr writeonly captures(none) %v6, i64 %v7) #3 {
 entry:
   %v21 = alloca [8 x i8], align 4
   %v22 = alloca [8 x i8], align 4
@@ -8815,7 +10410,7 @@ bb88:                                             ; preds = %bb41.split
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q4k_q8_gemv_multiwarp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #6 {
+define ptx_kernel void @q4k_q8_gemv_multiwarp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #3 {
 entry:
   %v35 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v36 = zext nneg i32 %v35 to i64
@@ -9183,7 +10778,7 @@ bb40:                                             ; preds = %bb7
 }
 
 ; Function Attrs: convergent nounwind memory(argmem: readwrite, inaccessiblemem: readwrite)
-define ptx_kernel void @q4k_q8_gemv_warp4(ptr readonly %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, ptr writeonly captures(none) %v9, i64 %v10) #3 {
+define ptx_kernel void @q4k_q8_gemv_warp4(ptr readonly %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, ptr writeonly captures(none) %v9, i64 %v10) #4 {
 entry:
   %v28 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v30 = zext i32 %v6 to i64
@@ -10472,7 +12067,7 @@ bb41:                                             ; preds = %bb17
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q5_0_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #6 {
+define ptx_kernel void @q5_0_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #3 {
 entry:
   %v23 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v24 = zext nneg i32 %v23 to i64
@@ -10803,7 +12398,7 @@ bb46:                                             ; preds = %bb18
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q6k_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #6 {
+define ptx_kernel void @q6k_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #3 {
 entry:
   %v22 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v23 = zext nneg i32 %v22 to i64
@@ -11562,7 +13157,7 @@ bb62:                                             ; preds = %bb28
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q6k_gemv_warp4(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #6 {
+define ptx_kernel void @q6k_gemv_warp4(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #3 {
 entry:
   %v21 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v22 = zext nneg i32 %v21 to i64
@@ -11838,7 +13433,7 @@ bb56:                                             ; preds = %bb4
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q6k_q8_gemv_multiwarp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #6 {
+define ptx_kernel void @q6k_q8_gemv_multiwarp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, ptr readonly captures(none) %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, ptr writeonly captures(none) %v12, i64 %v13) #3 {
 entry:
   %v35 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v36 = zext nneg i32 %v35 to i64
@@ -12125,7 +13720,7 @@ bb40:                                             ; preds = %bb7
 }
 
 ; Function Attrs: convergent nounwind memory(argmem: readwrite, inaccessiblemem: readwrite)
-define ptx_kernel void @q6k_q8_gemv_warp4(ptr readonly %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, ptr writeonly captures(none) %v9, i64 %v10) #3 {
+define ptx_kernel void @q6k_q8_gemv_warp4(ptr readonly %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, ptr readonly captures(none) %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, ptr writeonly captures(none) %v9, i64 %v10) #4 {
 entry:
   %v27 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v29 = zext i32 %v6 to i64
@@ -13129,7 +14724,7 @@ bb31:                                             ; preds = %bb12
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @q8_0_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #6 {
+define ptx_kernel void @q8_0_gemm_warp(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #3 {
 entry:
   %v22 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v23 = zext nneg i32 %v22 to i64
@@ -13506,7 +15101,7 @@ bb25:                                             ; preds = %bb22, %bb23, %entry
 }
 
 ; Function Attrs: convergent nounwind
-define ptx_kernel void @rmsnorm_group(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, float %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #6 {
+define ptx_kernel void @rmsnorm_group(ptr readonly captures(none) %v0, i64 %v1, ptr readonly captures(none) %v2, i64 %v3, float %v4, i32 %v5, i32 %v6, ptr writeonly captures(none) %v7, i64 %v8) #3 {
 entry:
   %v21 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #19
   %v22 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #19
@@ -16120,6 +17715,9 @@ bb46:                                             ; preds = %bb24
 ; Function Attrs: convergent nocallback nounwind memory(inaccessiblemem: readwrite)
 declare float @llvm.nvvm.shfl.sync.idx.f32(i32, float, i32, i32) #11
 
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #9
+
 ; Function Attrs: nofree nosync nounwind memory(none)
 declare noundef i32 @__nvvm_reflect(ptr noundef) local_unnamed_addr #13
 
@@ -16172,6 +17770,9 @@ declare float @llvm.nvvm.fma.rm.f(float, float, float) #9
 declare float @llvm.nvvm.ex2.approx.ftz.f32(float) #14
 
 ; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.umin.i32(i32, i32) #15
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
 declare float @llvm.fma.f32(float, float, float) #15
 
 ; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
@@ -16204,10 +17805,10 @@ declare void @llvm.assume(i1 noundef) #18
 attributes #0 = { convergent nounwind memory(argmem: readwrite, inaccessiblemem: write) }
 attributes #1 = { convergent norecurse nounwind }
 attributes #2 = { convergent nounwind memory(read, argmem: readwrite, inaccessiblemem: write, target_mem0: none, target_mem1: none) }
-attributes #3 = { convergent nounwind memory(argmem: readwrite, inaccessiblemem: readwrite) }
-attributes #4 = { convergent mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: write) }
-attributes #5 = { convergent nofree norecurse nosync nounwind memory(argmem: readwrite) }
-attributes #6 = { convergent nounwind }
+attributes #3 = { convergent nounwind }
+attributes #4 = { convergent nounwind memory(argmem: readwrite, inaccessiblemem: readwrite) }
+attributes #5 = { convergent mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: write) }
+attributes #6 = { convergent nofree norecurse nosync nounwind memory(argmem: readwrite) }
 attributes #7 = { mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
 attributes #8 = { cold noreturn nounwind memory(inaccessiblemem: write) }
 attributes #9 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }

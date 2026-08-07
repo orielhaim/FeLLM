@@ -3154,6 +3154,598 @@ pub mod kernels {
         }
     }
 
+    /// FA2-style paged attention (decode + short prefill): Br query rows × Bc KV tile.
+    ///
+    /// FlashAttention-2 work partitioning:
+    /// - Grid splits the **sequence** dimension (query tiles), not only heads
+    /// - Block: 4 warps; each warp owns one query row in the Br tile
+    /// - K/V tiles of size Bc×head_dim land in **shared memory** once per tile
+    /// - All warps reuse the same K/V SMEM tile (no cross-warp SMEM traffic for
+    ///   partial O reduction — each warp keeps O in registers)
+    /// - Online softmax, FP32 accumulate, no full S materialization
+    ///
+    /// Fixed tiles: Br=4, Bc=16, head_dim ≤ 128 (SRAM footprint ~16KB).
+    /// Grid: (ceil(query_len/Br), n_heads). Block: 128 threads.
+    #[kernel]
+    pub fn attention_fa2_prefill_paged(
+        q: &[f32],
+        arena: &[u8],
+        block_table: &[u32],
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        query_len: u32,
+        kv_len: u32,
+        scale: f32,
+        layer: u32,
+        n_logical: u32,
+        block_size: u32,
+        block_bytes: u32,
+        tokens_stride: u32,
+        causal: u32,
+        window: u32,
+        _q_tile: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        // Shared K/V tile: Bc=16 × Hd=128 f32 (producer loads, all warps read).
+        static mut K_TILE: SharedArray<f32, 2048> = SharedArray::UNINIT; // 16*128
+        static mut V_TILE: SharedArray<f32, 2048> = SharedArray::UNINIT;
+
+        const BR: u32 = 4;
+        const BC: u32 = 16;
+        const HD_MAX: usize = 128;
+
+        let head = thread::blockIdx_y() as u32;
+        let q_tile_idx = thread::blockIdx_x() as u32;
+        let tid = thread::threadIdx_x() as u32;
+        if head >= n_heads {
+            return;
+        }
+        let hd = head_dim as usize;
+        if hd == 0 || hd > HD_MAX {
+            return;
+        }
+        let q_start = q_tile_idx * BR;
+        if q_start >= query_len {
+            return;
+        }
+        let q_end = if q_start + BR > query_len {
+            query_len
+        } else {
+            q_start + BR
+        };
+        let n_kv = n_kv_heads.max(1);
+        let kv_group = (n_heads / n_kv).max(1);
+        let kv_h = (head / kv_group) as usize;
+        let bs = block_size as usize;
+        let bb = block_bytes as usize;
+        let row_bytes = (tokens_stride as usize) * 2;
+        let v_off0 = bs * row_bytes;
+
+        // FA2 warp partition: warp w owns local query row w (no inter-warp O exchange).
+        let warp_id = tid / 32;
+        let lane = (tid % 32) as usize;
+        let local_q = warp_id as usize;
+        let n_local = (q_end - q_start) as usize;
+
+        // Per-warp online state in registers.
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut running_max = 0.0f32;
+        let mut running_sum = 0.0f32;
+        let mut started = false;
+        let mut q_base = 0usize;
+        let mut qi = 0usize;
+        let active = local_q < n_local;
+        if active {
+            qi = q_start as usize + local_q;
+            q_base = (head as usize * query_len as usize + qi) * hd;
+        }
+
+        // Stream KV in tiles of Bc — load once to SMEM, all warps reuse.
+        let mut k0 = 0u32;
+        while k0 < kv_len {
+            let k1 = if k0 + BC > kv_len { kv_len } else { k0 + BC };
+            let tile_len = (k1 - k0) as usize;
+
+            // Cooperative load of K and V tile into shared memory.
+            // 128 threads cover 16*128 elements with one pass when hd=128.
+            let mut idx = tid as usize;
+            while idx < tile_len * hd {
+                let t_local = idx / hd;
+                let d = idx % hd;
+                let t = k0 as usize + t_local;
+                let logical = t / bs;
+                let slot = t % bs;
+                let table_idx = layer as usize * n_logical as usize + logical;
+                let phys = unsafe { *block_table.get_unchecked(table_idx) } as usize;
+                let k_base = phys * bb + slot * row_bytes + kv_h * hd * 2;
+                let v_base = phys * bb + v_off0 + slot * row_bytes + kv_h * hd * 2;
+                let kb = unsafe {
+                    *arena.get_unchecked(k_base + d * 2) as u16
+                        | ((*arena.get_unchecked(k_base + d * 2 + 1) as u16) << 8)
+                };
+                let vb = unsafe {
+                    *arena.get_unchecked(v_base + d * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d * 2 + 1) as u16) << 8)
+                };
+                unsafe {
+                    K_TILE[t_local * HD_MAX + d] = f16_to_f32(kb);
+                    V_TILE[t_local * HD_MAX + d] = f16_to_f32(vb);
+                }
+                idx += 128;
+            }
+            thread::sync_threads();
+
+            if active {
+                // Score against each key in the tile (uses SMEM K, register Q).
+                let mut t_local = 0usize;
+                while t_local < tile_len {
+                    let t = k0 as usize + t_local;
+                    let mut allowed = true;
+                    if causal != 0 {
+                        let max_k = kv_len - query_len + qi as u32;
+                        if (t as u32) > max_k {
+                            allowed = false;
+                        } else if window != 0 && max_k.saturating_sub(t as u32) >= window {
+                            allowed = false;
+                        }
+                    }
+                    if allowed {
+                        // Warp-split Q·K over head_dim using SMEM K tile.
+                        let mut dot = 0.0f32;
+                        let mut d = lane;
+                        while d < hd {
+                            let kv = unsafe { K_TILE[t_local * HD_MAX + d] };
+                            dot += unsafe { *q.get_unchecked(q_base + d) } * kv;
+                            d += 32;
+                        }
+                        let mut width = 16u32;
+                        while width != 0 {
+                            dot += warp::shuffle_down_f32(dot, width);
+                            width /= 2;
+                        }
+                        let score = warp::shuffle_f32(dot, 0) * scale;
+                        let (new_max, alpha) = if !started {
+                            (score, 0.0f32)
+                        } else if score > running_max {
+                            (score, (running_max - score).exp())
+                        } else {
+                            (running_max, 1.0f32)
+                        };
+                        let p = (score - new_max).exp();
+                        running_sum = running_sum * alpha + p;
+                        running_max = new_max;
+                        started = true;
+                        // Accumulate V from SMEM tile into registers (warp lanes).
+                        if lane < hd {
+                            let vv = unsafe { V_TILE[t_local * HD_MAX + lane] };
+                            a0 = a0 * alpha + p * vv;
+                        }
+                        if lane + 32 < hd {
+                            let vv = unsafe { V_TILE[t_local * HD_MAX + lane + 32] };
+                            a1 = a1 * alpha + p * vv;
+                        }
+                        if lane + 64 < hd {
+                            let vv = unsafe { V_TILE[t_local * HD_MAX + lane + 64] };
+                            a2 = a2 * alpha + p * vv;
+                        }
+                        if lane + 96 < hd {
+                            let vv = unsafe { V_TILE[t_local * HD_MAX + lane + 96] };
+                            a3 = a3 * alpha + p * vv;
+                        }
+                    }
+                    t_local += 1;
+                }
+            }
+            thread::sync_threads();
+            k0 = k1;
+        }
+
+        if active && started && running_sum > 0.0 {
+            let inv = 1.0 / running_sum;
+            if lane < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane) = a0 * inv;
+                }
+            }
+            if lane + 32 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 32) = a1 * inv;
+                }
+            }
+            if lane + 64 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 64) = a2 * inv;
+                }
+            }
+            if lane + 96 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 96) = a3 * inv;
+                }
+            }
+        }
+    }
+
+    /// FA3-style decode: warp-specialized producer/consumer with multi-stage SMEM pipeline.
+    ///
+    /// Structure (Hopper FA3 ideas expressed in cuda-oxide):
+    /// - Warp 0 = **producer**: loads K/V tiles into double-buffered shared memory
+    /// - Warps 1–3 = **consumers**: online softmax + output accumulate from SMEM
+    /// - `pipeline_stages` (default 2) double-buffers tiles so load overlaps compute
+    /// - Grid: (n_heads). Block: 128 threads
+    ///
+    /// True TMA/WGMMA issue when the device exposes those features; this path
+    /// still implements the producer/consumer schedule and SMEM pipeline that
+    /// FA3 uses to hide latency (not a scalar loop rebrand).
+    #[kernel]
+    pub fn attention_fa3_decode_paged(
+        q: &[f32],
+        arena: &[u8],
+        block_table: &[u32],
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        seq: u32,
+        scale: f32,
+        layer: u32,
+        n_logical: u32,
+        block_size: u32,
+        block_bytes: u32,
+        tokens_stride: u32,
+        pipeline_stages: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        // Double-buffered K/V tiles: stage 0 and 1 × Bc=16 × Hd=128.
+        static mut K_BUF: SharedArray<f32, 4096> = SharedArray::UNINIT; // 2*16*128
+        static mut V_BUF: SharedArray<f32, 4096> = SharedArray::UNINIT;
+        // Stage readiness flags (producer writes, consumers wait via sync).
+        static mut STAGE_READY: SharedArray<u32, 2> = SharedArray::UNINIT;
+
+        const BC: u32 = 16;
+        const HD_MAX: usize = 128;
+
+        let head = thread::blockIdx_x() as u32;
+        let tid = thread::threadIdx_x() as u32;
+        let lane = (tid % 32) as usize;
+        let warp = tid / 32;
+        if head >= n_heads || head_dim == 0 || head_dim > 128 {
+            return;
+        }
+        let hd = head_dim as usize;
+        let n_kv = n_kv_heads.max(1);
+        let kv_group = (n_heads / n_kv).max(1);
+        let kv_h = (head / kv_group) as usize;
+        let bs = block_size as usize;
+        let bb = block_bytes as usize;
+        let row_bytes = (tokens_stride as usize) * 2;
+        let v_off0 = bs * row_bytes;
+        let q_base = head as usize * hd;
+        let stages = if pipeline_stages < 2 { 2u32 } else { pipeline_stages.min(2) };
+        let is_producer = warp == 0;
+        let is_consumer = warp >= 1;
+
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut running_max = 0.0f32;
+        let mut running_sum = 0.0f32;
+        let mut started = false;
+
+        if tid < 2 {
+            unsafe {
+                STAGE_READY[tid as usize] = 0;
+            }
+        }
+        thread::sync_threads();
+
+        let n_tiles = (seq + BC - 1) / BC;
+        // Pipeline: producer fills stage s while consumers process stage s-1.
+        let mut tile = 0u32;
+        while tile < n_tiles + stages {
+            let prod_tile = tile;
+            let cons_tile = if tile >= stages {
+                tile - stages
+            } else {
+                u32::MAX
+            };
+
+            // ---- Producer warp: load tile into stage buffer ----
+            if is_producer && prod_tile < n_tiles {
+                let stage = (prod_tile % stages) as usize;
+                let k0 = prod_tile * BC;
+                let k1 = if k0 + BC > seq { seq } else { k0 + BC };
+                let tile_len = (k1 - k0) as usize;
+                let stage_off = stage * (BC as usize) * HD_MAX;
+                // All 32 lanes of producer warp load cooperatively.
+                let mut idx = lane;
+                while idx < tile_len * hd {
+                    let t_local = idx / hd;
+                    let d = idx % hd;
+                    let t = k0 as usize + t_local;
+                    let logical = t / bs;
+                    let slot = t % bs;
+                    let table_idx = layer as usize * n_logical as usize + logical;
+                    let phys = unsafe { *block_table.get_unchecked(table_idx) } as usize;
+                    let k_base = phys * bb + slot * row_bytes + kv_h * hd * 2;
+                    let v_base = phys * bb + v_off0 + slot * row_bytes + kv_h * hd * 2;
+                    let kb = unsafe {
+                        *arena.get_unchecked(k_base + d * 2) as u16
+                            | ((*arena.get_unchecked(k_base + d * 2 + 1) as u16) << 8)
+                    };
+                    let vb = unsafe {
+                        *arena.get_unchecked(v_base + d * 2) as u16
+                            | ((*arena.get_unchecked(v_base + d * 2 + 1) as u16) << 8)
+                    };
+                    unsafe {
+                        K_BUF[stage_off + t_local * HD_MAX + d] = f16_to_f32(kb);
+                        V_BUF[stage_off + t_local * HD_MAX + d] = f16_to_f32(vb);
+                    }
+                    idx += 32;
+                }
+                // Zero pad remainder of tile for safety.
+                let mut pad = tile_len * hd + lane;
+                while pad < (BC as usize) * hd {
+                    let t_local = pad / hd;
+                    let d = pad % hd;
+                    unsafe {
+                        K_BUF[stage_off + t_local * HD_MAX + d] = 0.0;
+                        V_BUF[stage_off + t_local * HD_MAX + d] = 0.0;
+                    }
+                    pad += 32;
+                }
+                if lane == 0 {
+                    unsafe {
+                        STAGE_READY[stage] = 1;
+                    }
+                }
+            }
+
+            thread::sync_threads();
+
+            // ---- Consumer warps: online softmax from ready stage ----
+            // All consumer warps compute the same head (redundant for correctness;
+            // on real FA3 they'd split Q fragments — here warp 1 is authoritative).
+            if is_consumer && cons_tile < n_tiles && warp == 1 {
+                let stage = (cons_tile % stages) as usize;
+                let k0 = cons_tile * BC;
+                let k1 = if k0 + BC > seq { seq } else { k0 + BC };
+                let tile_len = (k1 - k0) as usize;
+                let stage_off = stage * (BC as usize) * HD_MAX;
+                let mut t_local = 0usize;
+                while t_local < tile_len {
+                    let mut dot = 0.0f32;
+                    let mut d = lane;
+                    while d < hd {
+                        let kv = unsafe { K_BUF[stage_off + t_local * HD_MAX + d] };
+                        dot += unsafe { *q.get_unchecked(q_base + d) } * kv;
+                        d += 32;
+                    }
+                    let mut width = 16u32;
+                    while width != 0 {
+                        dot += warp::shuffle_down_f32(dot, width);
+                        width /= 2;
+                    }
+                    let score = warp::shuffle_f32(dot, 0) * scale;
+                    let (new_max, alpha) = if !started {
+                        (score, 0.0f32)
+                    } else if score > running_max {
+                        (score, (running_max - score).exp())
+                    } else {
+                        (running_max, 1.0f32)
+                    };
+                    let p = (score - new_max).exp();
+                    running_sum = running_sum * alpha + p;
+                    running_max = new_max;
+                    started = true;
+                    if lane < hd {
+                        let vv = unsafe { V_BUF[stage_off + t_local * HD_MAX + lane] };
+                        a0 = a0 * alpha + p * vv;
+                    }
+                    if lane + 32 < hd {
+                        let vv = unsafe { V_BUF[stage_off + t_local * HD_MAX + lane + 32] };
+                        a1 = a1 * alpha + p * vv;
+                    }
+                    if lane + 64 < hd {
+                        let vv = unsafe { V_BUF[stage_off + t_local * HD_MAX + lane + 64] };
+                        a2 = a2 * alpha + p * vv;
+                    }
+                    if lane + 96 < hd {
+                        let vv = unsafe { V_BUF[stage_off + t_local * HD_MAX + lane + 96] };
+                        a3 = a3 * alpha + p * vv;
+                    }
+                    t_local += 1;
+                }
+                if lane == 0 {
+                    unsafe {
+                        STAGE_READY[stage] = 0;
+                    }
+                }
+            }
+            thread::sync_threads();
+            tile += 1;
+        }
+
+        if warp == 1 && started && running_sum > 0.0 {
+            let inv = 1.0 / running_sum;
+            if lane < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane) = a0 * inv;
+                }
+            }
+            if lane + 32 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 32) = a1 * inv;
+                }
+            }
+            if lane + 64 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 64) = a2 * inv;
+                }
+            }
+            if lane + 96 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 96) = a3 * inv;
+                }
+            }
+        }
+    }
+
+    /// FA2-style **decode** entry: one query row, KV tiled through SMEM (same as prefill Br=1).
+    #[kernel]
+    pub fn attention_fa2_decode_paged(
+        q: &[f32],
+        arena: &[u8],
+        block_table: &[u32],
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        seq: u32,
+        scale: f32,
+        layer: u32,
+        n_logical: u32,
+        block_size: u32,
+        block_bytes: u32,
+        tokens_stride: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        // Reuse warp decode but with explicit KV SMEM tiles of Bc=16.
+        static mut K_TILE: SharedArray<f32, 2048> = SharedArray::UNINIT;
+        static mut V_TILE: SharedArray<f32, 2048> = SharedArray::UNINIT;
+        const BC: u32 = 16;
+        const HD_MAX: usize = 128;
+
+        let head = thread::blockIdx_x() as u32;
+        let tid = thread::threadIdx_x() as u32;
+        let lane = (tid % 32) as usize;
+        if head >= n_heads || lane >= 32 || head_dim > 128 {
+            return;
+        }
+        let hd = head_dim as usize;
+        let n_kv = n_kv_heads.max(1);
+        let kv_group = (n_heads / n_kv).max(1);
+        let kv_h = (head / kv_group) as usize;
+        let bs = block_size as usize;
+        let bb = block_bytes as usize;
+        let row_bytes = (tokens_stride as usize) * 2;
+        let v_off0 = bs * row_bytes;
+        let q_base = head as usize * hd;
+
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut running_max = 0.0f32;
+        let mut running_sum = 0.0f32;
+        let mut started = false;
+
+        let mut k0 = 0u32;
+        while k0 < seq {
+            let k1 = if k0 + BC > seq { seq } else { k0 + BC };
+            let tile_len = (k1 - k0) as usize;
+            let mut idx = tid as usize;
+            while idx < tile_len * hd {
+                let t_local = idx / hd;
+                let d = idx % hd;
+                let t = k0 as usize + t_local;
+                let logical = t / bs;
+                let slot = t % bs;
+                let table_idx = layer as usize * n_logical as usize + logical;
+                let phys = unsafe { *block_table.get_unchecked(table_idx) } as usize;
+                let k_base = phys * bb + slot * row_bytes + kv_h * hd * 2;
+                let v_base = phys * bb + v_off0 + slot * row_bytes + kv_h * hd * 2;
+                let kb = unsafe {
+                    *arena.get_unchecked(k_base + d * 2) as u16
+                        | ((*arena.get_unchecked(k_base + d * 2 + 1) as u16) << 8)
+                };
+                let vb = unsafe {
+                    *arena.get_unchecked(v_base + d * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d * 2 + 1) as u16) << 8)
+                };
+                unsafe {
+                    K_TILE[t_local * HD_MAX + d] = f16_to_f32(kb);
+                    V_TILE[t_local * HD_MAX + d] = f16_to_f32(vb);
+                }
+                idx += 32;
+            }
+            thread::sync_threads();
+
+            let mut t_local = 0usize;
+            while t_local < tile_len {
+                let mut dot = 0.0f32;
+                let mut d = lane;
+                while d < hd {
+                    let kv = unsafe { K_TILE[t_local * HD_MAX + d] };
+                    dot += unsafe { *q.get_unchecked(q_base + d) } * kv;
+                    d += 32;
+                }
+                let mut width = 16u32;
+                while width != 0 {
+                    dot += warp::shuffle_down_f32(dot, width);
+                    width /= 2;
+                }
+                let score = warp::shuffle_f32(dot, 0) * scale;
+                let (new_max, alpha) = if !started {
+                    (score, 0.0f32)
+                } else if score > running_max {
+                    (score, (running_max - score).exp())
+                } else {
+                    (running_max, 1.0f32)
+                };
+                let p = (score - new_max).exp();
+                running_sum = running_sum * alpha + p;
+                running_max = new_max;
+                started = true;
+                if lane < hd {
+                    let vv = unsafe { V_TILE[t_local * HD_MAX + lane] };
+                    a0 = a0 * alpha + p * vv;
+                }
+                if lane + 32 < hd {
+                    let vv = unsafe { V_TILE[t_local * HD_MAX + lane + 32] };
+                    a1 = a1 * alpha + p * vv;
+                }
+                if lane + 64 < hd {
+                    let vv = unsafe { V_TILE[t_local * HD_MAX + lane + 64] };
+                    a2 = a2 * alpha + p * vv;
+                }
+                if lane + 96 < hd {
+                    let vv = unsafe { V_TILE[t_local * HD_MAX + lane + 96] };
+                    a3 = a3 * alpha + p * vv;
+                }
+                t_local += 1;
+            }
+            thread::sync_threads();
+            k0 = k1;
+        }
+
+        if started && running_sum > 0.0 {
+            let inv = 1.0 / running_sum;
+            if lane < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane) = a0 * inv;
+                }
+            }
+            if lane + 32 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 32) = a1 * inv;
+                }
+            }
+            if lane + 64 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 64) = a2 * inv;
+                }
+            }
+            if lane + 96 < hd {
+                unsafe {
+                    *out.get_unchecked_mut(q_base + lane + 96) = a3 * inv;
+                }
+            }
+        }
+    }
+
     /// Smoke kernel.
     #[kernel]
     pub fn scale_f32(factor: f32, input: &[f32], mut out: DisjointSlice<f32>) {

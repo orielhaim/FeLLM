@@ -27,6 +27,24 @@ fn cfg_warp_blocks(blocks: u32) -> LaunchConfig {
     }
 }
 
+/// FA2 prefill: grid (q_tiles, n_heads), 4 warps, SMEM for K/V tiles.
+fn cfg_fa2_prefill(q_tiles: u32, n_heads: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (q_tiles.max(1), n_heads.max(1), 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0, // static SharedArray in kernel
+    }
+}
+
+/// FA2/FA3 decode: one block per head, 4 warps, SMEM tiles.
+fn cfg_fa_decode(n_heads: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n_heads.max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn cfg_mmvq_blocks(blocks: u32, _n_blocks: u32) -> LaunchConfig {
     let warps = 4;
     LaunchConfig {
@@ -273,6 +291,23 @@ pub unsafe extern "C" fn launch_rope(
         let out = f32_slice_mut(out_t)?;
         if x.len() != out.len() {
             return Err(-2);
+        }
+        // Host-side pre-RoPE key snapshot before device rotation (device-resident
+        // path still uses device rope; scoring policies read this host mirror).
+        if attrs.custom_op_id == 1 {
+            let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
+            if row_width > 0 && !x.is_empty() {
+                let row = if x.len() >= row_width {
+                    &x[x.len() - row_width..]
+                } else {
+                    x
+                };
+                fellm_plugin_abi::pre_rope_write(
+                    attrs.layer_ord as usize,
+                    attrs.position as usize,
+                    row,
+                );
+            }
         }
         let n = x.len();
         let _ctx = oxide_ctx();
@@ -2237,25 +2272,85 @@ pub unsafe extern "C" fn launch_attention(
                         std::sync::Arc::clone(ctx),
                     )
                 };
+                let q_len = attrs.query_len.max(1);
+                let path = fellm_plugin_abi::resolve_path(q_len, attrs.custom_op_id);
+                let dispatch = fellm_plugin_abi::attention_dispatch();
                 let launch_rc = unsafe {
-                    module.attention_paged_warp(
-                        &stream,
-                        cfg_warp_blocks(n_heads as u32),
-                        &qd,
-                        &arena,
-                        &td,
-                        n_heads as u32,
-                        n_kv as u32,
-                        head_dim as u32,
-                        seq as u32,
-                        scale,
-                        attrs.layer_ord,
-                        snap.n_logical_blocks as u32,
-                        snap.block_size as u32,
-                        snap.block_bytes as u32,
-                        snap.tokens_stride as u32,
-                        &mut od,
-                    )
+                    match path {
+                        fellm_plugin_abi::AttentionKernelPath::Fa3Decode
+                        | fellm_plugin_abi::AttentionKernelPath::Fa3Prefill => module
+                            .attention_fa3_decode_paged(
+                                &stream,
+                                cfg_fa_decode(n_heads as u32),
+                                &qd,
+                                &arena,
+                                &td,
+                                n_heads as u32,
+                                n_kv as u32,
+                                head_dim as u32,
+                                seq as u32,
+                                scale,
+                                attrs.layer_ord,
+                                snap.n_logical_blocks as u32,
+                                snap.block_size as u32,
+                                snap.block_bytes as u32,
+                                snap.tokens_stride as u32,
+                                dispatch.pipeline_stages.max(2),
+                                &mut od,
+                            ),
+                        fellm_plugin_abi::AttentionKernelPath::Fa2Prefill
+                            if q_len > 1 =>
+                        {
+                            let br = dispatch.q_tile.max(4);
+                            let q_tiles = q_len.div_ceil(br);
+                            module.attention_fa2_prefill_paged(
+                                &stream,
+                                cfg_fa2_prefill(q_tiles, n_heads as u32),
+                                &qd,
+                                &arena,
+                                &td,
+                                n_heads as u32,
+                                n_kv as u32,
+                                head_dim as u32,
+                                q_len,
+                                seq as u32,
+                                scale,
+                                attrs.layer_ord,
+                                snap.n_logical_blocks as u32,
+                                snap.block_size as u32,
+                                snap.block_bytes as u32,
+                                snap.tokens_stride as u32,
+                                if attrs.attention_mode == 0 { 1 } else { 0 },
+                                attrs.attention_window,
+                                br,
+                                &mut od,
+                            )
+                        }
+                        fellm_plugin_abi::AttentionKernelPath::Fa2Decode
+                        | fellm_plugin_abi::AttentionKernelPath::Fa2Prefill
+                        | fellm_plugin_abi::AttentionKernelPath::HostFa2
+                        | fellm_plugin_abi::AttentionKernelPath::Auto => {
+                            // Default decode: FA2 tiled SMEM path (not scalar warp loop).
+                            module.attention_fa2_decode_paged(
+                                &stream,
+                                cfg_fa_decode(n_heads as u32),
+                                &qd,
+                                &arena,
+                                &td,
+                                n_heads as u32,
+                                n_kv as u32,
+                                head_dim as u32,
+                                seq as u32,
+                                scale,
+                                attrs.layer_ord,
+                                snap.n_logical_blocks as u32,
+                                snap.block_size as u32,
+                                snap.block_bytes as u32,
+                                snap.tokens_stride as u32,
+                                &mut od,
+                            )
+                        }
+                    }
                 };
                 buffers::release_wrap(arena);
                 buffers::put_f32(q_key, qd, true)?;

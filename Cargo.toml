@@ -4,6 +4,7 @@ members = [
   "crates/*",
   "plugins/example_cpu_op",
   "plugins/diffusion_gemma",
+  "plugins/triattention",
 ]
 
 # cuda_kernels: build under WSL2 (see scripts/wsl-build-cuda.sh). Excluded so
@@ -30,6 +31,7 @@ fellm-model = { path = "crates/fellm-model", version = "0.1.0" }
 fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
 backend-cuda = { path = "crates/backend-cuda", version = "0.1.0" }
+fellm-triattention = { path = "plugins/triattention", version = "0.1.0" }
 libloading = "0.9"
 
 # External

@@ -113,6 +113,32 @@ impl PhysicalPool {
         self.free.len()
     }
 
+    /// Number of blocks currently allocated (not on the free list).
+    #[must_use]
+    pub fn allocated_count(&self) -> usize {
+        self.n_blocks.saturating_sub(self.free.len())
+    }
+
+    /// Release a physical block owned by a sequence after compaction when
+    /// its refcount reaches zero. Prefer [`Self::dec_ref`] when the block
+    /// may still be shared via prefix cache.
+    pub fn reclaim_exclusive(&mut self, id: u32) -> bool {
+        let idx = id as usize;
+        if idx >= self.n_blocks {
+            return false;
+        }
+        if self.meta[idx].refcount <= 1 {
+            self.meta[idx].refcount = 0;
+            if !self.free.contains(&id) {
+                self.free.push(id);
+            }
+            true
+        } else {
+            self.dec_ref(id);
+            self.meta[idx].refcount == 0
+        }
+    }
+
     /// Allocate one physical block. `O(1)`.
     pub fn alloc_block(&mut self) -> Option<u32> {
         let id = self.free.pop()?;

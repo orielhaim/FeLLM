@@ -127,42 +127,112 @@ pub struct DeviceStepParams {
     pub seed: u64,
 }
 
-/// Macro-operation understood by device plan compilers.
+/// Stable numeric macro-operation identity.
+///
+/// Built-ins occupy the low range. Plugins derive namespaced ids via
+/// [`Self::custom`]. Semantic attention requirements use names such as
+/// [`Self::PagedAttentionDecode`] — never product/algorithm brands.
+/// Prepared plans store this integer plus a `kernel_variant` handle; steady-
+/// state execution never string-dispatches.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MacroOpKind {
+pub struct MacroOpKind(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl MacroOpKind {
     /// Embedding lookup into the static activation arena.
-    Embedding,
+    pub const Embedding: Self = Self(0);
     /// RMS normalization fused with Q8_1 activation preparation.
-    RmsNormQuantizeQ8_1,
+    pub const RmsNormQuantizeQ8_1: Self = Self(1);
     /// Packed Q/K/V quantized projection.
-    QkvMmvq,
+    pub const QkvMmvq: Self = Self(2);
     /// RoPE plus direct device KV commit.
-    RopeKvCommit,
-    /// Tiled paged single-query attention.
-    PagedFlashDecode,
+    pub const RopeKvCommit: Self = Self(3);
+    /// Paged attention decode (single-query). Provider selects the kernel.
+    pub const PagedAttentionDecode: Self = Self(4);
+    /// Contiguous (non-paged) attention decode.
+    pub const ContiguousAttentionDecode: Self = Self(5);
+    /// Paged attention prefill (multi-query).
+    pub const PagedAttentionPrefill: Self = Self(6);
+    /// Contiguous attention prefill.
+    pub const ContiguousAttentionPrefill: Self = Self(7);
     /// Output projection with residual epilogue.
-    OutputProjectionResidual,
+    pub const OutputProjectionResidual: Self = Self(8);
     /// Packed gate/up projection with SwiGLU epilogue.
-    GateUpMmvqSwiglu,
+    pub const GateUpMmvqSwiglu: Self = Self(9);
     /// Down projection with residual epilogue.
-    DownProjectionResidual,
+    pub const DownProjectionResidual: Self = Self(10);
     /// Device LM-head projection and sampling pipeline.
-    LmHeadSample,
+    pub const LmHeadSample: Self = Self(11);
     /// GPU routing, grouping, expert execution and scatter-add.
-    GroupedMoe,
+    pub const GroupedMoe: Self = Self(12);
+
+    const CUSTOM_TAG: u32 = 0x8000_0000;
+
+    /// Derive a stable namespaced plugin macro-op id (FNV-1a).
+    #[must_use]
+    pub fn custom(namespace: &str, name: &str) -> Self {
+        let mut hash = 0x811c_9dc5u32;
+        for byte in namespace
+            .as_bytes()
+            .iter()
+            .chain(std::iter::once(&b':'))
+            .chain(name.as_bytes())
+        {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        Self(hash | Self::CUSTOM_TAG)
+    }
+
+    /// Raw discriminant.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Plugin-defined macro-op.
+    #[must_use]
+    pub const fn is_custom(self) -> bool {
+        self.0 & Self::CUSTOM_TAG != 0
+    }
+
+    /// Stable diagnostic name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Embedding => "embedding",
+            Self::RmsNormQuantizeQ8_1 => "rmsnorm_quantize_q8_1",
+            Self::QkvMmvq => "qkv_mmvq",
+            Self::RopeKvCommit => "rope_kv_commit",
+            Self::PagedAttentionDecode => "paged_attention_decode",
+            Self::ContiguousAttentionDecode => "contiguous_attention_decode",
+            Self::PagedAttentionPrefill => "paged_attention_prefill",
+            Self::ContiguousAttentionPrefill => "contiguous_attention_prefill",
+            Self::OutputProjectionResidual => "output_projection_residual",
+            Self::GateUpMmvqSwiglu => "gate_up_mmvq_swiglu",
+            Self::DownProjectionResidual => "down_projection_residual",
+            Self::LmHeadSample => "lm_head_sample",
+            Self::GroupedMoe => "grouped_moe",
+            _ if self.is_custom() => "custom",
+            _ => "unknown",
+        }
+    }
 }
 
 /// One fully resolved macro-operation. Kernel variant selection is complete.
 #[derive(Debug, Clone)]
 pub struct PreparedMacroOp {
-    /// Macro-operation semantic kind.
+    /// Macro-operation semantic kind (built-in or plugin custom).
     pub kind: MacroOpKind,
     /// Input tensors.
     pub inputs: Vec<PlanTensorId>,
     /// Output tensors.
     pub outputs: Vec<PlanTensorId>,
-    /// Backend-owned prepared kernel variant id.
+    /// Backend-owned prepared kernel variant id (direct dispatch; not a name).
     pub kernel_variant: u64,
+    /// Prepared attention / policy provider id when applicable (`0` = none).
+    pub provider_id: u64,
 }
 
 /// Device physical plan shared by prefill and decode plan implementations.

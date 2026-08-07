@@ -26,8 +26,9 @@ use fellm_model::{
     ModelSpec, StepBindings, build_step_graph, collect_step_bindings, parse_assistant_output,
 };
 use fellm_plugin_abi::{
-    Backend, DriverAction, DriverEvent, GenerationRequest, GraphId, GraphOutput, PagedKvContext,
-    set_paged_context,
+    AttentionDispatch, AttentionKernelPath, AttentionPathKind, Backend, DriverAction, DriverEvent,
+    GenerationRequest, GraphId, GraphOutput, PagedKvContext, PreRopeKeyStore, RetentionContext,
+    SequenceAttentionState, set_attention_dispatch, set_paged_context, set_pre_rope_store,
 };
 use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
 use std::cell::RefCell;
@@ -46,7 +47,7 @@ pub const DEFAULT_BATCH_SIZE: usize = 2048;
 pub const DEFAULT_UBATCH_SIZE: usize = 512;
 
 /// Engine load / runtime settings (mirrors llama.cpp context params).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EngineSettings {
     /// Context length (`n_ctx`). `None` → default [`DEFAULT_CTX_SIZE`].
     /// Use [`EngineSettings::ctx_from_model`] / CLI `0` to take the GGUF max.
@@ -61,6 +62,10 @@ pub struct EngineSettings {
     pub n_ubatch: usize,
     /// Backend selection (`auto` / `cpu` / `cuda`) + CPU fallback policy.
     pub backend: BackendSelect,
+    /// Explicit / automatic provider selection (attention, kv policy, config).
+    pub providers: crate::providers::ProviderSelection,
+    /// Optional plugin directory for dynamic capability plugins.
+    pub plugin_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineSettings {
@@ -71,6 +76,8 @@ impl Default for EngineSettings {
             n_batch: DEFAULT_BATCH_SIZE,
             n_ubatch: DEFAULT_UBATCH_SIZE,
             backend: BackendSelect::from_env(),
+            providers: crate::providers::ProviderSelection::new(),
+            plugin_dir: None,
         }
     }
 }
@@ -127,9 +134,23 @@ impl EngineSettings {
         self
     }
 
+    /// Provider selection (attention / kv-policy / plugin config).
+    #[must_use]
+    pub fn providers(mut self, selection: crate::providers::ProviderSelection) -> Self {
+        self.providers = selection;
+        self
+    }
+
+    /// Directory of dynamic capability plugins.
+    #[must_use]
+    pub fn plugin_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.plugin_dir = Some(dir.into());
+        self
+    }
+
     /// Resolve `n_ctx` given the model's maximum from GGUF metadata.
     #[must_use]
-    pub fn resolve_n_ctx(self, model_max: usize) -> usize {
+    pub fn resolve_n_ctx(&self, model_max: usize) -> usize {
         let model_max = model_max.max(1);
         if self.n_ctx_from_model {
             return model_max;
@@ -140,7 +161,7 @@ impl EngineSettings {
 
     /// Physical chunk size used during prompt processing.
     #[must_use]
-    pub fn resolve_ubatch(self) -> usize {
+    pub fn resolve_ubatch(&self) -> usize {
         let n_batch = self.n_batch.max(1);
         self.n_ubatch.max(1).min(n_batch)
     }
@@ -308,6 +329,12 @@ pub struct Engine {
     architecture_program: Option<fellm_plugin_abi::ModelProgram>,
     /// Evaluation / physical batch settings.
     settings: EngineSettings,
+    /// Capability providers (attention, KV policy) prepared at open.
+    providers: crate::providers::ProviderManager,
+    /// Per-request sequence attention state (views + policy metadata).
+    seq_attn: SequenceAttentionState,
+    /// Tokens generated since last KV policy compression window.
+    tokens_since_compress: u32,
 }
 
 /// Runtime state + compiled step graph for one GGUF model.
@@ -399,6 +426,37 @@ impl Engine {
         );
 
         let backend = settings.backend.resolve()?;
+
+        // Discover dynamic plugins and prepare attention / KV-policy providers.
+        let mut providers = crate::providers::ProviderManager::new(settings.providers.clone());
+        providers.load_plugins(settings.plugin_dir.as_deref())?;
+        let prep = providers.prepare(
+            backend.as_ref(),
+            spec.n_heads.max(1) as u32,
+            spec.n_kv_heads.max(1) as u32,
+            spec.head_dim.max(1) as u32,
+            spec.n_layers.max(1) as u32,
+        )?;
+        tracing::info!(
+            attention = %prep.attention_name,
+            attention_id = prep.attention_id.0,
+            kv_policy = %prep.kv_policy_name,
+            kv_policy_id = prep.kv_policy_id.0,
+            "providers prepared"
+        );
+        for note in &prep.report.notes {
+            tracing::debug!(%note, "provider selection");
+        }
+        // Install prepared attention paths so launchers dispatch FA2/FA3 kernels.
+        install_attention_dispatch(&providers, backend.id());
+        // Pre-RoPE key store for sequence-state policies.
+        set_pre_rope_store(Some(PreRopeKeyStore::new(
+            spec.n_attn_layers().max(1),
+            spec.n_kv_heads.max(1),
+            spec.head_dim.max(1),
+            max_seq,
+        )));
+
         let preparation = architecture
             .as_ref()
             .map(|plugin| plugin.prepare(&gguf, &spec, backend.as_ref()))
@@ -417,6 +475,7 @@ impl Engine {
             );
         }
         let architecture_program = preparation.as_ref().map(|p| p.program.clone());
+        let n_attn_layers = spec.n_attn_layers().max(1);
         let mut model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx, preparation)?;
 
         // B2: size VRAM KV arena to match the host PhysicalPool.
@@ -450,7 +509,12 @@ impl Engine {
                 n_batch,
                 n_ubatch,
                 backend: settings.backend,
+                providers: settings.providers.clone(),
+                plugin_dir: settings.plugin_dir.clone(),
             },
+            providers,
+            seq_attn: SequenceAttentionState::new(n_attn_layers),
+            tokens_since_compress: 0,
         })
     }
 
@@ -534,8 +598,148 @@ impl Engine {
 
     /// Active engine settings (resolved `n_ctx`).
     #[must_use]
-    pub fn settings(&self) -> EngineSettings {
-        self.settings
+    pub fn settings(&self) -> &EngineSettings {
+        &self.settings
+    }
+
+    /// Prepared capability providers (attention, KV policy).
+    #[must_use]
+    pub fn providers(&self) -> &crate::providers::ProviderManager {
+        &self.providers
+    }
+
+    /// Run the active sequence-state policy: score → select → compact → reclaim.
+    pub fn maybe_compress_kv(&mut self) -> Result<()> {
+        let policy_name = self
+            .providers
+            .prepared()
+            .map(|p| p.kv_policy_name.as_str())
+            .unwrap_or("kv.full");
+        let Some(policy) = self.providers.capabilities().sequence_policy(policy_name) else {
+            return Ok(());
+        };
+        // Sync live index + views from SequenceCache before scoring.
+        self.sync_seq_attn_from_cache();
+        let config = self.settings.providers.config.clone();
+        // Pre-RoPE packed in **live private candidate order** only (no ghost abs).
+        let private = self.seq_attn.live_private_positions();
+        let pre_rope = fellm_plugin_abi::pre_rope_gather(0, &private);
+        let ctx = RetentionContext {
+            state: &self.seq_attn,
+            layer: None,
+            current_pos: self
+                .model
+                .seq
+                .absolute_pos
+                .saturating_sub(1)
+                .max(self.model.seq.len_tokens.saturating_sub(1)) as u32,
+            tokens_since_window: self.tokens_since_compress,
+            pre_rope_keys: pre_rope.as_deref(),
+            head_dim: self.model.spec.head_dim as u32,
+            n_kv_heads: self.model.spec.n_kv_heads as u32,
+            n_heads: self.model.spec.n_heads as u32,
+            config: &config,
+        };
+        if !policy.should_compress(&ctx) {
+            return Ok(());
+        }
+        let mut plan = policy.plan_retention(&ctx)?;
+        // Guard: never retain abs ids outside the live set at plan time.
+        let live_set: std::collections::BTreeSet<u32> = self
+            .seq_attn
+            .live_retained_positions()
+            .into_iter()
+            .collect();
+        plan.retain_positions
+            .retain(|p| live_set.contains(p) || *p < self.seq_attn.shared_prefix_len);
+        plan.retain_positions.sort_unstable();
+        plan.retain_positions.dedup();
+
+        let free_before = self.model.cache.pool.free_count();
+        let dense_before = self.model.seq.len_tokens;
+        let live_before = self.seq_attn.live_retained_positions();
+        if plan.compact && !plan.retain_positions.is_empty() {
+            let reclaimed = self.model.cache.compact_sequence_to_positions(
+                &mut self.model.seq,
+                &plan.retain_positions,
+                crate::paged::BLOCK_SIZE,
+            );
+            // Refresh densified live index + views; mark host as layout owner.
+            self.sync_seq_attn_from_cache();
+            self.seq_attn.layout_owner = fellm_plugin_abi::LayoutOwner::HostDensified;
+            plan.host_densified = true;
+            // Prune pre-RoPE ghosts so the next window cannot score evicted abs.
+            let live_now = self.seq_attn.live_retained_positions();
+            fellm_plugin_abi::pre_rope_prune(0, &live_now);
+            let stats = policy.apply_plan(&mut self.seq_attn, &plan)?;
+            tracing::info!(
+                retained = self.model.seq.len_tokens,
+                dense_before,
+                reclaimed,
+                free_before,
+                free_after = self.model.cache.pool.free_count(),
+                live_before = live_before.len(),
+                live_after = live_now.len(),
+                policy_retained = stats.retained_count,
+                "sequence-state policy compacted KV (densify + rebuild + prune pre-rope)"
+            );
+            #[cfg(feature = "backend-cuda")]
+            if let Some(cuda) = self
+                .backend
+                .as_any()
+                .downcast_ref::<backend_cuda::CudaBackend>()
+            {
+                cuda.mark_kv_host_dirty();
+            }
+        }
+        self.tokens_since_compress = 0;
+        Ok(())
+    }
+
+    /// Push live SequenceCache state into `seq_attn` (single live-index contract).
+    fn sync_seq_attn_from_cache(&mut self) {
+        let seq = &self.model.seq;
+        self.seq_attn.logical_len = seq.absolute_pos.max(seq.len_tokens) as u32;
+        self.seq_attn.shared_prefix_len = seq.shared_prefix_len as u32;
+        self.seq_attn.dense_len = seq.len_tokens as u32;
+        // Live absolute positions: original_positions when compressed, else 0..len.
+        self.seq_attn.live_positions = if seq.is_compressed() {
+            seq.original_positions.clone()
+        } else {
+            (0..seq.len_tokens as u32).collect()
+        };
+        while self.seq_attn.layer_views.len() < seq.n_layers() {
+            self.seq_attn.layer_views.push(Default::default());
+        }
+        for layer in 0..seq.n_layers() {
+            let table = seq.table(layer);
+            let view = &mut self.seq_attn.layer_views[layer];
+            view.layer = layer as u32;
+            view.dense_block_table = table.blocks().to_vec();
+            view.dense_seq_len = seq.len_tokens as u32;
+            view.entries.clear();
+            if seq.is_compressed() {
+                for (dense_i, &abs) in seq.original_positions.iter().enumerate() {
+                    let (phys, slot) = table.locate(dense_i);
+                    view.entries.push(fellm_plugin_abi::RetainedEntry {
+                        logical_pos: abs,
+                        physical_block: phys,
+                        physical_slot: slot as u16,
+                        kv_head: u16::MAX,
+                        layer: layer as u16,
+                    });
+                }
+            }
+            view.ownership = Some(if seq.shared_prefix_len > 0 {
+                fellm_plugin_abi::StateOwnership::SharedImmutable
+            } else {
+                fellm_plugin_abi::StateOwnership::RequestPrivate
+            });
+        }
+        // Default layout owner is host densified after compact; otherwise policy view.
+        if seq.is_compressed() {
+            self.seq_attn.layout_owner = fellm_plugin_abi::LayoutOwner::HostDensified;
+        }
     }
 
     /// Generate tokens from a raw prompt string (completion mode).
@@ -579,7 +783,6 @@ impl Engine {
                     .join("\n"),
             };
         let ids = self.tokenizer.encode(&prompt, true)?;
-        tracing::info!(n_tokens = ids.len(), "chat prompt tokenized");
         self.generate_from_ids(&ids, params)
     }
 
@@ -875,12 +1078,19 @@ impl Engine {
     }
 
     /// Attach radix-prefix blocks for `ids` onto `seq_cache`. Returns matched token count.
+    ///
+    /// Matched tokens become **immutable shared prefix** (`shared_prefix_len`);
+    /// compression policies must not reclaim them in place.
     pub fn attach_prefix(&mut self, ids: &[u32], seq_cache: &mut SequenceCache) -> usize {
         let matched =
             self.model
                 .cache
                 .prefix
                 .attach_match(&mut self.model.cache.pool, seq_cache, ids);
+        if matched > 0 {
+            seq_cache.shared_prefix_len = matched;
+            seq_cache.len_tokens = seq_cache.len_tokens.max(matched);
+        }
         #[cfg(feature = "backend-cuda")]
         if matched > 0 {
             if let Some(cuda) = self
@@ -1256,7 +1466,29 @@ impl LoadedModel {
         pos: usize,
         compute_logits: bool,
     ) -> Result<Tensor> {
-        self.cache.ensure_writable(&mut self.seq, pos)?;
+        // Absolute generation position for RoPE; dense storage index for KV.
+        self.seq.absolute_pos = pos + 1;
+        let kv_pos = if self.seq.is_compressed() {
+            self.seq.kv_write_index()
+        } else {
+            pos
+        };
+        self.cache.ensure_writable(&mut self.seq, kv_pos)?;
+        if self.seq.is_compressed() {
+            // Track absolute identity of the newly written dense slot.
+            if self.seq.original_positions.len() == kv_pos {
+                self.seq.original_positions.push(pos as u32);
+            } else if kv_pos < self.seq.original_positions.len() {
+                self.seq.original_positions[kv_pos] = pos as u32;
+            } else {
+                while self.seq.original_positions.len() < kv_pos {
+                    self.seq
+                        .original_positions
+                        .push(self.seq.original_positions.len() as u32);
+                }
+                self.seq.original_positions.push(pos as u32);
+            }
+        }
         self.cache.tick();
 
         let n_logical = self.seq.table(0).num_blocks().max(1);
@@ -1304,11 +1536,12 @@ impl LoadedModel {
 
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
-            let (kv_write_block, kv_write_slot) = self.seq.table(0).locate(pos);
+            // Dense storage index after compress (not absolute generation pos).
+            let (kv_write_block, kv_write_slot) = self.seq.table(0).locate(kv_pos);
             cuda.update_step_params(&fellm_plugin_abi::DeviceStepParams {
                 token_id: tok,
                 position: pos as u32,
-                sequence_length: pos.saturating_add(1) as u32,
+                sequence_length: self.seq.len_tokens as u32,
                 active_batch: 1,
                 kv_write_block,
                 kv_write_slot: kv_write_slot as u32,
@@ -1343,6 +1576,18 @@ impl LoadedModel {
             .as_mut()
             .ok_or_else(|| FellmError::other("step not compiled"))?;
 
+        // Dense storage length drives attention work after compression.
+        let dense_len = self.seq.len_tokens.max(1);
+        let dense_past = dense_len.saturating_sub(1) as u32;
+        let kv_write_pos = if self.seq.is_compressed() {
+            // Current token was just ensured at dense end-1 after write path;
+            // ensure_writable set len_tokens = kv_pos+1, so write index was dense_len-1.
+            dense_past
+        } else {
+            pos_u32
+        };
+
+        // Rope: absolute position for correct rotations; preserve pre-RoPE K flag.
         for &id in &self.bindings.rope {
             let mut a = self.step_graph.node(id).attrs;
             a.position = pos_u32;
@@ -1350,14 +1595,19 @@ impl LoadedModel {
         }
         for &id in &self.bindings.kv_write {
             let mut a = self.step_graph.node(id).attrs;
-            a.position = pos_u32;
+            a.position = kv_write_pos;
             a.block_size = 16;
             step.set_attrs(id, a);
         }
+        let dispatch = fellm_plugin_abi::attention_dispatch();
         for &id in &self.bindings.attention {
             let mut a = self.step_graph.node(id).attrs;
-            a.past_len = pos_u32;
+            // Attention length = dense retained+new rows (not absolute pos).
+            a.past_len = dense_past;
             a.block_size = 16;
+            a.query_len = 1;
+            a.kv_len = dense_len as u32;
+            a.custom_op_id = dispatch.decode.as_u32();
             step.set_attrs(id, a);
         }
 
@@ -1629,6 +1879,13 @@ impl Iterator for TokenStream<'_> {
                 Ok(next) => {
                     self.pending_logits = Some(next);
                     self.position += 1;
+                    self.engine.tokens_since_compress =
+                        self.engine.tokens_since_compress.saturating_add(1);
+                    // Sequence-state policy: score → compact → reclaim physical blocks.
+                    if let Err(e) = self.engine.maybe_compress_kv() {
+                        self.finished = true;
+                        return Some(Err(e));
+                    }
                 }
                 Err(e) => {
                     self.finished = true;
@@ -1640,6 +1897,52 @@ impl Iterator for TokenStream<'_> {
         }
         Some(Ok(tok))
     }
+}
+
+/// Install process-wide attention dispatch from prepared provider plans.
+fn install_attention_dispatch(providers: &crate::providers::ProviderManager, backend_id: &str) {
+    let mut d = AttentionDispatch {
+        decode: AttentionKernelPath::Fa2Decode,
+        prefill: AttentionKernelPath::Fa2Prefill,
+        q_tile: 16,
+        kv_tile: 16,
+        pipeline_stages: 2,
+        provider_id: 0,
+    };
+    if let Some(prep) = providers.prepared() {
+        d.provider_id = prep.attention_id.0;
+        if prep.attention_name.contains("host") || backend_id == "cpu" {
+            d.decode = AttentionKernelPath::HostFa2;
+            d.prefill = AttentionKernelPath::HostFa2;
+        }
+        // Path kind: Prefill=1, Decode=2 (see AttentionPathKind).
+        if let Some(plan) = providers.attention_plan(AttentionPathKind::Decode as u8) {
+            d.decode =
+                AttentionKernelPath::from_prepared(plan.plan_handle, plan.kernel_variant, false);
+            if backend_id == "cpu" {
+                d.decode = AttentionKernelPath::HostFa2;
+            }
+            // Decode tile encoding: high 16 = Br, low 16 = Bc for host; CUDA uses style bit.
+            if plan.kernel_variant > 0xFFFF {
+                d.q_tile = ((plan.kernel_variant >> 16) & 0xFFFF) as u32;
+                d.kv_tile = (plan.kernel_variant & 0xFFFF) as u32;
+            }
+        }
+        if let Some(plan) = providers.attention_plan(AttentionPathKind::Prefill as u8) {
+            d.prefill =
+                AttentionKernelPath::from_prepared(plan.plan_handle, plan.kernel_variant, true);
+            if backend_id == "cpu" {
+                d.prefill = AttentionKernelPath::HostFa2;
+            }
+        }
+    }
+    set_attention_dispatch(d);
+    tracing::debug!(
+        decode = ?d.decode,
+        prefill = ?d.prefill,
+        provider_id = d.provider_id,
+        "attention dispatch installed"
+    );
 }
 
 fn tensor_f32_ffi_views(

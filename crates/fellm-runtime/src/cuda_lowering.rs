@@ -138,7 +138,11 @@ fn recognize_macro_ops(
             inputs.extend_from_slice(graph.inputs_slice(v_write));
             (MacroOpKind::RopeKvCommit, inputs, vec![q_rope, id, v_write])
         } else if label.ends_with(".attn") {
-            (MacroOpKind::PagedFlashDecode, graph.inputs_of(id), vec![id])
+            (
+                MacroOpKind::PagedAttentionDecode,
+                graph.inputs_of(id),
+                vec![id],
+            )
         } else if label.ends_with(".o_proj_residual") {
             (
                 MacroOpKind::OutputProjectionResidual,
@@ -186,6 +190,8 @@ fn recognize_macro_ops(
             outputs,
             // Zero means variant selection remains for the CUDA compiler/autotuner.
             kernel_variant: 0,
+            // Filled at provider prepare time for attention ops.
+            provider_id: 0,
         });
     }
     Ok(operations)
@@ -203,7 +209,7 @@ fn macro_kind(label: &str) -> Option<MacroOpKind> {
     } else if label.ends_with(".k_write") {
         Some(MacroOpKind::RopeKvCommit)
     } else if label.ends_with(".attn") {
-        Some(MacroOpKind::PagedFlashDecode)
+        Some(MacroOpKind::PagedAttentionDecode)
     } else if label.ends_with(".o_proj") {
         Some(MacroOpKind::OutputProjectionResidual)
     } else if label.ends_with(".ffn_gate_proj") {

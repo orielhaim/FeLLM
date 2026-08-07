@@ -251,6 +251,63 @@ pub struct BackendCaps {
     pub supports_batched_quantized_gemm: bool,
     /// Namespaced semantic custom operations can be resolved at compile time.
     pub supports_custom_operations: bool,
+    /// GPU compute capability major (`0` = unknown / CPU).
+    pub compute_major: u32,
+    /// GPU compute capability minor.
+    pub compute_minor: u32,
+    /// Shared memory per SM in bytes (`0` if unknown).
+    pub smem_per_sm: u32,
+    /// Hardware supports Ampere/Ada-class tensor-core style paths.
+    pub has_ampere_ada_features: bool,
+    /// Hardware supports Hopper-class async pipeline / TMA / WGMMA-class paths.
+    pub has_hopper_features: bool,
+    /// Hardware supports Blackwell-class features (reserved).
+    pub has_blackwell_features: bool,
+}
+
+impl BackendCaps {
+    /// Convert hardware flags into a [`crate::capability::FeatureSet`] for
+    /// provider negotiation. Prefer this over stringly-typed GPU product names.
+    #[must_use]
+    pub fn feature_set(&self) -> crate::capability::FeatureSet {
+        use crate::capability::{FeatureId, FeatureSet};
+        let mut f = FeatureSet::new();
+        if self.supports_bidirectional_attention {
+            f.insert(FeatureId::ATTN_BIDIRECTIONAL);
+        }
+        f.insert(FeatureId::ATTN_CAUSAL);
+        f.insert(FeatureId::ATTN_MHA);
+        f.insert(FeatureId::ATTN_MQA);
+        f.insert(FeatureId::ATTN_GQA);
+        f.insert(FeatureId::ATTN_CONTIGUOUS_KV);
+        f.insert(FeatureId::ATTN_PAGED_KV);
+        f.insert(FeatureId::ATTN_PREFILL);
+        f.insert(FeatureId::ATTN_DECODE);
+        f.insert(FeatureId::ATTN_BATCHED_DECODE);
+        f.insert(FeatureId::ATTN_FP16);
+        f.insert(FeatureId::ATTN_BF16);
+        f.insert(FeatureId::ATTN_SLIDING_WINDOW);
+        f.insert(FeatureId::ATTN_INDIRECT_POSITIONS);
+        f.insert(FeatureId::ATTN_PER_HEAD_KV_VIEWS);
+        // Runtime sequence-state contracts available to all backends.
+        f.insert(FeatureId::KV_LOGICAL_POSITIONS);
+        f.insert(FeatureId::KV_PREFIX_PRIVATE_SPLIT);
+        f.insert(FeatureId::KV_MUTABLE_REMAP);
+        f.insert(FeatureId::KV_PHYSICAL_RECLAIM);
+        if self.has_ampere_ada_features {
+            f.insert(FeatureId::HW_AMPERE_ADA);
+        }
+        if self.has_hopper_features {
+            f.insert(FeatureId::HW_HOPPER);
+            f.insert(FeatureId::HW_ASYNC_PIPELINE);
+            f.insert(FeatureId::HW_TMA_CLASS);
+            f.insert(FeatureId::HW_WGMMA_CLASS);
+        }
+        if self.has_blackwell_features {
+            f.insert(FeatureId::HW_BLACKWELL);
+        }
+        f
+    }
 }
 
 /// A resolved kernel launch descriptor.

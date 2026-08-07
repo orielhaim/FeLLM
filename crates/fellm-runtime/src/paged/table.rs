@@ -66,8 +66,18 @@ impl BlockTable {
 /// Per-sequence paged KV state (all attention layers).
 pub struct SequenceCache {
     tables: Vec<BlockTable>,
-    /// Filled token count (logical).
+    /// Filled token count in **dense storage order** (attention length).
+    ///
+    /// After compression this equals the number of retained rows, not the
+    /// absolute generation position.
     pub len_tokens: usize,
+    /// Absolute generation cursor (RoPE / sampling). Continues across compress.
+    pub absolute_pos: usize,
+    /// Original absolute positions for each dense storage slot (`len == len_tokens`
+    /// when compressed; empty means identity `i → i`).
+    pub original_positions: Vec<u32>,
+    /// Tokens belonging to immutable shared prefix (never compacted in place).
+    pub shared_prefix_len: usize,
     /// Maximum sequence length.
     pub max_seq: usize,
     /// Optional swap slot ids per physical block currently swapped out.
@@ -81,9 +91,33 @@ impl SequenceCache {
         Self {
             tables: (0..n_layers).map(|_| BlockTable::new()).collect(),
             len_tokens: 0,
+            absolute_pos: 0,
+            original_positions: Vec::new(),
+            shared_prefix_len: 0,
             max_seq,
             swapped: false,
         }
+    }
+
+    /// Dense storage index used for the next KV write.
+    #[must_use]
+    pub fn kv_write_index(&self) -> usize {
+        self.len_tokens
+    }
+
+    /// Whether the sequence is in compressed (non-identity) layout.
+    #[must_use]
+    pub fn is_compressed(&self) -> bool {
+        !self.original_positions.is_empty()
+    }
+
+    /// Original absolute position for dense slot `i` (identity if uncompressed).
+    #[must_use]
+    pub fn original_pos(&self, dense_i: usize) -> u32 {
+        self.original_positions
+            .get(dense_i)
+            .copied()
+            .unwrap_or(dense_i as u32)
     }
 
     /// Attention layer count.
@@ -109,12 +143,18 @@ impl SequenceCache {
             t.clear();
         }
         self.len_tokens = 0;
+        self.absolute_pos = 0;
+        self.original_positions.clear();
+        self.shared_prefix_len = 0;
         self.swapped = false;
     }
 
     /// Reset logical length without freeing blocks (caller releases).
     pub fn reset_len(&mut self) {
         self.len_tokens = 0;
+        self.absolute_pos = 0;
+        self.original_positions.clear();
+        self.shared_prefix_len = 0;
     }
 
     /// Flatten block tables into a dense `u32` vector for kernel binding:

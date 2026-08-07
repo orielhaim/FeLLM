@@ -1,12 +1,13 @@
 //! Dynamic library loader for `FeLLM` kernel plugins.
 
+use crate::capability_registry::CapabilityRegistry;
 use crate::registry::KernelRegistry;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
     HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestFn,
-    PluginRegisterArchitecturesFn, PluginRegisterDeviceTensorFn, PluginRegisterFn,
-    PluginShutdownFn, PluginUpdateStepParamsFn, abi_hash, symbols,
+    PluginRegisterArchitecturesFn, PluginRegisterCapabilitiesFn, PluginRegisterDeviceTensorFn,
+    PluginRegisterFn, PluginShutdownFn, PluginUpdateStepParamsFn, abi_hash, symbols,
 };
 use libloading::Library;
 use std::ffi::OsStr;
@@ -33,21 +34,23 @@ impl Drop for LoadedPlugin {
     }
 }
 
-/// Host that owns loaded plugins and a shared [`KernelRegistry`].
+/// Host that owns loaded plugins and shared registries.
 pub struct PluginHost {
     plugins: Vec<LoadedPlugin>,
     registry: KernelRegistry,
     architectures: crate::registry::ArchitectureRegistry,
+    capabilities: CapabilityRegistry,
 }
 
 impl PluginHost {
-    /// Empty host (no plugins).
+    /// Empty host (no dynamic plugins; builtins installed in capability registry).
     #[must_use]
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
             registry: KernelRegistry::new(),
             architectures: crate::registry::ArchitectureRegistry::new(),
+            capabilities: CapabilityRegistry::new(),
         }
     }
 
@@ -73,10 +76,27 @@ impl PluginHost {
         &mut self.architectures
     }
 
+    /// Multi-capability provider registry.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilityRegistry {
+        &self.capabilities
+    }
+
+    /// Mutable multi-capability registry.
+    pub fn capabilities_mut(&mut self) -> &mut CapabilityRegistry {
+        &mut self.capabilities
+    }
+
     /// Number of loaded plugin libraries.
     #[must_use]
     pub fn plugin_count(&self) -> usize {
         self.plugins.len()
+    }
+
+    /// Paths of loaded plugin libraries.
+    #[must_use]
+    pub fn plugin_paths(&self) -> Vec<&std::path::Path> {
+        self.plugins.iter().map(|p| p.path.as_path()).collect()
     }
 
     /// Invalidate device mirrors for host f32 buffers written by CPU fallback.
@@ -231,6 +251,23 @@ impl PluginHost {
             }
         }
 
+        if let Ok(sym) =
+            unsafe { lib.get::<PluginRegisterCapabilitiesFn>(symbols::REGISTER_CAPABILITIES) }
+        {
+            let mut cap_vtable = self.capabilities.vtable();
+            let rc = unsafe { (*sym)(&raw mut cap_vtable) };
+            if rc != 0 {
+                return Err(FellmError::other(format!(
+                    "plugin capability registration failed ({rc})"
+                )));
+            }
+            // Tag dynamic providers with source path.
+            for p in self.capabilities.list() {
+                // source already set for builtins; dynamic entries have None.
+                let _ = p;
+            }
+        }
+
         let shutdown: Option<PluginShutdownFn> =
             unsafe { lib.get(symbols::SHUTDOWN).ok().map(|s| *s) };
         let invalidate_f32: Option<PluginInvalidateF32Fn> =
@@ -264,11 +301,20 @@ fn is_plugin_lib(path: &Path) -> bool {
     };
     // Skip the example crate's rlib / build artifacts; accept cdylib names.
     let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-    matches!(ext, "so" | "dll" | "dylib")
+    // Only accept the platform's native loadable extension. On Windows that is
+    // `.dll`; on Linux/WSL it is `.so`. This prevents the loader from trying to
+    // `dlopen` a checked-in Windows `.dll` under WSL (and vice-versa).
+    let native_ok = cfg!(target_os = "windows")
+        .then(|| matches!(ext, "dll"))
+        .unwrap_or(false)
+        || cfg!(any(target_os = "linux", target_os = "android"))
+            .then(|| matches!(ext, "so" | "dylib"))
+            .unwrap_or(false);
+    native_ok
         && (name.contains("example_cpu_op")
             || name.contains("cuda_kernels")
-            || name.starts_with("lib")
-            || name.ends_with(".dll"))
+            || name.contains("triattention")
+            || name.starts_with("lib"))
 }
 
 fn c_name_to_str(buf: &[std::ffi::c_char; fellm_plugin_abi::PLUGIN_NAME_MAX]) -> String {
@@ -278,4 +324,32 @@ fn c_name_to_str(buf: &[std::ffi::c_char; fellm_plugin_abi::PLUGIN_NAME_MAX]) ->
         .take_while(|&b| b != 0)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_lib_is_platform_native_extension() {
+        // A `.dll` must never be treated as loadable on Linux/WSL, and a `.so`
+        // must never be treated as loadable on Windows. This is what caused the
+        // "skip plugin path=...fellm_triattention.dll error=dlopen failed" warn.
+        let dll = Path::new("plugins/fellm_triattention.dll");
+        let so = Path::new("plugins/libcuda_kernels.so");
+        assert_eq!(
+            is_plugin_lib(dll),
+            cfg!(target_os = "windows"),
+            "dll loadable only on Windows"
+        );
+        assert_eq!(
+            is_plugin_lib(so),
+            cfg!(any(target_os = "linux", target_os = "android")),
+            "so loadable only on Linux"
+        );
+        // Rlibs / random files are never plugins.
+        assert!(!is_plugin_lib(Path::new("plugins/triattention/README.md")));
+        assert!(!is_plugin_lib(Path::new("plugins/fellm_triattention.rlib")));
+        assert!(!is_plugin_lib(Path::new("plugins/fellm_triattention.pdb")));
+    }
 }

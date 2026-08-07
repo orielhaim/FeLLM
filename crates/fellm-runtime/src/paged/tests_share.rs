@@ -66,3 +66,36 @@ fn cow_on_write_forks_block() {
     assert_ne!(shared, after);
     assert_eq!(mgr.pool.refcount(after), 1);
 }
+
+#[test]
+fn compact_sequence_reclaims_physical_blocks() {
+    let mut mgr = CacheManager::new(64, 1, 1, 4, 8).unwrap();
+    let mut seq = mgr.new_sequence(128);
+    // Allocate 4 blocks (64 tokens with BLOCK_SIZE=16).
+    for pos in 0..64 {
+        mgr.ensure_writable(&mut seq, pos).unwrap();
+    }
+    let free_before = mgr.pool.free_count();
+    let allocated_before = mgr.pool.allocated_count();
+    assert!(allocated_before >= 4);
+
+    // Retain only positions in the first block (0..16).
+    let retain: Vec<u32> = (0..16).collect();
+    let reclaimed = mgr.compact_sequence_to_positions(&mut seq, &retain, BLOCK_SIZE);
+    assert!(
+        reclaimed >= 3,
+        "expected at least 3 blocks reclaimed, got {reclaimed}"
+    );
+    let free_after = mgr.pool.free_count();
+    assert!(
+        free_after > free_before,
+        "free list should grow after reclaim ({free_before} -> {free_after})"
+    );
+    assert_eq!(seq.len_tokens, 16);
+    assert_eq!(seq.table(0).num_blocks(), 1);
+    // Dense table has no dangling freed phys ids.
+    for t in 0..seq.len_tokens {
+        let (phys, _) = seq.table(0).locate(t);
+        assert_eq!(mgr.pool.refcount(phys), 1);
+    }
+}

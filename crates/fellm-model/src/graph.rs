@@ -849,6 +849,9 @@ fn build_attention(
             rope_dim: rope_dim as u32,
             position: 0,
             rope_base: spec.rope_base,
+            // Snapshot pre-RoPE K for sequence-state policies (TriAttention).
+            layer_ord: attn_ord as u32,
+            custom_op_id: 1, // 1 = store pre-RoPE key before rotation
             ..Default::default()
         },
         DType::F32,
