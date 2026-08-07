@@ -1,6 +1,7 @@
 use crate::dequant::{QK_K, QK4_0, QK8_0};
 use crate::kernels::vec_dot_q4k::{
-    Q4KBlockCache, decode_q4_k_block_cached, dot_q4_k_cached, vec_dot_q4_k_q8_k_row,
+    Q4KBlockCache, decode_q4_k_block_cached, dot_q4_k_cached, vec_dot_q4_k_q8_k_4rows,
+    vec_dot_q4_k_q8_k_row,
 };
 use aligned_vec::AVec;
 use dyn_stack::{PodBuffer, PodStack, StackReq};
@@ -434,7 +435,7 @@ pub fn matvec_quant_multi(x: &[f32], mats: &[MatDesc<'_>], y: &mut [f32]) -> Res
     let pool = &pool;
 
     let n_threads = rayon::current_num_threads().max(1);
-    let chunk = (total / n_threads).max(16);
+    let chunk = ((total / n_threads).max(16)).next_multiple_of(4);
     y.par_chunks_mut(chunk)
         .enumerate()
         .for_each(|(ci, y_chunk)| {
@@ -445,16 +446,37 @@ pub fn matvec_quant_multi(x: &[f32], mats: &[MatDesc<'_>], y: &mut [f32]) -> Res
                 mi += 1;
             }
             let mut local = row0 - y_base[mi];
-            for yi in y_chunk.iter_mut() {
+            let mut j = 0usize;
+            while j < y_chunk.len() {
                 while mi + 1 < n_mats && local >= mats[mi].out_dim {
                     mi += 1;
                     local = 0;
                 }
                 let m = &mats[mi];
-                let row = &m.w[local * m.dtype.byte_size(m.in_dim)
-                    ..(local + 1) * m.dtype.byte_size(m.in_dim)];
                 let xq = &pool[xq_base[mi]..xq_base[mi] + m.in_dim / QK_K];
-                *yi = match m.dtype {
+                let bpr = m.dtype.byte_size(m.in_dim);
+                // Fast path: four consecutive rows of the same Q4_K matrix.
+                if m.dtype == DType::Q4K && j + 4 <= y_chunk.len() && local + 4 <= m.out_dim {
+                    let base = local * bpr;
+                    let outs = vec_dot_q4_k_q8_k_4rows(
+                        [
+                            &m.w[base..base + bpr],
+                            &m.w[base + bpr..base + 2 * bpr],
+                            &m.w[base + 2 * bpr..base + 3 * bpr],
+                            &m.w[base + 3 * bpr..base + 4 * bpr],
+                        ],
+                        xq,
+                    );
+                    y_chunk[j] = outs[0];
+                    y_chunk[j + 1] = outs[1];
+                    y_chunk[j + 2] = outs[2];
+                    y_chunk[j + 3] = outs[3];
+                    local += 4;
+                    j += 4;
+                    continue;
+                }
+                let row = &m.w[local * bpr..(local + 1) * bpr];
+                y_chunk[j] = match m.dtype {
                     DType::Q4K => vec_dot_q4_k_q8_k_row(row, xq),
                     DType::Q6K => {
                         let mut acc = 0.0f32;
@@ -468,6 +490,7 @@ pub fn matvec_quant_multi(x: &[f32], mats: &[MatDesc<'_>], y: &mut [f32]) -> Res
                     other => unreachable!("matvec_multi: unsupported dtype {other:?}"),
                 };
                 local += 1;
+                j += 1;
             }
         });
     Ok(())
@@ -1177,50 +1200,71 @@ fn matvec_q4_k(
     // same quantized activation (llama.cpp / ggml style). Avoid oversubscription.
     let profile = crate::cpu_profile::CpuHardwareProfile::get();
     let n_threads = if y.len() >= 16_384 {
-        profile.physical_cores.saturating_add(4)
+        profile.logical_threads
     } else {
         profile.physical_cores
     }
     .max(1);
-    let chunk = (y.len() / n_threads).max(16);
+    let raw_chunk = (y.len() / n_threads).max(16);
+    let chunk = raw_chunk.next_multiple_of(4);
     y.par_chunks_mut(chunk)
         .enumerate()
         .for_each(|(ci, y_chunk)| {
             let row0 = ci * chunk;
             let n = y_chunk.len();
-            for j in 0..n {
+            let mut j = 0usize;
+            while j + 4 <= n {
+                let i = row0 + j;
+                prefetch_weight_row(w_bytes, i + 4, bytes_per_row);
+                prefetch_weight_row(w_bytes, i + 5, bytes_per_row);
+                let r0 = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
+                let r1 = &w_bytes[(i + 1) * bytes_per_row..(i + 2) * bytes_per_row];
+                let r2 = &w_bytes[(i + 2) * bytes_per_row..(i + 3) * bytes_per_row];
+                let r3 = &w_bytes[(i + 3) * bytes_per_row..(i + 4) * bytes_per_row];
+                let outs = vec_dot_q4_k_q8_k_4rows([r0, r1, r2, r3], xq);
+                y_chunk[j] = outs[0];
+                y_chunk[j + 1] = outs[1];
+                y_chunk[j + 2] = outs[2];
+                y_chunk[j + 3] = outs[3];
+                j += 4;
+            }
+            while j < n {
                 let i = row0 + j;
                 let row = &w_bytes[i * bytes_per_row..(i + 1) * bytes_per_row];
-                // Prefetch the next weight row into L2 while computing current.
-                if j + 1 < n {
-                    let next = w_bytes.as_ptr().wrapping_add((i + 1) * bytes_per_row);
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        // SAFETY: prefetch is a hint; address need not be dereferenceable.
-                        unsafe {
-                            core::arch::x86_64::_mm_prefetch(
-                                next as *const i8,
-                                core::arch::x86_64::_MM_HINT_T1,
-                            );
-                        }
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        unsafe {
-                            core::arch::x86::_mm_prefetch(
-                                next as *const i8,
-                                core::arch::x86::_MM_HINT_T1,
-                            );
-                        }
-                    }
-                    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-                    {
-                        let _ = next;
-                    }
-                }
+                prefetch_weight_row(w_bytes, i + 1, bytes_per_row);
                 y_chunk[j] = vec_dot_q4_k_q8_k_row(row, xq);
+                j += 1;
             }
         });
+}
+
+#[inline(always)]
+fn prefetch_weight_row(w_bytes: &[u8], row: usize, bytes_per_row: usize) {
+    if bytes_per_row == 0 {
+        return;
+    }
+    let max_row = w_bytes.len() / bytes_per_row;
+    if row >= max_row {
+        return;
+    }
+    let ptr = w_bytes.as_ptr().wrapping_add(row * bytes_per_row);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: prefetch is a hint; the address need not be dereferenceable.
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T1);
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        unsafe {
+            core::arch::x86::_mm_prefetch(ptr as *const i8, core::arch::x86::_MM_HINT_T1);
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        let _ = ptr;
+    }
 }
 
 fn matvec_q6_k(

@@ -1,9 +1,7 @@
 [build]
-# Default builds are portable (x86-64-v3 baseline).
-
-[profile.release-native]
-# Applied via CARGO_PROFILE_RELEASE_NATIVE_RUSTFLAGS in CI/dev if needed.
+# Prefer host CPU features (AVX2/AVX-VNNI/FMA on modern x86). Portable
+# CI/release artifacts should override with CARGO_BUILD_RUSTFLAGS or
+# `--config 'build.rustflags=["-C","target-cpu=x86-64-v3"]'`.
 
 [target.'cfg(all(target_arch = "x86_64"))']
-# Uncomment for local dev machines:
-# rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native"]

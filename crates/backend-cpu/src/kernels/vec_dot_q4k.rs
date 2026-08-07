@@ -1,10 +1,92 @@
 use crate::dequant::QK_K;
 use crate::kernels::matmul::Q8KBlock;
 use half::f16;
+use std::sync::OnceLock;
 
 const KMASK1: u32 = 0x3f3f_3f3f;
 const KMASK2: u32 = 0x0f0f_0f0f;
 const KMASK3: u32 = 0x0303_0303;
+
+type RowDotFn = unsafe fn(&[u8], &[Q8KBlock]) -> f32;
+type Rows4DotFn = unsafe fn([&[u8]; 4], &[Q8KBlock]) -> [f32; 4];
+
+fn resolve_row_dot() -> RowDotFn {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            return vec_dot_q4_k_q8_k_row_avx512;
+        }
+        if is_x86_feature_detected!("avxvnni")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            return vec_dot_q4_k_q8_k_row_vnni;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return vec_dot_q4_k_q8_k_row_avx2;
+        }
+        if is_x86_feature_detected!("avx2") {
+            return vec_dot_q4_k_q8_k_row_avx2_nofma;
+        }
+    }
+    vec_dot_q4_k_q8_k_row_scalar_ptr
+}
+
+fn resolve_rows4_dot() -> Rows4DotFn {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avxvnni")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            return vec_dot_q4_k_q8_k_4rows_vnni;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return vec_dot_q4_k_q8_k_4rows_avx2;
+        }
+        if is_x86_feature_detected!("avx2") {
+            return vec_dot_q4_k_q8_k_4rows_avx2_nofma;
+        }
+    }
+    vec_dot_q4_k_q8_k_4rows_scalar_ptr
+}
+
+fn row_dot_fn() -> RowDotFn {
+    static FN: OnceLock<RowDotFn> = OnceLock::new();
+    *FN.get_or_init(resolve_row_dot)
+}
+
+fn rows4_dot_fn() -> Rows4DotFn {
+    static FN: OnceLock<Rows4DotFn> = OnceLock::new();
+    *FN.get_or_init(resolve_rows4_dot)
+}
+
+unsafe fn vec_dot_q4_k_q8_k_row_scalar_ptr(row: &[u8], xq: &[Q8KBlock]) -> f32 {
+    // Pure safe arithmetic; `unsafe fn` only to match the RowDotFn signature.
+    let n_blocks = xq.len();
+    let mut acc = 0.0f32;
+    for b in 0..n_blocks {
+        let base = b * Q4_K_BLOCK_BYTES;
+        acc += vec_dot_q4_k_q8_k_scalar(&row[base..base + Q4_K_BLOCK_BYTES], &xq[b]);
+    }
+    acc
+}
+
+unsafe fn vec_dot_q4_k_q8_k_4rows_scalar_ptr(rows: [&[u8]; 4], xq: &[Q8KBlock]) -> [f32; 4] {
+    // SAFETY: scalar path has no target-feature requirements.
+    unsafe {
+        [
+            vec_dot_q4_k_q8_k_row_scalar_ptr(rows[0], xq),
+            vec_dot_q4_k_q8_k_row_scalar_ptr(rows[1], xq),
+            vec_dot_q4_k_q8_k_row_scalar_ptr(rows[2], xq),
+            vec_dot_q4_k_q8_k_row_scalar_ptr(rows[3], xq),
+        ]
+    }
+}
 
 /// Q4_K super-block size in bytes.
 pub const Q4_K_BLOCK_BYTES: usize = 144;
@@ -197,31 +279,17 @@ pub fn vec_dot_q4_k_q8_k(q4_block: &[u8], q8: &Q8KBlock) -> f32 {
 pub fn vec_dot_q4_k_q8_k_row(row: &[u8], xq: &[Q8KBlock]) -> f32 {
     let n_blocks = xq.len();
     debug_assert_eq!(row.len(), n_blocks * Q4_K_BLOCK_BYTES);
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
-            // SAFETY: feature gate above.
-            return unsafe { vec_dot_q4_k_q8_k_row_avx512(row, xq) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // SAFETY: feature gate above.
-            return unsafe { vec_dot_q4_k_q8_k_row_avx2(row, xq) };
-        }
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: feature gate above.
-            return unsafe { vec_dot_q4_k_q8_k_row_avx2_nofma(row, xq) };
-        }
+    unsafe { row_dot_fn()(row, xq) }
+}
+
+#[inline]
+pub fn vec_dot_q4_k_q8_k_4rows(rows: [&[u8]; 4], xq: &[Q8KBlock]) -> [f32; 4] {
+    let n_blocks = xq.len();
+    for row in &rows {
+        debug_assert_eq!(row.len(), n_blocks * Q4_K_BLOCK_BYTES);
     }
-    let mut acc = 0.0f32;
-    for b in 0..n_blocks {
-        let base = b * Q4_K_BLOCK_BYTES;
-        acc += vec_dot_q4_k_q8_k_scalar(&row[base..base + Q4_K_BLOCK_BYTES], &xq[b]);
-    }
-    acc
+    // SAFETY: see [`vec_dot_q4_k_q8_k_row`].
+    unsafe { rows4_dot_fn()(rows, xq) }
 }
 
 /// Portable path matching `ggml_vec_dot_q4_K_q8_K_generic`.
@@ -456,12 +524,155 @@ mod x86_avx2 {
             hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
         }
     }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn vec_dot_q4_k_q8_k_4rows_avx2(
+        rows: [&[u8]; 4],
+        xq: &[Q8KBlock],
+    ) -> [f32; 4] {
+        unsafe {
+            [
+                vec_dot_q4_k_q8_k_row_avx2(rows[0], xq),
+                vec_dot_q4_k_q8_k_row_avx2(rows[1], xq),
+                vec_dot_q4_k_q8_k_row_avx2(rows[2], xq),
+                vec_dot_q4_k_q8_k_row_avx2(rows[3], xq),
+            ]
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn vec_dot_q4_k_q8_k_4rows_avx2_nofma(
+        rows: [&[u8]; 4],
+        xq: &[Q8KBlock],
+    ) -> [f32; 4] {
+        unsafe {
+            [
+                vec_dot_q4_k_q8_k_row_avx2_nofma(rows[0], xq),
+                vec_dot_q4_k_q8_k_row_avx2_nofma(rows[1], xq),
+                vec_dot_q4_k_q8_k_row_avx2_nofma(rows[2], xq),
+                vec_dot_q4_k_q8_k_row_avx2_nofma(rows[3], xq),
+            ]
+        }
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use x86_avx2::{
-    vec_dot_q4_k_q8_k_avx2, vec_dot_q4_k_q8_k_row_avx2, vec_dot_q4_k_q8_k_row_avx2_nofma,
+    vec_dot_q4_k_q8_k_4rows_avx2, vec_dot_q4_k_q8_k_4rows_avx2_nofma, vec_dot_q4_k_q8_k_avx2,
+    vec_dot_q4_k_q8_k_row_avx2, vec_dot_q4_k_q8_k_row_avx2_nofma,
 };
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86_vnni {
+    use super::x86_avx2::hsum_float_8;
+    use super::*;
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    /// AVX-VNNI path: `vpdpbusd` replaces `maddubs`+`madd_epi16` for the
+    /// nibble×activation product (single uop on Arrow Lake / Zen 5).
+    #[target_feature(enable = "avx2", enable = "avxvnni", enable = "fma")]
+    pub(super) unsafe fn vec_dot_q4_k_q8_k_row_vnni(row: &[u8], xq: &[Q8KBlock]) -> f32 {
+        unsafe {
+            let n_blocks = xq.len();
+            let m4 = _mm256_set1_epi8(0x0F_u8 as i8);
+            let mut acc = _mm256_setzero_ps();
+            let mut acc_m = _mm_setzero_ps();
+
+            for i in 0..n_blocks {
+                let blk = row.as_ptr().add(i * Q4_K_BLOCK_BYTES);
+                let d = xq[i].d * f16::from_bits(u16::from_le_bytes([*blk, *blk.add(1)])).to_f32();
+                let dmin = -xq[i].d
+                    * f16::from_bits(u16::from_le_bytes([*blk.add(2), *blk.add(3)])).to_f32();
+
+                let utmp = decode_utmp(core::slice::from_raw_parts(blk.add(4), 12));
+                let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
+                    utmp[3] as i32,
+                    utmp[2] as i32,
+                    utmp[1] as i32,
+                    utmp[0] as i32,
+                ));
+
+                let q8sums = _mm256_loadu_si256(xq[i].bsums.as_ptr().cast());
+                let q8s = _mm_hadd_epi16(
+                    _mm256_extracti128_si256(q8sums, 0),
+                    _mm256_extracti128_si256(q8sums, 1),
+                );
+                let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+                acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+                // Low 128-bit lane holds 8 scale values as i16 (0..63); widen to i32
+                // for mullo against the 8 VNNI partial sums per 32-weight group.
+                let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+                let scales_i32 = _mm256_cvtepu16_epi32(sc128);
+
+                let mut q4 = blk.add(16);
+                let mut q8p = xq[i].qs.as_ptr();
+                let mut sumi = _mm256_setzero_si256();
+
+                // Two scale groups (64 weights) per iteration: low/high nibble.
+                for j in 0..QK_K / 64 {
+                    let s_lo =
+                        _mm256_permutevar8x32_epi32(scales_i32, _mm256_set1_epi32((2 * j) as i32));
+                    let s_hi = _mm256_permutevar8x32_epi32(
+                        scales_i32,
+                        _mm256_set1_epi32((2 * j + 1) as i32),
+                    );
+
+                    let q4bits = _mm256_loadu_si256(q4.cast());
+                    q4 = q4.add(32);
+                    let q4l = _mm256_and_si256(q4bits, m4);
+                    let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+                    let q8l = _mm256_loadu_si256(q8p.cast());
+                    q8p = q8p.add(32);
+                    let p_lo = _mm256_mullo_epi32(
+                        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), q4l, q8l),
+                        s_lo,
+                    );
+
+                    let q8h = _mm256_loadu_si256(q8p.cast());
+                    q8p = q8p.add(32);
+                    let p_hi = _mm256_mullo_epi32(
+                        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), q4h, q8h),
+                        s_hi,
+                    );
+
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p_lo, p_hi));
+                }
+
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+
+            acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+            acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+            hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
+        }
+    }
+
+    #[target_feature(enable = "avx2", enable = "avxvnni", enable = "fma")]
+    pub(super) unsafe fn vec_dot_q4_k_q8_k_4rows_vnni(
+        rows: [&[u8]; 4],
+        xq: &[Q8KBlock],
+    ) -> [f32; 4] {
+        // Decode is bandwidth-bound: keep each weight row sequential so the
+        // hardware prefetcher can stream 144-byte Q4_K blocks contiguously.
+        // `xq` is tiny (~few KB) and stays hot in L1 across the four calls.
+        unsafe {
+            [
+                vec_dot_q4_k_q8_k_row_vnni(rows[0], xq),
+                vec_dot_q4_k_q8_k_row_vnni(rows[1], xq),
+                vec_dot_q4_k_q8_k_row_vnni(rows[2], xq),
+                vec_dot_q4_k_q8_k_row_vnni(rows[3], xq),
+            ]
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use x86_vnni::{vec_dot_q4_k_q8_k_4rows_vnni, vec_dot_q4_k_q8_k_row_vnni};
 
 /// AVX-512 path: same numerics as AVX2, but processes 128 weights per inner step
 /// with 512-bit loads (maddubs still on 256-bit halves — no `_mm512_maddubs_epi16`).
@@ -666,5 +877,33 @@ mod tests {
             (row_sum - block_sum).abs() < 1e-2,
             "row={row_sum} blocks={block_sum}"
         );
+    }
+
+    #[test]
+    fn four_rows_match_single_rows() {
+        let mut rows = Vec::new();
+        for r in 0..4 {
+            let mut blk = make_q4_k_block();
+            blk[16] = (0x10 + r) as u8;
+            rows.push(blk);
+        }
+        let mut x = [0.0f32; QK_K];
+        let mut rng = 99u64;
+        for v in &mut x {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = (rng >> 33) as f32 / (u32::MAX as f32) * 2.0 - 1.0;
+        }
+        let mut xq = [Q8KBlock::default()];
+        crate::kernels::matmul::quantize_row_q8_k(&x, &mut xq);
+        let got = vec_dot_q4_k_q8_k_4rows([&rows[0], &rows[1], &rows[2], &rows[3]], &xq);
+        for r in 0..4 {
+            let exp = vec_dot_q4_k_q8_k_row(&rows[r], &xq);
+            assert!(
+                (got[r] - exp).abs() < 1e-3,
+                "row {r}: got={} exp={}",
+                got[r],
+                exp
+            );
+        }
     }
 }

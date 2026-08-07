@@ -7,7 +7,7 @@ use crate::kernels::{
     sampling::sample,
     simd_f32::PulpDispatch,
     softmax::softmax_rows_inplace,
-    swiglu::silu_gate,
+    swiglu::{silu_gate, silu_gate_inplace},
 };
 use crossbeam_utils::CachePadded;
 use fellm_core::dtype::DType;
@@ -412,9 +412,10 @@ fn launch_matmul(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut
                 "matmul residual epilogue: shape mismatch",
             ));
         }
-        for (value, skip) in y_slice.iter_mut().zip(residual) {
-            *value += *skip;
-        }
+        static SIMD: std::sync::OnceLock<crate::kernels::simd_f32::PulpDispatch> =
+            std::sync::OnceLock::new();
+        let simd = *SIMD.get_or_init(crate::kernels::simd_f32::PulpDispatch::new);
+        crate::kernels::simd_f32::axpy_f32(y_slice, residual, 1.0, simd);
     }
     if attrs.softcap > 0.0 {
         let cap = attrs.softcap;
@@ -436,25 +437,75 @@ fn launch_gate_up_swiglu(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Res
     if inputs[1].dims_slice() != inputs[0].dims_slice() || x.len() != cols || out.len() != rows {
         return Err(FellmError::other("gate_up_swiglu: shape mismatch"));
     }
-    let mut gate = vec![0.0f32; rows];
-    let project = |weight: &TensorRef, dst: &mut [f32]| -> Result<()> {
-        let dtype = weight
-            .dtype()
-            .ok_or_else(|| FellmError::other("gate_up_swiglu: weight dtype"))?;
-        match dtype {
-            DType::F32 => matmul::matmul_f32_batch(as_f32_slice(weight)?, x, dst, 1, rows, cols),
-            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
-                matmul::matvec_quant(as_bytes_slice(weight), dtype, x, dst, rows, cols)
-            }
-            other => Err(FellmError::UnsupportedDType(other)),
-        }
-    };
-    project(&inputs[0], &mut gate)?;
-    project(&inputs[1], out)?;
-    for (value, gate) in out.iter_mut().zip(gate) {
-        *value *= gate / (1.0 + (-gate).exp());
+    let gate_dtype = inputs[0]
+        .dtype()
+        .ok_or_else(|| FellmError::other("gate_up_swiglu: gate dtype"))?;
+    let up_dtype = inputs[1]
+        .dtype()
+        .ok_or_else(|| FellmError::other("gate_up_swiglu: up dtype"))?;
+
+    thread_local! {
+        static GATE_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static COMBINED_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    Ok(())
+
+    if gate_dtype == up_dtype && matches!(gate_dtype, DType::Q4K | DType::Q6K) {
+        return COMBINED_SCRATCH.with(|combined_cell| {
+            let mut combined = combined_cell.borrow_mut();
+            if combined.len() < rows * 2 {
+                combined.resize(rows * 2, 0.0);
+            }
+            let mats = [
+                matmul::MatDesc {
+                    w: as_bytes_slice(&inputs[0]),
+                    dtype: gate_dtype,
+                    out_dim: rows,
+                    in_dim: cols,
+                    x_off: 0,
+                },
+                matmul::MatDesc {
+                    w: as_bytes_slice(&inputs[1]),
+                    dtype: up_dtype,
+                    out_dim: rows,
+                    in_dim: cols,
+                    x_off: 0,
+                },
+            ];
+            matmul::matvec_quant_multi(x, &mats, &mut combined[..rows * 2])?;
+            // combined = [gate | up] → out[i] = silu(gate[i]) * up[i]
+            let (gate, up) = combined.split_at(rows);
+            silu_gate(gate, up, out);
+            Ok(())
+        });
+    }
+
+    GATE_SCRATCH.with(|cell| {
+        let mut gate = cell.borrow_mut();
+        if gate.len() < rows {
+            gate.resize(rows, 0.0);
+        }
+        let gate = &mut gate[..rows];
+        match gate_dtype {
+            DType::F32 => {
+                matmul::matmul_f32_batch(as_f32_slice(&inputs[0])?, x, gate, 1, rows, cols)?
+            }
+            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+                matmul::matvec_quant(as_bytes_slice(&inputs[0]), gate_dtype, x, gate, rows, cols)?
+            }
+            other => return Err(FellmError::UnsupportedDType(other)),
+        }
+        match up_dtype {
+            DType::F32 => {
+                matmul::matmul_f32_batch(as_f32_slice(&inputs[1])?, x, out, 1, rows, cols)?
+            }
+            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+                matmul::matvec_quant(as_bytes_slice(&inputs[1]), up_dtype, x, out, rows, cols)?
+            }
+            other => return Err(FellmError::UnsupportedDType(other)),
+        }
+        silu_gate_inplace(gate, out);
+        Ok(())
+    })
 }
 
 fn launch_embedding(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {

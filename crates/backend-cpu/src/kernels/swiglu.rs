@@ -15,6 +15,15 @@ pub fn silu_gate(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+#[inline]
+pub fn silu_gate_inplace(gate: &[f32], up_out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up_out.len());
+    for i in 0..gate.len() {
+        let g = gate[i];
+        up_out[i] *= silu(g);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
