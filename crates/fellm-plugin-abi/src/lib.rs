@@ -22,8 +22,8 @@ pub use attention_provider::{
 pub use c_abi::{
     ArchitecturePluginRegistration, ArchitectureRegistryVtable, CapabilityRegistryVtable,
     DeviceHandle, HostContext, KernelRegistryVtable, PLUGIN_MAX_INPUT_DTYPES, PLUGIN_MAX_OPS,
-    PLUGIN_NAME_MAX, PluginCapabilityRegistration, PluginLaunchFn, PluginManifest,
-    PluginOpRegistration, abi_hash,
+    PLUGIN_NAME_MAX, PluginCapabilityRegistration, PluginLaunchFn, PluginManifestJson,
+    PluginManifestJsonFn, PluginOpRegistration, PluginRegisterKernelsFn,
 };
 pub use capability::{
     CapabilityKind, FeatureId, FeatureSet, NegotiationError, NegotiationReport, PluginConfig,
@@ -72,6 +72,6 @@ pub struct AbiVersion {
 /// The ABI version this crate advertises. Bump on breaking changes.
 pub const ABI_VERSION: AbiVersion = AbiVersion {
     major: 0,
-    minor: 7,
+    minor: 8,
     patch: 0,
 };

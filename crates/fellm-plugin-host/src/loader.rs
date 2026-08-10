@@ -1,24 +1,105 @@
-//! Dynamic library loader for `FeLLM` kernel plugins.
+//! Dynamic library discovery and activation for FeLLM plugins.
 
 use crate::capability_registry::CapabilityRegistry;
+use crate::manifest::{PluginComponentKind, PluginManifest, parse_manifest};
 use crate::registry::KernelRegistry;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
-    HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestFn,
+    HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestJsonFn,
     PluginRegisterArchitecturesFn, PluginRegisterCapabilitiesFn, PluginRegisterDeviceTensorFn,
-    PluginRegisterFn, PluginShutdownFn, PluginUpdateStepParamsFn, abi_hash, symbols,
+    PluginRegisterKernelsFn, PluginShutdownFn, PluginUpdateStepParamsFn, symbols,
 };
 use libloading::Library;
-use std::ffi::OsStr;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// One loaded plugin library (kept alive so function pointers remain valid).
+const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// A plugin found during discovery, before it has been initialized.
+#[derive(Debug, Clone)]
+pub struct DiscoveredPlugin {
+    /// Filesystem path of the dynamic library.
+    pub path: PathBuf,
+    /// Parsed manifest embedded in the library.
+    pub manifest: PluginManifest,
+}
+
+/// Catalog of plugins discovered from a directory.
+#[derive(Debug, Clone, Default)]
+pub struct PluginCatalog {
+    plugins: Vec<DiscoveredPlugin>,
+}
+
+impl PluginCatalog {
+    /// Discover all native dynamic libraries in `dir` without initializing
+    /// or registering any plugin.
+    pub fn discover_dir(dir: &Path) -> Result<Self> {
+        if !dir.is_dir() {
+            return Ok(Self::default());
+        }
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| FellmError::other(format!("read plugin dir: {e}")))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| is_dynamic_library(path))
+            .collect();
+        paths.sort();
+
+        let mut plugins = Vec::with_capacity(paths.len());
+        let mut ids = HashSet::new();
+        for path in paths {
+            match Self::discover_path(&path) {
+                Ok(plugin) => {
+                    if !ids.insert(plugin.manifest.id.clone()) {
+                        return Err(FellmError::other(format!(
+                            "duplicate plugin id {}",
+                            plugin.manifest.id
+                        )));
+                    }
+                    plugins.push(plugin);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skip non-FeLLM dynamic library");
+                }
+            }
+        }
+        Ok(Self { plugins })
+    }
+
+    /// Discover one native dynamic library without initializing it.
+    pub fn discover_path(path: &Path) -> Result<DiscoveredPlugin> {
+        if !is_dynamic_library(path) {
+            return Err(FellmError::other(format!(
+                "not a native dynamic library: {}",
+                path.display()
+            )));
+        }
+        let lib = unsafe { Library::new(path) }
+            .map_err(|e| FellmError::other(format!("dlopen {}: {e}", path.display())))?;
+        verify_abi(&lib, path)?;
+        let manifest = read_manifest(&lib, path)?;
+        Ok(DiscoveredPlugin {
+            path: path.to_path_buf(),
+            manifest,
+        })
+    }
+
+    /// Discovered plugins in deterministic path order.
+    #[must_use]
+    pub fn plugins(&self) -> &[DiscoveredPlugin] {
+        &self.plugins
+    }
+}
+
+/// One activated plugin library. The library remains alive while all function
+/// pointers registered in host registries may be called.
 pub struct LoadedPlugin {
     /// Filesystem path.
     pub path: PathBuf,
+    /// Declarative metadata used during activation.
+    pub manifest: PluginManifest,
     _lib: Library,
-    shutdown: Option<PluginShutdownFn>,
+    shutdown: PluginShutdownFn,
     invalidate_f32: Option<PluginInvalidateF32Fn>,
     update_step_params: Option<PluginUpdateStepParamsFn>,
     register_device_tensor: Option<PluginRegisterDeviceTensorFn>,
@@ -26,15 +107,11 @@ pub struct LoadedPlugin {
 
 impl Drop for LoadedPlugin {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            unsafe {
-                shutdown();
-            }
-        }
+        unsafe { (self.shutdown)() };
     }
 }
 
-/// Host that owns loaded plugins and shared registries.
+/// Host that owns activated plugins and shared registries.
 pub struct PluginHost {
     plugins: Vec<LoadedPlugin>,
     registry: KernelRegistry,
@@ -95,26 +172,26 @@ impl PluginHost {
 
     /// Paths of loaded plugin libraries.
     #[must_use]
-    pub fn plugin_paths(&self) -> Vec<&std::path::Path> {
-        self.plugins.iter().map(|p| p.path.as_path()).collect()
+    pub fn plugin_paths(&self) -> Vec<&Path> {
+        self.plugins
+            .iter()
+            .map(|plugin| plugin.path.as_path())
+            .collect()
     }
 
     /// Invalidate device mirrors for host f32 buffers written by CPU fallback.
-    ///
-    /// Call after any CPU op that mutates activation tensors so the next GPU
-    /// `ensure_f32` re-uploads instead of trusting a stale `device_valid` cache.
     pub fn invalidate_f32_outputs(&self, outputs: &[fellm_plugin_abi::TensorMut]) {
         for out in outputs {
             if out
                 .dtype()
-                .is_some_and(|d| d == fellm_core::dtype::DType::F32)
+                .is_some_and(|dtype| dtype == fellm_core::dtype::DType::F32)
                 && !out.data.is_null()
                 && out.byte_len >= 4
             {
                 let ptr = out.data as *const f32;
                 for plugin in &self.plugins {
-                    if let Some(inv) = plugin.invalidate_f32 {
-                        unsafe { inv(ptr, out.byte_len as usize) };
+                    if let Some(invalidate) = plugin.invalidate_f32 {
+                        unsafe { invalidate(ptr, out.byte_len as usize) };
                     }
                 }
             }
@@ -156,129 +233,92 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Load all plugins from `dir` (or `FELLM_PLUGIN_DIR` if `dir` is `None`).
+    /// Discover and activate all plugins in `dir` (or `FELLM_PLUGIN_DIR` if
+    /// `dir` is `None`). Discovery completes before the first plugin is
+    /// initialized.
     pub fn load_dir(&mut self, dir: Option<&Path>, ctx: &HostContext) -> Result<()> {
         let path = match dir {
-            Some(p) => p.to_path_buf(),
+            Some(path) => path.to_path_buf(),
             None => std::env::var_os("FELLM_PLUGIN_DIR")
                 .map_or_else(|| PathBuf::from("plugins"), PathBuf::from),
         };
-        if !path.is_dir() {
-            tracing::debug!(?path, "plugin dir missing; skipping");
-            return Ok(());
-        }
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
-            .map_err(|e| FellmError::other(format!("read plugin dir: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| is_plugin_lib(p))
-            .collect();
-        entries.sort();
-        for entry in entries {
-            match self.load_path(&entry, ctx) {
-                Ok(()) => tracing::info!(path = %entry.display(), "loaded plugin"),
-                Err(e) => tracing::warn!(path = %entry.display(), error = %e, "skip plugin"),
+        let catalog = PluginCatalog::discover_dir(&path)?;
+        for plugin in catalog.plugins() {
+            match self.activate_path(plugin, ctx) {
+                Ok(()) => tracing::info!(
+                    path = %plugin.path.display(),
+                    id = %plugin.manifest.id,
+                    "activated plugin"
+                ),
+                Err(error) => tracing::warn!(
+                    path = %plugin.path.display(),
+                    id = %plugin.manifest.id,
+                    %error,
+                    "skip plugin activation"
+                ),
             }
         }
         Ok(())
     }
 
-    /// Load a single plugin library.
+    /// Discover and activate one plugin library.
     pub fn load_path(&mut self, path: &Path, ctx: &HostContext) -> Result<()> {
-        // SAFETY: plugins are trusted; we verify ABI version before init.
-        let lib = unsafe { Library::new(path) }
-            .map_err(|e| FellmError::other(format!("dlopen {}: {e}", path.display())))?;
+        let discovered = PluginCatalog::discover_path(path)?;
+        self.activate_path(&discovered, ctx)
+    }
 
-        let abi_version_fn: PluginAbiVersionFn = unsafe {
-            *lib.get(symbols::ABI_VERSION)
-                .map_err(|e| FellmError::other(format!("missing abi_version: {e}")))?
-        };
-        let reported = unsafe { abi_version_fn() };
-        if reported.major != ABI_VERSION.major
-            || reported.minor != ABI_VERSION.minor
-            || reported.patch != ABI_VERSION.patch
+    fn activate_path(&mut self, discovered: &DiscoveredPlugin, ctx: &HostContext) -> Result<()> {
+        if self
+            .plugins
+            .iter()
+            .any(|plugin| plugin.manifest.id == discovered.manifest.id)
         {
             return Err(FellmError::other(format!(
-                "plugin ABI {}.{}.{} incompatible with host {}.{}.{}",
-                reported.major,
-                reported.minor,
-                reported.patch,
-                ABI_VERSION.major,
-                ABI_VERSION.minor,
-                ABI_VERSION.patch
+                "plugin id {} is already activated",
+                discovered.manifest.id
             )));
         }
 
-        if let Ok(sym) = unsafe { lib.get::<PluginManifestFn>(symbols::MANIFEST) } {
-            let manifest = unsafe { (*sym)() };
-            if manifest.abi_hash != 0 && manifest.abi_hash != abi_hash() {
-                return Err(FellmError::other(format!(
-                    "plugin abi_hash {:#x} != host {:#x}",
-                    manifest.abi_hash,
-                    abi_hash()
-                )));
-            }
-            let _name = c_name_to_str(&manifest.name);
+        let lib = unsafe { Library::new(&discovered.path) }
+            .map_err(|e| FellmError::other(format!("dlopen {}: {e}", discovered.path.display())))?;
+        verify_abi(&lib, &discovered.path)?;
+        let manifest = read_manifest(&lib, &discovered.path)?;
+        if manifest.id != discovered.manifest.id {
+            return Err(FellmError::other(format!(
+                "plugin manifest changed during activation: {} -> {}",
+                discovered.manifest.id, manifest.id
+            )));
         }
 
-        let init_fn: PluginInitFn = unsafe {
+        let init: PluginInitFn = unsafe {
             *lib.get(symbols::INIT)
-                .map_err(|e| FellmError::other(format!("missing init: {e}")))?
+                .map_err(|e| FellmError::other(format!("missing _fellm_plugin_init: {e}")))?
         };
-        let rc = unsafe { init_fn(ctx) };
-        if rc != 0 {
-            return Err(FellmError::other(format!("plugin init failed ({rc})")));
-        }
-
-        let register_fn: PluginRegisterFn = unsafe {
-            *lib.get(symbols::REGISTER)
-                .map_err(|e| FellmError::other(format!("missing register: {e}")))?
+        let shutdown: PluginShutdownFn = unsafe {
+            *lib.get(symbols::SHUTDOWN)
+                .map_err(|e| FellmError::other(format!("missing _fellm_plugin_shutdown: {e}")))?
         };
-        let mut vtable = self.registry.vtable();
-        let rc = unsafe { register_fn(&raw mut vtable) };
-        if rc != 0 {
-            return Err(FellmError::other(format!("plugin register failed ({rc})")));
-        }
-
-        if let Ok(sym) =
-            unsafe { lib.get::<PluginRegisterArchitecturesFn>(symbols::REGISTER_ARCHITECTURES) }
-        {
-            let mut architecture_vtable = self.architectures.vtable();
-            let rc = unsafe { (*sym)(&raw mut architecture_vtable) };
-            if rc != 0 {
-                return Err(FellmError::other(format!(
-                    "plugin architecture registration failed ({rc})"
-                )));
-            }
-        }
-
-        if let Ok(sym) =
-            unsafe { lib.get::<PluginRegisterCapabilitiesFn>(symbols::REGISTER_CAPABILITIES) }
-        {
-            let mut cap_vtable = self.capabilities.vtable();
-            let rc = unsafe { (*sym)(&raw mut cap_vtable) };
-            if rc != 0 {
-                return Err(FellmError::other(format!(
-                    "plugin capability registration failed ({rc})"
-                )));
-            }
-            // Tag dynamic providers with source path.
-            for p in self.capabilities.list() {
-                // source already set for builtins; dynamic entries have None.
-                let _ = p;
-            }
-        }
-
-        let shutdown: Option<PluginShutdownFn> =
-            unsafe { lib.get(symbols::SHUTDOWN).ok().map(|s| *s) };
-        let invalidate_f32: Option<PluginInvalidateF32Fn> =
-            unsafe { lib.get(symbols::INVALIDATE_F32).ok().map(|s| *s) };
-        let update_step_params: Option<PluginUpdateStepParamsFn> =
-            unsafe { lib.get(symbols::UPDATE_STEP_PARAMS).ok().map(|s| *s) };
-        let register_device_tensor: Option<PluginRegisterDeviceTensorFn> =
+        let registrations = resolve_registrations(&lib, &manifest)?;
+        let invalidate_f32 = unsafe { lib.get(symbols::INVALIDATE_F32).ok().map(|s| *s) };
+        let update_step_params = unsafe { lib.get(symbols::UPDATE_STEP_PARAMS).ok().map(|s| *s) };
+        let register_device_tensor =
             unsafe { lib.get(symbols::REGISTER_DEVICE_TENSOR).ok().map(|s| *s) };
 
+        let result = (|| {
+            let rc = unsafe { init(ctx) };
+            if rc != 0 {
+                return Err(FellmError::other(format!("plugin init failed ({rc})")));
+            }
+            register_components(self, &registrations)
+        })();
+        if let Err(error) = result {
+            unsafe { shutdown() };
+            return Err(error);
+        }
+
         self.plugins.push(LoadedPlugin {
-            path: path.to_path_buf(),
+            path: discovered.path.clone(),
+            manifest,
             _lib: lib,
             shutdown,
             invalidate_f32,
@@ -295,35 +335,179 @@ impl Default for PluginHost {
     }
 }
 
-fn is_plugin_lib(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    // Skip the example crate's rlib / build artifacts; accept cdylib names.
-    let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-    // Only accept the platform's native loadable extension. On Windows that is
-    // `.dll`; on Linux/WSL it is `.so`. This prevents the loader from trying to
-    // `dlopen` a checked-in Windows `.dll` under WSL (and vice-versa).
-    let native_ok = cfg!(target_os = "windows")
-        .then(|| matches!(ext, "dll"))
-        .unwrap_or(false)
-        || cfg!(any(target_os = "linux", target_os = "android"))
-            .then(|| matches!(ext, "so" | "dylib"))
-            .unwrap_or(false);
-    native_ok
-        && (name.contains("example_cpu_op")
-            || name.contains("cuda_kernels")
-            || name.contains("triattention")
-            || name.starts_with("lib"))
+struct Registrations {
+    kernels: Option<PluginRegisterKernelsFn>,
+    architectures: Option<PluginRegisterArchitecturesFn>,
+    capabilities: Option<PluginRegisterCapabilitiesFn>,
 }
 
-fn c_name_to_str(buf: &[std::ffi::c_char; fellm_plugin_abi::PLUGIN_NAME_MAX]) -> String {
-    let bytes: Vec<u8> = buf
-        .iter()
-        .map(|&c| c as u8)
-        .take_while(|&b| b != 0)
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+fn register_components(host: &mut PluginHost, registrations: &Registrations) -> Result<()> {
+    if let Some(register) = registrations.kernels {
+        let mut vtable = host.registry.vtable();
+        let rc = unsafe { register(&raw mut vtable) };
+        if rc != 0 {
+            return Err(FellmError::other(format!(
+                "plugin kernel registration failed ({rc})"
+            )));
+        }
+    }
+    if let Some(register) = registrations.architectures {
+        let mut vtable = host.architectures.vtable();
+        let rc = unsafe { register(&raw mut vtable) };
+        if rc != 0 {
+            return Err(FellmError::other(format!(
+                "plugin architecture registration failed ({rc})"
+            )));
+        }
+    }
+    if let Some(register) = registrations.capabilities {
+        let mut vtable = host.capabilities.vtable();
+        let rc = unsafe { register(&raw mut vtable) };
+        if rc != 0 {
+            return Err(FellmError::other(format!(
+                "plugin capability registration failed ({rc})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_registrations(lib: &Library, manifest: &PluginManifest) -> Result<Registrations> {
+    let mut kernels = false;
+    let mut architectures = false;
+    let mut capabilities = false;
+    for component in &manifest.provides {
+        let (required, symbol) = match component.kind() {
+            PluginComponentKind::Backend | PluginComponentKind::Unknown(_) => continue,
+            PluginComponentKind::Kernels => {
+                kernels = true;
+                (
+                    component.entrypoint.as_deref(),
+                    "_fellm_plugin_register_kernels",
+                )
+            }
+            PluginComponentKind::Architecture => {
+                architectures = true;
+                (
+                    component.entrypoint.as_deref(),
+                    "_fellm_plugin_register_architectures",
+                )
+            }
+            PluginComponentKind::Capability => {
+                capabilities = true;
+                (
+                    component.entrypoint.as_deref(),
+                    "_fellm_plugin_register_capabilities",
+                )
+            }
+        };
+        if required.is_some_and(|entrypoint| !entrypoint_matches(entrypoint, symbol)) {
+            return Err(FellmError::other(format!(
+                "plugin {} declares unsupported entrypoint for {} (expected {symbol})",
+                manifest.id, component.component_type
+            )));
+        }
+    }
+
+    let kernels = if kernels {
+        Some(unsafe {
+            *lib.get(symbols::REGISTER_KERNELS).map_err(|e| {
+                FellmError::other(format!(
+                    "manifest declares kernels but symbol is missing: {e}"
+                ))
+            })?
+        })
+    } else {
+        None
+    };
+    let architectures = if architectures {
+        Some(unsafe {
+            *lib.get(symbols::REGISTER_ARCHITECTURES).map_err(|e| {
+                FellmError::other(format!(
+                    "manifest declares architecture but symbol is missing: {e}"
+                ))
+            })?
+        })
+    } else {
+        None
+    };
+    let capabilities = if capabilities {
+        Some(unsafe {
+            *lib.get(symbols::REGISTER_CAPABILITIES).map_err(|e| {
+                FellmError::other(format!(
+                    "manifest declares capability but symbol is missing: {e}"
+                ))
+            })?
+        })
+    } else {
+        None
+    };
+    Ok(Registrations {
+        kernels,
+        architectures,
+        capabilities,
+    })
+}
+
+fn entrypoint_matches(declared: &str, symbol: &str) -> bool {
+    declared == symbol
+        || symbol
+            .strip_prefix("_fellm_plugin_")
+            .is_some_and(|expected| declared == expected)
+}
+
+fn verify_abi(lib: &Library, path: &Path) -> Result<()> {
+    let abi_version: PluginAbiVersionFn = unsafe {
+        *lib.get(symbols::ABI_VERSION).map_err(|e| {
+            FellmError::other(format!(
+                "missing _fellm_plugin_abi_version in {}: {e}",
+                path.display()
+            ))
+        })?
+    };
+    let reported = unsafe { abi_version() };
+    if reported != ABI_VERSION {
+        return Err(FellmError::other(format!(
+            "plugin ABI {}.{}.{} incompatible with host {}.{}.{}",
+            reported.major,
+            reported.minor,
+            reported.patch,
+            ABI_VERSION.major,
+            ABI_VERSION.minor,
+            ABI_VERSION.patch
+        )));
+    }
+    Ok(())
+}
+
+fn read_manifest(lib: &Library, path: &Path) -> Result<PluginManifest> {
+    let manifest_json: PluginManifestJsonFn = unsafe {
+        *lib.get(symbols::MANIFEST_JSON).map_err(|e| {
+            FellmError::other(format!(
+                "missing _fellm_plugin_manifest_json in {}: {e}",
+                path.display()
+            ))
+        })?
+    };
+    let raw = unsafe { manifest_json() };
+    if raw.ptr.is_null() || raw.len == 0 || raw.len > MAX_MANIFEST_BYTES {
+        return Err(FellmError::other(format!(
+            "invalid embedded manifest buffer in {}",
+            path.display()
+        )));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(raw.ptr, raw.len) };
+    parse_manifest(bytes)
+}
+
+fn is_dynamic_library(path: &Path) -> bool {
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    match () {
+        _ if cfg!(target_os = "windows") => extension == Some("dll"),
+        _ if cfg!(target_os = "macos") => extension == Some("dylib"),
+        _ if cfg!(unix) => extension == Some("so"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -331,25 +515,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_lib_is_platform_native_extension() {
-        // A `.dll` must never be treated as loadable on Linux/WSL, and a `.so`
-        // must never be treated as loadable on Windows. This is what caused the
-        // "skip plugin path=...fellm_triattention.dll error=dlopen failed" warn.
-        let dll = Path::new("plugins/fellm_triattention.dll");
-        let so = Path::new("plugins/libcuda_kernels.so");
+    fn dynamic_library_filter_uses_only_native_extension() {
         assert_eq!(
-            is_plugin_lib(dll),
-            cfg!(target_os = "windows"),
-            "dll loadable only on Windows"
+            is_dynamic_library(Path::new("plugins/plugin.dll")),
+            cfg!(target_os = "windows")
         );
         assert_eq!(
-            is_plugin_lib(so),
-            cfg!(any(target_os = "linux", target_os = "android")),
-            "so loadable only on Linux"
+            is_dynamic_library(Path::new("plugins/plugin.dylib")),
+            cfg!(target_os = "macos")
         );
-        // Rlibs / random files are never plugins.
-        assert!(!is_plugin_lib(Path::new("plugins/triattention/README.md")));
-        assert!(!is_plugin_lib(Path::new("plugins/fellm_triattention.rlib")));
-        assert!(!is_plugin_lib(Path::new("plugins/fellm_triattention.pdb")));
+        assert_eq!(
+            is_dynamic_library(Path::new("plugins/plugin.so")),
+            cfg!(unix)
+        );
+        assert!(!is_dynamic_library(Path::new("plugins/plugin.rlib")));
+        assert!(!is_dynamic_library(Path::new("plugins/plugin.dll.bak")));
+    }
+
+    #[test]
+    fn entrypoint_accepts_manifest_convention_or_exported_symbol() {
+        assert!(entrypoint_matches(
+            "register_architectures",
+            "_fellm_plugin_register_architectures"
+        ));
+        assert!(entrypoint_matches(
+            "_fellm_plugin_register_kernels",
+            "_fellm_plugin_register_kernels"
+        ));
+        assert!(!entrypoint_matches(
+            "register_backend",
+            "_fellm_plugin_register_kernels"
+        ));
     }
 }

@@ -21,9 +21,9 @@ The engine is designed around two promises that usually don't coexist:
 
 **Backend folding.** You don't compile one bloated binary that tries to talk to every GPU vendor at runtime. You compile `fellm-cpu` or `fellm-cuda`, and you get a single, tight binary where the compiler has inlined and optimized everything for exactly that target. Nothing you didn't ask for is in the binary.
 
-**A plugin system.** New model architectures - Mamba-3, block-diffusion models, hybrid attention-SSM stacks, whatever comes next month - ship as plugins. Drop a shared library into `plugins/` and the engine picks it up. No forking, no months-long integration projects, no waiting for upstream. The plugin runs its kernels on the same GPU context as the core with zero-copy buffer sharing, so the abstraction doesn't cost you performance where it matters.
+**Plugin system.** New model architectures - Mamba-3, block-diffusion models, hybrid attention-SSM stacks, whatever comes next month - ship as plugins. Drop a shared library into `plugins/` and the engine picks it up. No forking, no months-long integration projects, no waiting for upstream. The plugin runs its kernels on the same GPU context as the core with zero-copy buffer sharing, so the abstraction doesn't cost you performance where it matters.
 
-**A flexible core.** The execution model isn't hardcoded to "predict one token, append, repeat." It's a general-purpose generator abstraction that handles autoregressive decoding, block-diffusion, multi-token prediction, speculative decoding, and reasoning-budget loops through one uniform interface. The scheduler, the memory allocator, and the graph executor don't care *how* a model produces tokens - they just care that it does.
+**Flexible core.** The execution model isn't hardcoded to "predict one token, append, repeat." It's a general-purpose generator abstraction that handles autoregressive decoding, block-diffusion, multi-token prediction, speculative decoding, and reasoning-budget loops through one uniform interface. The scheduler, the memory allocator, and the graph executor don't care *how* a model produces tokens - they just care that it does.
 
 ## Current status
 
@@ -32,7 +32,13 @@ FeLLM is in active early development. Two backends are available today:
 - **CPU** - with SIMD acceleration (AVX2, AVX-512, NEON) and full GGUF quantization support.
 - **CUDA** - targeting NVIDIA GPUs from Ampere onward.
 
-Metal, ROCm, and Vulkan backends are planned.
+*Metal, ROCm, and Vulkan backends are planned.*
+
+### Supported architectures
+
+- **dense attention** - the standard Transformer architecture.
+- **MoE** - mixture-of-experts.
+- **Diffusion** - block-diffusion models. (plugin)
 
 ## Building
 

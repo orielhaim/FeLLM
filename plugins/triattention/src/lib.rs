@@ -21,13 +21,12 @@ pub use scoring::{
 
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::c_abi::{
-    CapabilityRegistryVtable, HostContext, KernelRegistryVtable, PLUGIN_MAX_FEATURES,
-    PluginCapabilityRegistration, PluginManifest, abi_hash,
+    CapabilityRegistryVtable, HostContext, PLUGIN_MAX_FEATURES, PluginCapabilityRegistration,
+    PluginManifestJson,
 };
 use fellm_plugin_abi::capability::{
     CapabilityKind, FeatureId, FeatureSet, PluginConfig, ProviderDescriptor, ProviderVersion,
 };
-use fellm_plugin_abi::op::OpKind;
 use fellm_plugin_abi::sequence_state::{
     RetainedEntry, RetentionContext, RetentionPlan, RetentionStats, SequenceAttentionState,
     SequenceStatePolicy,
@@ -295,18 +294,26 @@ impl SequenceStatePolicy for TriAttentionPolicy {
     }
 }
 
-// ---- Dynamic plugin C ABI -------------------------------------------------
-
 /// Report ABI version to the host loader.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _fellm_plugin_abi_version() -> AbiVersion {
     ABI_VERSION
 }
 
-/// Static plugin manifest (name, version, abi hash).
+static MANIFEST_JSON: &[u8] = concat!(
+    r#"{"schema":1,"id":"fellm.triattention","name":"TriAttention","version":"#,
+    env!("CARGO_PKG_VERSION"),
+    r#"","provides":[{"type":"capability","id":"kv.triattention"}]}"#
+)
+.as_bytes();
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _fellm_plugin_manifest() -> PluginManifest {
-    PluginManifest::new("kv.triattention", 0, 1, 0, abi_hash())
+/// Return the embedded declarative plugin manifest.
+pub unsafe extern "C" fn _fellm_plugin_manifest_json() -> PluginManifestJson {
+    PluginManifestJson {
+        ptr: MANIFEST_JSON.as_ptr(),
+        len: MANIFEST_JSON.len(),
+    }
 }
 
 /// Initialize plugin with host context.
@@ -363,23 +370,6 @@ pub unsafe extern "C" fn _fellm_triattention_score_batch(
         );
         let out = unsafe { std::slice::from_raw_parts_mut(out_scores, n) };
         out.copy_from_slice(&scores);
-        0
-    }));
-    result.unwrap_or(-99)
-}
-
-/// Register ops (score batch exposed via dedicated C symbol above).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVtable) -> c_int {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if registry.is_null() {
-            return -1;
-        }
-        // Scoring is provided via `_fellm_triattention_score_batch` (stable C ABI).
-        // Optional custom OpKind ids for graph embedding:
-        let _ = OpKind::custom("kv.triattention", "score");
-        let _ = OpKind::custom("kv.triattention", "compact");
-        let _ = registry;
         0
     }));
     result.unwrap_or(-99)

@@ -7,6 +7,7 @@ use fellm_plugin_abi::op::OpKind;
 use fellm_plugin_abi::{OpAttrs, TensorMut, TensorRef};
 use fellm_plugin_host::PluginHost;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::{LazyLock, Mutex};
 
 /// The numerical CUDA tests load the plugin and launch kernels on the shared
@@ -21,13 +22,11 @@ fn candidate_paths() -> Vec<PathBuf> {
     root.pop();
     if cfg!(windows) {
         vec![
-            root.join("plugins/dist/cuda_kernels.dll"),
             root.join("plugins/cuda_kernels/target/release/cuda_kernels.dll"),
             root.join("plugins/cuda_kernels/target/debug/cuda_kernels.dll"),
         ]
     } else {
         vec![
-            root.join("plugins/dist/libcuda_kernels.so"),
             root.join("plugins/cuda_kernels/target/release/libcuda_kernels.so"),
             root.join("plugins/cuda_kernels/target/debug/libcuda_kernels.so"),
         ]

@@ -76,54 +76,13 @@ impl HostContext {
     }
 }
 
-/// Static manifest returned by `_fellm_plugin_manifest` (optional but recommended).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct PluginManifest {
-    /// Plugin short name (NUL-terminated).
-    pub name: [c_char; PLUGIN_NAME_MAX],
-    /// Plugin semver major.
-    pub version_major: u16,
-    /// Plugin semver minor.
-    pub version_minor: u16,
-    /// Plugin semver patch.
-    pub version_patch: u16,
-    /// FNV-1a hash of the ABI surface the plugin was built against.
-    pub abi_hash: u64,
-}
-
-impl PluginManifest {
-    /// Construct a manifest with a Rust `&str` name.
-    #[must_use]
-    pub fn new(name: &str, major: u16, minor: u16, patch: u16, abi_hash: u64) -> Self {
-        let mut buf = [0i8; PLUGIN_NAME_MAX];
-        for (dst, src) in buf.iter_mut().zip(name.bytes()).take(PLUGIN_NAME_MAX - 1) {
-            *dst = src as c_char;
-        }
-        Self {
-            name: buf,
-            version_major: major,
-            version_minor: minor,
-            version_patch: patch,
-            abi_hash,
-        }
-    }
-}
-
-/// Stable FNV-1a hash of the current ABI version tuple.
-#[must_use]
-pub const fn abi_hash() -> u64 {
-    // FNV-1a 64-bit over "fellm-abi-{major}.{minor}.{patch}"
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = b"fellm-abi-0.7.0";
-    let mut i = 0;
-    while i < bytes.len() {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-        i += 1;
-    }
-    let _ = (ABI_VERSION.major, ABI_VERSION.minor, ABI_VERSION.patch);
-    hash
+pub struct PluginManifestJson {
+    /// Pointer to UTF-8 JSON bytes.
+    pub ptr: *const u8,
+    /// Number of bytes at [`Self::ptr`].
+    pub len: usize,
 }
 
 /// Hot-path kernel launch function pointer (C ABI).
@@ -138,7 +97,6 @@ pub type PluginLaunchFn = unsafe extern "C" fn(
     stream: StreamHandle,
 ) -> c_int;
 
-/// One op registration record filled by the plugin during `_fellm_plugin_register`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PluginOpRegistration {
@@ -154,7 +112,6 @@ pub struct PluginOpRegistration {
     pub launch: Option<PluginLaunchFn>,
 }
 
-/// Vtable the host passes into `_fellm_plugin_register`.
 #[repr(C)]
 pub struct KernelRegistryVtable {
     /// Opaque host registry pointer.
@@ -215,20 +172,22 @@ pub struct ArchitectureRegistryVtable {
 
 /// Required plugin entry: report ABI version.
 pub type PluginAbiVersionFn = unsafe extern "C" fn() -> AbiVersion;
-/// Optional plugin entry: static manifest.
-pub type PluginManifestFn = unsafe extern "C" fn() -> PluginManifest;
+/// Required plugin entry: embedded JSON manifest.
+pub type PluginManifestJsonFn = unsafe extern "C" fn() -> PluginManifestJson;
 /// Required plugin entry: initialize with host context.
 pub type PluginInitFn = unsafe extern "C" fn(ctx: *const HostContext) -> c_int;
-/// Required plugin entry: register ops into the host registry.
-pub type PluginRegisterFn = unsafe extern "C" fn(registry: *mut KernelRegistryVtable) -> c_int;
-/// Optional architecture registration entry.  If present, it must register
-/// complete providers using the exact current contract.
+/// Conditional plugin entry: register kernels into the host registry.
+pub type PluginRegisterKernelsFn =
+    unsafe extern "C" fn(registry: *mut KernelRegistryVtable) -> c_int;
+/// Conditional architecture registration entry. A plugin declaring an
+/// `architecture` component must export it and register complete providers
+/// using the exact current contract.
 pub type PluginRegisterArchitecturesFn =
     unsafe extern "C" fn(registry: *mut ArchitectureRegistryVtable) -> c_int;
-/// Optional multi-capability registration (attention, KV policy, etc.).
+/// Conditional multi-capability registration (attention, KV policy, etc.).
 pub type PluginRegisterCapabilitiesFn =
     unsafe extern "C" fn(registry: *mut CapabilityRegistryVtable) -> c_int;
-/// Required plugin entry: tear down plugin state.
+/// Required plugin entry: tear down plugin state after activation.
 pub type PluginShutdownFn = unsafe extern "C" fn();
 /// Optional: invalidate a host f32 buffer's device mirror after a CPU write.
 ///
@@ -336,12 +295,12 @@ pub struct CapabilityRegistryVtable {
 pub mod symbols {
     /// `_fellm_plugin_abi_version`
     pub const ABI_VERSION: &[u8] = b"_fellm_plugin_abi_version\0";
-    /// `_fellm_plugin_manifest`
-    pub const MANIFEST: &[u8] = b"_fellm_plugin_manifest\0";
+    /// `_fellm_plugin_manifest_json`
+    pub const MANIFEST_JSON: &[u8] = b"_fellm_plugin_manifest_json\0";
     /// `_fellm_plugin_init`
     pub const INIT: &[u8] = b"_fellm_plugin_init\0";
-    /// `_fellm_plugin_register`
-    pub const REGISTER: &[u8] = b"_fellm_plugin_register\0";
+    /// `_fellm_plugin_register_kernels`
+    pub const REGISTER_KERNELS: &[u8] = b"_fellm_plugin_register_kernels\0";
     /// `_fellm_plugin_register_capabilities`
     pub const REGISTER_CAPABILITIES: &[u8] = b"_fellm_plugin_register_capabilities\0";
     /// `_fellm_plugin_register_architectures` (optional for kernel-only plugins)

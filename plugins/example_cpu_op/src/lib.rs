@@ -2,7 +2,7 @@
 
 use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::{
-    HostContext, KernelRegistryVtable, PluginManifest, PluginOpRegistration, abi_hash,
+    HostContext, KernelRegistryVtable, PluginManifestJson, PluginOpRegistration,
 };
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::{ABI_VERSION, AbiVersion, StreamHandle, TensorMut, TensorRef};
@@ -16,9 +16,19 @@ pub unsafe extern "C" fn _fellm_plugin_abi_version() -> AbiVersion {
     ABI_VERSION
 }
 
+static MANIFEST_JSON: &[u8] = concat!(
+    r#"{"schema":1,"id":"fellm.example.cpu-op","name":"Example CPU Op","version":"#,
+    env!("CARGO_PKG_VERSION"),
+    r#"","provides":[{"type":"kernels","backend":"cpu"}]}"#
+)
+.as_bytes();
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _fellm_plugin_manifest() -> PluginManifest {
-    PluginManifest::new("example_cpu_op", 0, 1, 0, abi_hash())
+pub unsafe extern "C" fn _fellm_plugin_manifest_json() -> PluginManifestJson {
+    PluginManifestJson {
+        ptr: MANIFEST_JSON.as_ptr(),
+        len: MANIFEST_JSON.len(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -36,7 +46,9 @@ pub unsafe extern "C" fn _fellm_plugin_init(ctx: *const HostContext) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVtable) -> c_int {
+pub unsafe extern "C" fn _fellm_plugin_register_kernels(
+    registry: *mut KernelRegistryVtable,
+) -> c_int {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if registry.is_null() {
             return -1;

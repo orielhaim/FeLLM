@@ -9,6 +9,8 @@ license.workspace = true
 fellm-core.workspace = true
 fellm-plugin-abi.workspace = true
 libloading.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

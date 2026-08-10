@@ -4,7 +4,7 @@ use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::HostContext;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::{TensorMut, TensorRef};
-use fellm_plugin_host::PluginHost;
+use fellm_plugin_host::{PluginCatalog, PluginHost};
 use std::path::PathBuf;
 
 fn plugin_path() -> PathBuf {
@@ -30,6 +30,9 @@ fn load_and_launch_identity_cast() {
         eprintln!("skip: plugin not built at {}", path.display());
         return;
     }
+    let discovered = PluginCatalog::discover_path(&path).expect("discover plugin manifest");
+    assert_eq!(discovered.manifest.id, "fellm.example.cpu-op");
+    assert_eq!(discovered.manifest.provides.len(), 1);
     let mut host = PluginHost::new();
     let ctx = HostContext::new(0, 0, std::ptr::null_mut(), "cpu");
     host.load_path(&path, &ctx).expect("load plugin");

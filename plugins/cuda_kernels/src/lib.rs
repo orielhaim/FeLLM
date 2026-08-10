@@ -12,7 +12,7 @@ mod tensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use fellm_core::dtype::DType;
 use fellm_plugin_abi::c_abi::{
-    HostContext, KernelRegistryVtable, PluginManifest, PluginOpRegistration, abi_hash,
+    HostContext, KernelRegistryVtable, PluginManifestJson, PluginOpRegistration,
 };
 use fellm_plugin_abi::op::OpKind;
 use fellm_plugin_abi::{ABI_VERSION, AbiVersion, DeviceStepParams, PagedKvSnapshot};
@@ -224,9 +224,19 @@ pub unsafe extern "C" fn _fellm_plugin_abi_version() -> AbiVersion {
     ABI_VERSION
 }
 
+static MANIFEST_JSON: &[u8] = concat!(
+    r#"{"schema":1,"id":"fellm.cuda","name":"FeLLM CUDA Backend","version":"#,
+    env!("CARGO_PKG_VERSION"),
+    r#"","provides":[{"type":"backend","id":"cuda"},{"type":"kernels","backend":"cuda"}]}"#
+)
+.as_bytes();
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _fellm_plugin_manifest() -> PluginManifest {
-    PluginManifest::new("cuda_kernels", 0, 1, 0, abi_hash())
+pub unsafe extern "C" fn _fellm_plugin_manifest_json() -> PluginManifestJson {
+    PluginManifestJson {
+        ptr: MANIFEST_JSON.as_ptr(),
+        len: MANIFEST_JSON.len(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -243,7 +253,9 @@ pub unsafe extern "C" fn _fellm_plugin_init(ctx: *const HostContext) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _fellm_plugin_register(registry: *mut KernelRegistryVtable) -> c_int {
+pub unsafe extern "C" fn _fellm_plugin_register_kernels(
+    registry: *mut KernelRegistryVtable,
+) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         if registry.is_null() {
             return -1;
