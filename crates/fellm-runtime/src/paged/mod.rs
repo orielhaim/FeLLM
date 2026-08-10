@@ -9,11 +9,110 @@ pub mod table;
 mod tests_share;
 
 pub use pool::{BLOCK_SIZE, BlockMeta, PhysicalPool};
-pub use prefix::PrefixTree;
+pub use prefix::{PrefixCacheStats, PrefixTree};
 pub use swap::SwapArena;
 pub use table::{BlockTable, SequenceCache};
 
 use fellm_core::error::{FellmError, Result};
+use fellm_plugin_abi::DeviceMemoryInfo;
+
+/// Byte-oriented KV allocation policy.
+#[derive(Debug, Clone)]
+pub struct KvCacheConfig {
+    /// Exact KV arena budget. When set, automatic memory targeting is bypassed.
+    pub budget_bytes: Option<u64>,
+    /// Fraction of currently available device/system memory usable in auto mode.
+    pub memory_fraction: f64,
+    /// Memory deliberately left available after model/runtime allocations.
+    pub safety_reserve_bytes: u64,
+    /// Backend/runtime headroom not otherwise represented in the graph plan.
+    pub runtime_reserve_bytes: u64,
+    /// Explicit host swap-tier budget.
+    pub swap_bytes: u64,
+}
+
+impl Default for KvCacheConfig {
+    fn default() -> Self {
+        Self {
+            budget_bytes: None,
+            memory_fraction: 0.25,
+            safety_reserve_bytes: 2 * 1024 * 1024 * 1024,
+            runtime_reserve_bytes: 512 * 1024 * 1024,
+            swap_bytes: 0,
+        }
+    }
+}
+
+/// Fully resolved startup memory plan for paged KV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvMemoryPlan {
+    pub weights_bytes: u64,
+    pub activation_bytes: u64,
+    pub block_bytes: usize,
+    pub blocks: usize,
+    pub kv_bytes: u64,
+    pub swap_blocks: usize,
+    pub swap_bytes: u64,
+    pub remaining_reserve_bytes: Option<u64>,
+}
+
+impl KvMemoryPlan {
+    pub fn resolve(
+        config: &KvCacheConfig,
+        memory: Option<DeviceMemoryInfo>,
+        weights_bytes: u64,
+        activation_bytes: u64,
+        block_bytes: usize,
+        minimum_blocks: usize,
+    ) -> Result<Self> {
+        if block_bytes == 0 {
+            return Err(FellmError::other("KV block size is zero"));
+        }
+        if !config.memory_fraction.is_finite()
+            || config.memory_fraction <= 0.0
+            || config.memory_fraction > 1.0
+        {
+            return Err(FellmError::other("KV memory fraction must be in (0, 1]"));
+        }
+        let fraction = config.memory_fraction;
+        let automatic = memory.map(|info| {
+            let usable = info
+                .available_bytes
+                .saturating_sub(weights_bytes)
+                .saturating_sub(activation_bytes)
+                .saturating_sub(config.runtime_reserve_bytes)
+                .saturating_sub(config.safety_reserve_bytes);
+            (usable as f64 * fraction) as u64
+        });
+        let requested = config.budget_bytes.or(automatic).ok_or_else(|| {
+            FellmError::other("automatic KV budget requires backend memory information; set an explicit byte budget")
+        })?;
+        let blocks = usize::try_from(requested / block_bytes as u64)
+            .unwrap_or(usize::MAX)
+            .max(minimum_blocks.max(1));
+        let kv_bytes = (blocks as u64).saturating_mul(block_bytes as u64);
+        let swap_blocks =
+            usize::try_from(config.swap_bytes / block_bytes as u64).unwrap_or(usize::MAX);
+        let swap_bytes = (swap_blocks as u64).saturating_mul(block_bytes as u64);
+        let remaining_reserve_bytes = memory.map(|info| {
+            info.available_bytes
+                .saturating_sub(weights_bytes)
+                .saturating_sub(activation_bytes)
+                .saturating_sub(config.runtime_reserve_bytes)
+                .saturating_sub(kv_bytes)
+        });
+        Ok(Self {
+            weights_bytes,
+            activation_bytes,
+            block_bytes,
+            blocks,
+            kv_bytes,
+            swap_blocks,
+            swap_bytes,
+            remaining_reserve_bytes,
+        })
+    }
+}
 
 /// Owns the shared physical pool, prefix index, and swap tier.
 pub struct CacheManager {
@@ -44,22 +143,6 @@ impl CacheManager {
             swap,
             clock: 0,
         })
-    }
-
-    /// Default sizing: enough blocks for `max_seq` tokens × layers × concurrency hint.
-    pub fn with_capacity(
-        max_seq: usize,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        concurrency: usize,
-    ) -> Result<Self> {
-        let blocks_per_seq = max_seq.div_ceil(BLOCK_SIZE).max(1) * n_layers.max(1);
-        let n_blocks = blocks_per_seq
-            .saturating_mul(concurrency.max(1))
-            .max(n_layers.max(1));
-        let swap_blocks = n_blocks / 2;
-        Self::new(n_blocks, n_layers, n_kv_heads, head_dim, swap_blocks)
     }
 
     /// Tick LRU clock.
@@ -237,5 +320,40 @@ impl CacheManager {
             seq.len_tokens = pos + 1;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_budget_resolves_to_whole_blocks() {
+        let config = KvCacheConfig {
+            budget_bytes: Some(10_000),
+            swap_bytes: 4_096,
+            ..KvCacheConfig::default()
+        };
+        let plan = KvMemoryPlan::resolve(&config, None, 20, 30, 1024, 2).unwrap();
+        assert_eq!(plan.blocks, 9);
+        assert_eq!(plan.kv_bytes, 9_216);
+        assert_eq!(plan.swap_blocks, 4);
+    }
+
+    #[test]
+    fn auto_budget_subtracts_known_allocations_and_reserves() {
+        let config = KvCacheConfig {
+            memory_fraction: 1.0,
+            safety_reserve_bytes: 100,
+            runtime_reserve_bytes: 200,
+            ..KvCacheConfig::default()
+        };
+        let memory = DeviceMemoryInfo {
+            total_bytes: 10_000,
+            available_bytes: 8_000,
+        };
+        let plan = KvMemoryPlan::resolve(&config, Some(memory), 1_000, 700, 100, 1).unwrap();
+        assert_eq!(plan.kv_bytes, 6_000);
+        assert_eq!(plan.remaining_reserve_bytes, Some(100));
     }
 }

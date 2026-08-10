@@ -54,6 +54,10 @@ pub(crate) fn host_paged_snapshot() -> Option<PagedKvSnapshot> {
         elem_bytes: 0,
         device_arena: std::ptr::null_mut(),
         device_arena_len: 0,
+        batch_size: 0,
+        row_positions: std::ptr::null(),
+        row_lengths: std::ptr::null(),
+        row_rope_positions: std::ptr::null(),
     };
     let rc = unsafe { snap_fn(&mut out) };
     if rc == 0 { Some(out) } else { None }
@@ -225,9 +229,9 @@ pub unsafe extern "C" fn _fellm_plugin_abi_version() -> AbiVersion {
 }
 
 static MANIFEST_JSON: &[u8] = concat!(
-    r#"{"schema":1,"id":"fellm.cuda","name":"FeLLM CUDA Backend","version":"#,
+    "{\"schema\":1,\"id\":\"fellm.cuda\",\"name\":\"FeLLM CUDA Backend\",\"version\":\"",
     env!("CARGO_PKG_VERSION"),
-    r#"","provides":[{"type":"backend","id":"cuda"},{"type":"kernels","backend":"cuda"}]}"#
+    "\",\"provides\":[{\"type\":\"backend\",\"id\":\"cuda\"},{\"type\":\"kernels\",\"backend\":\"cuda\"}]}"
 )
 .as_bytes();
 

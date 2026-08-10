@@ -2,6 +2,7 @@
 
 use fellm_runtime::{GenParams, GenStats, Message, ToolCall, ToolDef};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Axum application state shared across handlers.
 #[derive(Clone)]
@@ -12,6 +13,8 @@ pub struct AppState {
     pub model_id: String,
     /// Default sampling params when the request omits fields.
     pub defaults: GenParams,
+    /// In-process Prometheus recorder rendered by `/metrics`.
+    pub metrics: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 /// One generation job submitted by an HTTP handler.
@@ -26,6 +29,8 @@ pub struct InferenceTask {
     pub stream: bool,
     /// Reply channel back to the HTTP handler.
     pub reply: mpsc::UnboundedSender<WorkerEvent>,
+    /// Explicit signal tied to the HTTP response owner's lifetime.
+    pub cancellation: CancellationToken,
 }
 
 /// Events emitted by the inference worker for a single task.

@@ -73,6 +73,18 @@ struct RunArgs {
     /// Physical batch size (`n_ubatch`).
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: usize,
+    /// Exact KV arena bytes (0 selects automatic device/system budgeting).
+    #[arg(long, default_value_t = 0)]
+    kv_cache_bytes: u64,
+    /// Fraction of available memory considered by automatic KV budgeting.
+    #[arg(long, default_value_t = 0.25)]
+    kv_memory_fraction: f64,
+    /// Host swap-tier bytes reserved for paged KV.
+    #[arg(long, default_value_t = 0)]
+    kv_swap_bytes: u64,
+    /// Bytes kept free as a safety reserve.
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+    kv_safety_reserve_bytes: u64,
     /// Optional max sequence length override (alias of `--ctx-size`).
     #[arg(long, hide = true)]
     max_seq: Option<usize>,
@@ -185,11 +197,19 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     let preference = BackendPreference::parse(&args.backend)?;
     let select = BackendSelect::new(preference, !args.no_cpu_fallback);
     let providers = build_selection(&args)?;
+    let kv_cache = fellm_runtime::KvCacheConfig {
+        budget_bytes: (args.kv_cache_bytes > 0).then_some(args.kv_cache_bytes),
+        memory_fraction: args.kv_memory_fraction,
+        safety_reserve_bytes: args.kv_safety_reserve_bytes,
+        swap_bytes: args.kv_swap_bytes,
+        ..fellm_runtime::KvCacheConfig::default()
+    };
     let mut settings = EngineSettings::default()
         .batch_size(args.batch_size)
         .ubatch_size(args.ubatch_size)
         .backend_select(select)
-        .providers(providers);
+        .providers(providers)
+        .kv_cache(kv_cache);
 
     if let Some(dir) = &args.plugin_dir {
         settings = settings.plugin_dir(dir.clone());
@@ -222,6 +242,7 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
         top_p: args.top_p,
         seed: args.seed,
         repetition_penalty: args.repetition_penalty,
+        priority: 0,
     };
 
     let use_chat = !args.completion && engine.tokenizer().chat_template().is_some();

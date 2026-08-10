@@ -36,6 +36,14 @@ pub struct PagedKvSnapshot {
     pub device_arena: *mut u8,
     /// Device arena length in bytes (`0` if host-only).
     pub device_arena_len: usize,
+    /// Number of independently-addressed sequence rows in this physical batch.
+    pub batch_size: usize,
+    /// Dense KV write position for each batch row.
+    pub row_positions: *const u32,
+    /// Attention-visible KV length for each batch row.
+    pub row_lengths: *const u32,
+    /// Absolute RoPE position for each batch row.
+    pub row_rope_positions: *const u32,
 }
 
 /// Host callback: fill `out` from the process-wide paged context.
@@ -79,6 +87,10 @@ pub unsafe extern "C" fn host_snapshot_paged_kv(out: *mut PagedKvSnapshot) -> c_
             elem_bytes: ctx.elem_bytes,
             device_arena: ctx.device_arena,
             device_arena_len: ctx.device_arena_len,
+            batch_size: ctx.batch_size(),
+            row_positions: ctx.row_positions.as_ptr(),
+            row_lengths: ctx.row_lengths.as_ptr(),
+            row_rope_positions: ctx.row_rope_positions.as_ptr(),
         };
     }
     0
@@ -88,7 +100,13 @@ impl PagedKvSnapshot {
     /// Physical block id for `(layer, logical_block)`.
     #[must_use]
     pub fn physical(&self, layer: usize, logical: usize) -> u32 {
-        let idx = layer * self.n_logical_blocks + logical;
+        self.physical_for(0, layer, logical)
+    }
+
+    /// Physical block id for one batch row's `(layer, logical_block)`.
+    #[must_use]
+    pub fn physical_for(&self, row: usize, layer: usize, logical: usize) -> u32 {
+        let idx = (row * self.n_layers + layer) * self.n_logical_blocks + logical;
         debug_assert!(idx < self.n_block_table);
         // SAFETY: host guarantees table covers all logical blocks for the step.
         unsafe { *self.block_table.add(idx) }
@@ -104,9 +122,14 @@ impl PagedKvSnapshot {
     /// # Safety
     /// Arena must outlive the returned slice; caller must not mutate concurrently.
     pub unsafe fn k_row(&self, layer: usize, t: usize) -> &[f16] {
+        unsafe { self.k_row_for(0, layer, t) }
+    }
+
+    /// K row for a specific physical-batch row.
+    pub unsafe fn k_row_for(&self, row: usize, layer: usize, t: usize) -> &[f16] {
         let logical = t / self.block_size;
         let slot = t % self.block_size;
-        let phys = self.physical(layer, logical);
+        let phys = self.physical_for(row, layer, logical);
         let off = (phys as usize) * self.block_bytes;
         let row_bytes = self.row_byte_len();
         let base = off + slot * row_bytes;
@@ -122,9 +145,14 @@ impl PagedKvSnapshot {
     /// # Safety
     /// Same as [`Self::k_row`].
     pub unsafe fn v_row(&self, layer: usize, t: usize) -> &[f16] {
+        unsafe { self.v_row_for(0, layer, t) }
+    }
+
+    /// V row for a specific physical-batch row.
+    pub unsafe fn v_row_for(&self, row: usize, layer: usize, t: usize) -> &[f16] {
         let logical = t / self.block_size;
         let slot = t % self.block_size;
-        let phys = self.physical(layer, logical);
+        let phys = self.physical_for(row, layer, logical);
         let off = (phys as usize) * self.block_bytes;
         let row_bytes = self.row_byte_len();
         let v_base = self.block_size * row_bytes;
@@ -161,6 +189,12 @@ pub struct PagedKvContext {
     pub device_arena: *mut u8,
     /// Device arena byte length.
     pub device_arena_len: usize,
+    /// Dense KV write position for every row in the physical batch.
+    pub row_positions: Arc<[u32]>,
+    /// Attention-visible KV length for every row in the physical batch.
+    pub row_lengths: Arc<[u32]>,
+    /// Absolute RoPE position for every row in the physical batch.
+    pub row_rope_positions: Arc<[u32]>,
 }
 
 // SAFETY: The runtime guarantees the arena lives for the duration of the step
@@ -203,10 +237,22 @@ pub fn with_paged_context_mut<R>(f: impl FnOnce(Option<&mut PagedKvContext>) -> 
 }
 
 impl PagedKvContext {
+    /// Number of independently-addressed sequence rows.
+    #[must_use]
+    pub fn batch_size(&self) -> usize {
+        self.row_positions.len().max(1)
+    }
+
     /// Physical block id for `(layer, logical_block)`.
     #[must_use]
     pub fn physical(&self, layer: usize, logical: usize) -> u32 {
-        self.block_table[layer * self.n_logical_blocks + logical]
+        self.physical_for(0, layer, logical)
+    }
+
+    /// Physical block id for a row in a multi-sequence batch.
+    #[must_use]
+    pub fn physical_for(&self, row: usize, layer: usize, logical: usize) -> u32 {
+        self.block_table[(row * self.n_layers + layer) * self.n_logical_blocks + logical]
     }
 
     /// Byte offset of a physical block in the arena.
@@ -225,9 +271,14 @@ impl PagedKvContext {
     /// # Safety
     /// Arena must outlive the returned slice; caller must not mutate concurrently.
     pub unsafe fn k_row(&self, layer: usize, t: usize) -> &[f16] {
+        unsafe { self.k_row_for(0, layer, t) }
+    }
+
+    /// K row for a specific physical-batch row.
+    pub unsafe fn k_row_for(&self, row: usize, layer: usize, t: usize) -> &[f16] {
         let logical = t / self.block_size;
         let slot = t % self.block_size;
-        let phys = self.physical(layer, logical);
+        let phys = self.physical_for(row, layer, logical);
         let off = self.block_offset(phys);
         let row_bytes = self.row_byte_len();
         let base = off + slot * row_bytes;
@@ -244,9 +295,14 @@ impl PagedKvContext {
     /// # Safety
     /// Same as [`Self::k_row`].
     pub unsafe fn v_row(&self, layer: usize, t: usize) -> &[f16] {
+        unsafe { self.v_row_for(0, layer, t) }
+    }
+
+    /// V row for a specific physical-batch row.
+    pub unsafe fn v_row_for(&self, row: usize, layer: usize, t: usize) -> &[f16] {
         let logical = t / self.block_size;
         let slot = t % self.block_size;
-        let phys = self.physical(layer, logical);
+        let phys = self.physical_for(row, layer, logical);
         let off = self.block_offset(phys);
         let row_bytes = self.row_byte_len();
         let v_base = self.block_size * row_bytes;
@@ -263,9 +319,20 @@ impl PagedKvContext {
     /// # Safety
     /// Arena must be uniquely borrowed for mutation.
     pub unsafe fn row_mut(&mut self, layer: usize, t: usize, is_v: bool) -> &mut [f16] {
+        unsafe { self.row_mut_for(0, layer, t, is_v) }
+    }
+
+    /// Mutable K or V row for a specific physical-batch row.
+    pub unsafe fn row_mut_for(
+        &mut self,
+        row: usize,
+        layer: usize,
+        t: usize,
+        is_v: bool,
+    ) -> &mut [f16] {
         let logical = t / self.block_size;
         let slot = t % self.block_size;
-        let phys = self.physical(layer, logical);
+        let phys = self.physical_for(row, layer, logical);
         let off = self.block_offset(phys);
         let row_bytes = self.row_byte_len();
         let v_base = if is_v { self.block_size * row_bytes } else { 0 };

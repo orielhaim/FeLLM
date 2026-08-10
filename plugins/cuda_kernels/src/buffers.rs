@@ -39,16 +39,16 @@ fn weight_cache() -> &'static Mutex<WeightCache> {
     })
 }
 
-fn external_weights() -> &'static Mutex<HashMap<usize, (u64, usize)>> {
-    static EXTERNAL: OnceLock<Mutex<HashMap<usize, (u64, usize)>>> = OnceLock::new();
+fn external_weights() -> &'static Mutex<HashMap<(usize, usize), (u64, usize)>> {
+    static EXTERNAL: OnceLock<Mutex<HashMap<(usize, usize), (u64, usize)>>> = OnceLock::new();
     EXTERNAL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn external_tensor(host_ptr: usize) -> Result<Option<(u64, usize)>, i32> {
+fn external_tensor(host_ptr: usize, len: usize) -> Result<Option<(u64, usize)>, i32> {
     Ok(external_weights()
         .lock()
         .map_err(|_| -30)?
-        .get(&host_ptr)
+        .get(&(host_ptr, len))
         .copied())
 }
 
@@ -64,7 +64,7 @@ pub fn register_external_weight(
     external_weights()
         .lock()
         .map_err(|_| -30)?
-        .insert(host_ptr as usize, (device_ptr, len));
+        .insert((host_ptr as usize, len), (device_ptr, len));
     Ok(())
 }
 
@@ -74,7 +74,7 @@ pub fn ensure_weight(stream: &CudaStream, host: &[u8]) -> Result<usize, i32> {
     if external_weights()
         .lock()
         .map_err(|_| -30)?
-        .contains_key(&key)
+        .contains_key(&(key, host.len()))
     {
         return Ok(key);
     }
@@ -110,8 +110,8 @@ pub fn with_weight<R>(key: usize, f: impl FnOnce(&DeviceBuffer<u8>) -> R) -> Res
         external_weights()
             .lock()
             .map_err(|_| -30)?
-            .get(&key)
-            .copied()
+            .iter()
+            .find_map(|(&(ptr, _), &binding)| (ptr == key).then_some(binding))
     };
     if let Some((ptr, len)) = external {
         let buffer =
@@ -176,12 +176,12 @@ pub fn ensure_f32(stream: &CudaStream, host: &[f32], force_upload: bool) -> Resu
         ptr: host.as_ptr() as usize,
         len,
     };
-    if let Some((_, bytes)) = external_tensor(key.ptr)? {
+    if let Some((_, bytes)) = external_tensor(key.ptr, len * core::mem::size_of::<f32>())? {
         if bytes != len * core::mem::size_of::<f32>() {
             return Err(-2);
         }
         if force_upload {
-            let (ptr, _) = external_tensor(key.ptr)?.ok_or(-31)?;
+            let (ptr, _) = external_tensor(key.ptr, len * core::mem::size_of::<f32>())?.ok_or(-31)?;
             let mut buffer = unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(ptr, len, crate::oxide_ctx().clone())
             };
@@ -247,7 +247,7 @@ pub fn ensure_f32_out(stream: &CudaStream, host: &mut [f32]) -> Result<BufferKey
         ptr: host.as_ptr() as usize,
         len,
     };
-    if let Some((_, bytes)) = external_tensor(key.ptr)? {
+    if let Some((_, bytes)) = external_tensor(key.ptr, len * core::mem::size_of::<f32>())? {
         return if bytes == len * core::mem::size_of::<f32>() {
             Ok(key)
         } else {
@@ -277,7 +277,7 @@ pub fn ensure_f32_out(stream: &CudaStream, host: &mut [f32]) -> Result<BufferKey
 
 /// Mark the device buffer for `key` as matching host (after a successful kernel write).
 pub fn mark_valid(key: BufferKey) -> Result<(), i32> {
-    if external_tensor(key.ptr)?.is_some() {
+    if external_tensor(key.ptr, key.len * core::mem::size_of::<f32>())?.is_some() {
         return bump_f32_version(key);
     }
     let mut guard = f32_cache().lock().map_err(|_| -30)?;
@@ -337,7 +337,7 @@ pub fn with_q8_activation<R>(
 
 /// Download device buffer to host (keeps host coherent for CPU fallback / sampling).
 pub fn download_to(stream: &CudaStream, key: BufferKey, host: &mut [f32]) -> Result<(), i32> {
-    if let Some((ptr, bytes)) = external_tensor(key.ptr)? {
+    if let Some((ptr, bytes)) = external_tensor(key.ptr, key.len * core::mem::size_of::<f32>())? {
         if bytes != host.len() * core::mem::size_of::<f32>() {
             return Err(-2);
         }
@@ -364,7 +364,7 @@ pub fn download_to(stream: &CudaStream, key: BufferKey, host: &mut [f32]) -> Res
 
 /// Take ownership of an f32 cache entry (caller must [`put_f32`] later).
 pub fn take_f32(key: BufferKey) -> Result<(DeviceBuffer<f32>, bool), i32> {
-    if let Some((ptr, bytes)) = external_tensor(key.ptr)? {
+    if let Some((ptr, bytes)) = external_tensor(key.ptr, key.len * core::mem::size_of::<f32>())? {
         if bytes != key.len * core::mem::size_of::<f32>() {
             return Err(-2);
         }
@@ -380,7 +380,7 @@ pub fn take_f32(key: BufferKey) -> Result<(DeviceBuffer<f32>, bool), i32> {
 
 /// Return an f32 buffer previously taken with [`take_f32`].
 pub fn put_f32(key: BufferKey, buf: DeviceBuffer<f32>, device_valid: bool) -> Result<(), i32> {
-    if external_tensor(key.ptr)?.is_some() {
+    if external_tensor(key.ptr, key.len * core::mem::size_of::<f32>())?.is_some() {
         let _ = buf.into_raw_parts();
         if device_valid {
             bump_f32_version(key)?;

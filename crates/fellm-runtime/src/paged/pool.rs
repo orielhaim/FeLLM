@@ -34,6 +34,16 @@ pub struct PhysicalPool {
 }
 
 impl PhysicalPool {
+    #[must_use]
+    pub fn block_bytes_for(n_kv_heads: usize, head_dim: usize) -> usize {
+        let stride = n_kv_heads.max(1).saturating_mul(head_dim.max(1));
+        let raw = 2usize
+            .saturating_mul(BLOCK_SIZE)
+            .saturating_mul(stride)
+            .saturating_mul(ELEM_BYTES);
+        (raw + 63) & !63
+    }
+
     /// Pre-allocate `n_blocks` physical blocks (shared across layers via free list).
     pub fn new(
         n_blocks: usize,
@@ -47,9 +57,7 @@ impl PhysicalPool {
         let tokens_stride = n_kv_heads.max(1) * head_dim.max(1);
         // K then V for BLOCK_SIZE tokens.
         let block_elems = 2 * BLOCK_SIZE * tokens_stride;
-        let raw_bytes = block_elems * ELEM_BYTES;
-        // Pad so each block starts on a 64-byte boundary.
-        let block_bytes = (raw_bytes + 63) & !63;
+        let block_bytes = Self::block_bytes_for(n_kv_heads, head_dim);
         debug_assert_eq!(
             block_bytes % 64,
             0,

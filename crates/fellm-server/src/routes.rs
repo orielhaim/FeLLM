@@ -18,13 +18,25 @@ use serde_json::json;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Build the HTTP router.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
+        .route("/metrics", get(scrape_metrics))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
+}
+
+async fn scrape_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render(),
+    )
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -43,12 +55,14 @@ async fn chat_completions(
     };
 
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+    let cancellation = CancellationToken::new();
     let task = InferenceTask {
         messages,
         tools,
         params,
         stream: want_stream,
         reply: reply_tx,
+        cancellation: cancellation.clone(),
     };
 
     if let Err(err) = state.task_tx.send(task).await {
@@ -59,8 +73,9 @@ async fn chat_completions(
     }
 
     if want_stream {
-        stream_response(state.model_id.clone(), reply_rx).into_response()
+        stream_response(state.model_id.clone(), reply_rx, cancellation.drop_guard()).into_response()
     } else {
+        let _cancel_on_drop = cancellation.drop_guard();
         non_stream_response(&state.model_id, reply_rx).await
     }
 }
@@ -117,10 +132,12 @@ async fn non_stream_response(
 fn stream_response(
     model_id: String,
     mut reply_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    cancel_on_drop: DropGuard,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send> {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
+        let _cancel_on_drop = cancel_on_drop;
         let id = completion_id();
         let created = unix_now();
         let mut sent_role = false;
@@ -129,18 +146,26 @@ fn stream_response(
             match ev {
                 WorkerEvent::Token { text } => {
                     if !sent_role {
-                        let _ = tx
+                        if tx
                             .send(Ok(Event::default()
                                 .data(json_data(&stream_role_chunk(&id, created, &model_id)))))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         sent_role = true;
                     }
                     if !text.is_empty() {
-                        let _ = tx
+                        if tx
                             .send(Ok(Event::default().data(json_data(&stream_content_chunk(
                                 &id, created, &model_id, &text,
                             )))))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 WorkerEvent::Done {
@@ -149,12 +174,16 @@ fn stream_response(
                     ..
                 } => {
                     if !sent_role {
-                        let _ = tx
+                        if tx
                             .send(Ok(Event::default()
                                 .data(json_data(&stream_role_chunk(&id, created, &model_id)))))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
-                    let _ = tx
+                    if tx
                         .send(Ok(Event::default().data(json_data(&stream_final_chunk(
                             &id,
                             created,
@@ -162,8 +191,14 @@ fn stream_response(
                             &finish_reason,
                             tool_calls.as_deref(),
                         )))))
-                        .await;
-                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if tx.send(Ok(Event::default().data("[DONE]"))).await.is_err() {
+                        return;
+                    }
                     break;
                 }
                 WorkerEvent::Error(err) => {
@@ -171,8 +206,12 @@ fn stream_response(
                         "error": { "message": err, "type": "server_error" }
                     })
                     .to_string();
-                    let _ = tx.send(Ok(Event::default().data(payload))).await;
-                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    if tx.send(Ok(Event::default().data(payload))).await.is_err() {
+                        return;
+                    }
+                    if tx.send(Ok(Event::default().data("[DONE]"))).await.is_err() {
+                        return;
+                    }
                     break;
                 }
             }

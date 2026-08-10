@@ -30,6 +30,7 @@ rand.workspace = true
 rand_chacha.workspace = true
 half.workspace = true
 smallvec.workspace = true
+metrics.workspace = true
 
 [lints]
 workspace = true

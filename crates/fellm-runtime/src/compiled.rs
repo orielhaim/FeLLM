@@ -16,10 +16,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::executor::MutableBinding;
-
 /// Shared mutable buffer for a runtime / mutable-input slot.
 type SharedBuf = Rc<RefCell<AlignedBuffer>>;
+
+/// Mutable graph input backed by stable reusable storage.
+pub struct MutableBinding {
+    /// Element type.
+    pub dtype: DType,
+    /// Logical shape.
+    pub shape: Shape,
+    /// Shared storage modified by in-place graph operations.
+    pub buffer: Rc<RefCell<AlignedBuffer>>,
+}
 
 /// A per-slot value backing.
 enum SlotKind {
@@ -31,6 +39,12 @@ enum SlotKind {
     None,
     /// Runtime buffer or mutable input: shared, reused across steps.
     Buffer(SharedBuf),
+    /// A byte range in the graph-wide reusable activation arena.
+    Arena {
+        buffer: SharedBuf,
+        offset: usize,
+        len: usize,
+    },
 }
 
 /// One compiled node in plan order.
@@ -98,6 +112,16 @@ impl CompiledStep {
                         borrow.as_slice().as_ptr(),
                         borrow.len(),
                     ))
+                }
+                SlotKind::Arena {
+                    buffer,
+                    offset,
+                    len,
+                } => {
+                    let borrow = buffer.borrow();
+                    // SAFETY: the memory plan validates that offset + len is within the arena.
+                    let ptr = unsafe { borrow.as_slice().as_ptr().add(*offset) };
+                    Some((fellm_plugin_abi::PlanTensorId(index as u32), ptr, *len))
                 }
                 _ => None,
             })
@@ -178,6 +202,10 @@ impl CompiledStep {
         }
 
         let mut nodes: Vec<CompiledNode> = Vec::with_capacity(plan.order.len());
+        let activation_arena = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(
+            plan.memory.arena_bytes,
+            64,
+        )));
 
         for &id in &plan.order {
             let node = graph.node(id);
@@ -261,17 +289,40 @@ impl CompiledStep {
                         let src = &nodes[src_idx];
                         let buf = match &src.kind {
                             SlotKind::Buffer(b) => b.clone(),
+                            SlotKind::Arena { buffer, .. } => buffer.clone(),
                             _ => {
                                 return Err(FellmError::other(
                                     "in-place source is not a runtime/mutable value",
                                 ));
                             }
                         };
-                        (SlotKind::Buffer(buf), src.dtype, shape_from_dims(&src.dims))
+                        let kind = match &src.kind {
+                            SlotKind::Arena { offset, len, .. } => SlotKind::Arena {
+                                buffer: buf,
+                                offset: *offset,
+                                len: *len,
+                            },
+                            _ => SlotKind::Buffer(buf),
+                        };
+                        (kind, src.dtype, shape_from_dims(&src.dims))
                     } else {
                         let bytes = dtype.byte_size(shape.num_elements());
-                        let buf = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes, 64)));
-                        (SlotKind::Buffer(buf), *dtype, shape.clone())
+                        let allocation = plan.memory.allocations.get(&id).ok_or_else(|| {
+                            FellmError::other(format!(
+                                "missing activation allocation for {}",
+                                node.label
+                            ))
+                        })?;
+                        debug_assert!(allocation.size >= bytes);
+                        (
+                            SlotKind::Arena {
+                                buffer: activation_arena.clone(),
+                                offset: allocation.offset,
+                                len: bytes,
+                            },
+                            *dtype,
+                            shape.clone(),
+                        )
                     };
 
                     let (dims, strides) = dims_strides(&out_shape);
@@ -479,20 +530,16 @@ impl CompiledStep {
             return Ok(Tensor::from_storage(layout, storage));
         }
 
-        // Take the logits buffer out of the slot (zero-copy) and leave a fresh
-        // zeroed buffer for the next step that needs logits.
+        // Copy the logits out of the persistent activation arena. Sampling owns
+        // this result while the arena is immediately reusable by another batch.
         let bytes_len = self
             .logits_dtype
             .byte_size(self.logits_shape.num_elements());
-        let replacement = AlignedBuffer::new_zeroed(bytes_len, 64);
-        let taken = match &mut self.nodes[self.logits_src].kind {
-            SlotKind::Buffer(buf) => std::mem::replace(&mut *buf.borrow_mut(), replacement),
-            _ => {
-                return Err(FellmError::other(
-                    "logits source is not a reusable buffer slot",
-                ));
-            }
-        };
+        let mut taken = AlignedBuffer::new_zeroed(bytes_len, 64);
+        let source = self.tensor_ref(self.logits_src)?;
+        // SAFETY: tensor_ref describes a live contiguous logits buffer for this step.
+        let bytes = unsafe { core::slice::from_raw_parts(source.data, source.byte_len as usize) };
+        taken.as_mut_slice().copy_from_slice(&bytes[..bytes_len]);
         let layout = Layout::contiguous(self.logits_dtype, self.logits_shape.clone());
         let storage = Arc::new(Storage::Owned(Arc::new(taken)));
         Ok(Tensor::from_storage(layout, storage))
@@ -542,6 +589,20 @@ impl CompiledStep {
                 // SAFETY: single-op-at-a-time; no live &mut to this buffer now.
                 Ok(unsafe { TensorRef::from_raw(node.dtype, &node.dims, &node.strides, ptr, len) })
             }
+            SlotKind::Arena {
+                buffer,
+                offset,
+                len,
+            } => {
+                let borrow = buffer.borrow();
+                // SAFETY: planned range is within the stable arena allocation.
+                let ptr = unsafe { borrow.as_slice().as_ptr().add(*offset) };
+                Ok(
+                    unsafe {
+                        TensorRef::from_raw(node.dtype, &node.dims, &node.strides, ptr, *len)
+                    },
+                )
+            }
         }
     }
 
@@ -559,6 +620,20 @@ impl CompiledStep {
                 drop(borrow);
                 // SAFETY: single-op-at-a-time; caller holds only one mutable view.
                 Ok(unsafe { TensorMut::from_raw(node.dtype, &node.dims, &node.strides, ptr, len) })
+            }
+            SlotKind::Arena {
+                buffer,
+                offset,
+                len,
+            } => {
+                let mut borrow = buffer.borrow_mut();
+                // SAFETY: liveness planning prevents overlapping live outputs; launches are serial.
+                let ptr = unsafe { borrow.as_mut_slice().as_mut_ptr().add(*offset) };
+                Ok(
+                    unsafe {
+                        TensorMut::from_raw(node.dtype, &node.dims, &node.strides, ptr, *len)
+                    },
+                )
             }
             _ => Err(FellmError::other(
                 "cannot take mutable view of a non-buffer slot",

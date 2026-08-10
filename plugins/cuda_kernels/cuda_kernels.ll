@@ -869,6 +869,157 @@ bb34:
   unreachable
 }
 
+define ptx_kernel void @embedding_q8_0_rows(ptr %v0, i64 %v1, ptr %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr %v7, i64 %v8) #0 {
+entry:
+  %v9 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v10 = insertvalue { ptr, i64 } %v9, i64 %v1, 1
+  %v11 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v12 = insertvalue { ptr, i64 } %v11, i64 %v3, 1
+  %v13 = insertvalue { ptr, i64 } undef, ptr %v7, 0
+  %v14 = insertvalue { ptr, i64 } %v13, i64 %v8, 1
+  br label %bb0
+bb0:
+  %v15 = phi { ptr, i64 } [ %v10, %entry ]
+  %v16 = phi { ptr, i64 } [ %v12, %entry ]
+  %v17 = phi i32 [ %v4, %entry ]
+  %v18 = phi i32 [ %v5, %entry ]
+  %v19 = phi i32 [ %v6, %entry ]
+  %v20 = phi { ptr, i64 } [ %v14, %entry ]
+  %v21 = alloca {  }, align 1
+  %v22 = alloca [2 x i8], align 1
+  %v23 = bitcast ptr %v21 to ptr
+  %v24 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v23) #0
+  br label %bb1
+bb1:
+  %v25 = zext i32 %v17 to i64
+  %v26 = zext i32 %v18 to i64
+  %v27 = mul i64 %v25, %v26
+  %v28 = icmp uge i64 %v24, %v27
+  %v29 = xor i1 %v28, 1
+  br i1 %v29, label %bb3, label %bb2
+bb2:
+  br label %bb13
+bb3:
+  %v30 = icmp eq i64 %v26, 0
+  %v31 = xor i1 %v30, 1
+  br i1 %v31, label %bb4, label %bb21
+bb4:
+  %v32 = udiv i64 %v24, %v26
+  %v33 = urem i64 %v24, %v26
+  %v34 = zext i32 %v19 to i64
+  %v35 = mul i64 %v34, 34
+  %v36 = udiv i64 %v33, 32
+  %v37 = urem i64 %v33, 32
+  %v38 = extractvalue { ptr, i64 } %v16, 1
+  %v39 = icmp ult i64 %v32, %v38
+  br i1 %v39, label %bb5, label %bb22
+bb5:
+  %v40 = extractvalue { ptr, i64 } %v16, 0
+  %v41 = getelementptr inbounds i32, ptr %v40, i64 %v32
+  %v42 = load i32, ptr %v41, align 4
+  %v43 = zext i32 %v42 to i64
+  %v44 = mul i64 %v43, %v35
+  %v45 = mul i64 %v36, 34
+  %v46 = add i64 %v44, %v45
+  %v47 = extractvalue { ptr, i64 } %v15, 1
+  %v48 = icmp ult i64 %v46, %v47
+  br i1 %v48, label %bb6, label %bb23
+bb6:
+  %v49 = extractvalue { ptr, i64 } %v15, 0
+  %v50 = getelementptr inbounds i8, ptr %v49, i64 %v46
+  %v51 = load i8, ptr %v50, align 1
+  %v52 = add i64 %v46, 1
+  %v53 = icmp ult i64 %v52, %v47
+  br i1 %v53, label %bb7, label %bb24
+bb7:
+  %v54 = extractvalue { ptr, i64 } %v15, 0
+  %v55 = getelementptr inbounds i8, ptr %v54, i64 %v52
+  %v56 = load i8, ptr %v55, align 1
+  %v57 = getelementptr inbounds [2 x i8], ptr %v22, i32 0, i64 0
+  store i8 %v51, ptr %v57, align 1
+  %v58 = getelementptr inbounds [2 x i8], ptr %v22, i32 0, i64 1
+  store i8 %v56, ptr %v58, align 1
+  %v59 = load [2 x i8], ptr %v22, align 1
+  %v60 = alloca [2 x i8], align 2
+  store [2 x i8] %v59, ptr %v60, align 2
+  %v61 = load i16, ptr %v60, align 2
+  %v62 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v61) #0
+  br label %bb8
+bb8:
+  %v63 = icmp eq i64 %v24, 18446744073709551615
+  br i1 %v63, label %bb17, label %bb14
+bb9:
+  %v64 = extractvalue { ptr } %v85, 0
+  %v65 = add i64 %v46, 2
+  %v66 = add i64 %v65, %v37
+  %v67 = icmp ult i64 %v66, %v47
+  br i1 %v67, label %bb10, label %bb25
+bb10:
+  %v68 = extractvalue { ptr, i64 } %v15, 0
+  %v69 = getelementptr inbounds i8, ptr %v68, i64 %v66
+  %v70 = load i8, ptr %v69, align 1
+  %v71 = bitcast i8 %v70 to i8
+  %v72 = sitofp i8 %v71 to float
+  %v73 = fmul contract float %v62, %v72
+  store float %v73, ptr %v64, align 4
+  br label %bb12
+bb11:
+  br label %bb12
+bb12:
+  br label %bb13
+bb13:
+  ret void
+bb14:
+  %v74 = extractvalue { ptr, i64 } %v20, 1
+  %v75 = icmp ult i64 %v24, %v74
+  %v76 = xor i1 %v75, 1
+  br i1 %v76, label %bb16, label %bb15
+bb15:
+  %v77 = extractvalue { ptr, i64 } %v20, 0
+  %v78 = getelementptr inbounds float, ptr %v77, i64 %v24
+  %v79 = insertvalue { ptr } undef, ptr %v78, 0
+  %v80 = extractvalue { ptr } %v79, 0
+  br label %bb18
+bb16:
+  br label %bb17
+bb17:
+  %v81 = inttoptr i64 0 to ptr
+  %v82 = insertvalue { ptr } undef, ptr %v81, 0
+  %v83 = extractvalue { ptr } %v82, 0
+  br label %bb18
+bb18:
+  %v84 = phi ptr [ %v80, %bb15 ], [ %v83, %bb17 ]
+  %v85 = insertvalue { ptr } undef, ptr %v84, 0
+  %v86 = extractvalue { ptr } %v85, 0
+  %v87 = ptrtoint ptr %v86 to i64
+  %v88 = sub i64 %v87, 0
+  %v89 = icmp ule i64 %v88, 0
+  %v90 = add i64 %v88, 0
+  %v91 = select i1 %v89, i64 %v90, i64 1
+  %v92 = icmp eq i64 %v91, 1
+  br i1 %v92, label %bb9, label %bb19
+bb19:
+  %v93 = icmp eq i64 %v91, 0
+  br i1 %v93, label %bb11, label %bb20
+bb20:
+  unreachable
+bb21:
+  call void @llvm.trap() #0
+  unreachable
+bb22:
+  call void @llvm.trap() #0
+  unreachable
+bb23:
+  call void @llvm.trap() #0
+  unreachable
+bb24:
+  call void @llvm.trap() #0
+  unreachable
+bb25:
+  call void @llvm.trap() #0
+  unreachable
+}
+
 declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32) #0
 
 define ptx_kernel void @q6k_q8_gemv_warp4(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ptr %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, ptr %v9, i64 %v10) #0 {
@@ -2617,6 +2768,115 @@ bb39:
   %v157 = udiv i32 %v139, 2
   br label %bb28
 bb40:
+  call void @llvm.trap() #0
+  unreachable
+}
+
+define ptx_kernel void @embedding_f32_rows(ptr %v0, i64 %v1, ptr %v2, i64 %v3, i32 %v4, i32 %v5, ptr %v6, i64 %v7) #0 {
+entry:
+  %v8 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v9 = insertvalue { ptr, i64 } %v8, i64 %v1, 1
+  %v10 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v11 = insertvalue { ptr, i64 } %v10, i64 %v3, 1
+  %v12 = insertvalue { ptr, i64 } undef, ptr %v6, 0
+  %v13 = insertvalue { ptr, i64 } %v12, i64 %v7, 1
+  br label %bb0
+bb0:
+  %v14 = phi { ptr, i64 } [ %v9, %entry ]
+  %v15 = phi { ptr, i64 } [ %v11, %entry ]
+  %v16 = phi i32 [ %v4, %entry ]
+  %v17 = phi i32 [ %v5, %entry ]
+  %v18 = phi { ptr, i64 } [ %v13, %entry ]
+  %v19 = alloca {  }, align 1
+  %v20 = bitcast ptr %v19 to ptr
+  %v21 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v20) #0
+  br label %bb1
+bb1:
+  %v22 = zext i32 %v16 to i64
+  %v23 = zext i32 %v17 to i64
+  %v24 = mul i64 %v22, %v23
+  %v25 = icmp uge i64 %v21, %v24
+  %v26 = xor i1 %v25, 1
+  br i1 %v26, label %bb3, label %bb2
+bb2:
+  br label %bb10
+bb3:
+  %v27 = icmp eq i64 %v23, 0
+  %v28 = xor i1 %v27, 1
+  br i1 %v28, label %bb4, label %bb18
+bb4:
+  %v29 = udiv i64 %v21, %v23
+  %v30 = urem i64 %v21, %v23
+  %v31 = icmp eq i64 %v21, 18446744073709551615
+  br i1 %v31, label %bb14, label %bb11
+bb5:
+  %v32 = extractvalue { ptr } %v57, 0
+  %v33 = extractvalue { ptr, i64 } %v15, 1
+  %v34 = icmp ult i64 %v29, %v33
+  br i1 %v34, label %bb6, label %bb19
+bb6:
+  %v35 = extractvalue { ptr, i64 } %v15, 0
+  %v36 = getelementptr inbounds i32, ptr %v35, i64 %v29
+  %v37 = load i32, ptr %v36, align 4
+  %v38 = zext i32 %v37 to i64
+  %v39 = mul i64 %v38, %v23
+  %v40 = add i64 %v39, %v30
+  %v41 = extractvalue { ptr, i64 } %v14, 1
+  %v42 = icmp ult i64 %v40, %v41
+  br i1 %v42, label %bb7, label %bb20
+bb7:
+  %v43 = extractvalue { ptr, i64 } %v14, 0
+  %v44 = getelementptr inbounds float, ptr %v43, i64 %v40
+  %v45 = load float, ptr %v44, align 4
+  store float %v45, ptr %v32, align 4
+  br label %bb9
+bb8:
+  br label %bb9
+bb9:
+  br label %bb10
+bb10:
+  ret void
+bb11:
+  %v46 = extractvalue { ptr, i64 } %v18, 1
+  %v47 = icmp ult i64 %v21, %v46
+  %v48 = xor i1 %v47, 1
+  br i1 %v48, label %bb13, label %bb12
+bb12:
+  %v49 = extractvalue { ptr, i64 } %v18, 0
+  %v50 = getelementptr inbounds float, ptr %v49, i64 %v21
+  %v51 = insertvalue { ptr } undef, ptr %v50, 0
+  %v52 = extractvalue { ptr } %v51, 0
+  br label %bb15
+bb13:
+  br label %bb14
+bb14:
+  %v53 = inttoptr i64 0 to ptr
+  %v54 = insertvalue { ptr } undef, ptr %v53, 0
+  %v55 = extractvalue { ptr } %v54, 0
+  br label %bb15
+bb15:
+  %v56 = phi ptr [ %v52, %bb12 ], [ %v55, %bb14 ]
+  %v57 = insertvalue { ptr } undef, ptr %v56, 0
+  %v58 = extractvalue { ptr } %v57, 0
+  %v59 = ptrtoint ptr %v58 to i64
+  %v60 = sub i64 %v59, 0
+  %v61 = icmp ule i64 %v60, 0
+  %v62 = add i64 %v60, 0
+  %v63 = select i1 %v61, i64 %v62, i64 1
+  %v64 = icmp eq i64 %v63, 1
+  br i1 %v64, label %bb5, label %bb16
+bb16:
+  %v65 = icmp eq i64 %v63, 0
+  br i1 %v65, label %bb8, label %bb17
+bb17:
+  unreachable
+bb18:
+  call void @llvm.trap() #0
+  unreachable
+bb19:
+  call void @llvm.trap() #0
+  unreachable
+bb20:
   call void @llvm.trap() #0
   unreachable
 }
@@ -7422,6 +7682,615 @@ bb9:
   unreachable
 }
 
+define ptx_kernel void @kv_write_batch(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ptr %v4, i64 %v5, ptr %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, i32 %v15) #0 {
+entry:
+  %v16 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v17 = insertvalue { ptr, i64 } %v16, i64 %v1, 1
+  %v18 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v19 = insertvalue { ptr, i64 } %v18, i64 %v3, 1
+  %v20 = insertvalue { ptr, i64 } undef, ptr %v4, 0
+  %v21 = insertvalue { ptr, i64 } %v20, i64 %v5, 1
+  %v22 = insertvalue { ptr, i64 } undef, ptr %v6, 0
+  %v23 = insertvalue { ptr, i64 } %v22, i64 %v7, 1
+  br label %bb0
+bb0:
+  %v24 = phi { ptr, i64 } [ %v17, %entry ]
+  %v25 = phi { ptr, i64 } [ %v19, %entry ]
+  %v26 = phi { ptr, i64 } [ %v21, %entry ]
+  %v27 = phi { ptr, i64 } [ %v23, %entry ]
+  %v28 = phi i32 [ %v8, %entry ]
+  %v29 = phi i32 [ %v9, %entry ]
+  %v30 = phi i32 [ %v10, %entry ]
+  %v31 = phi i32 [ %v11, %entry ]
+  %v32 = phi i32 [ %v12, %entry ]
+  %v33 = phi i32 [ %v13, %entry ]
+  %v34 = phi i32 [ %v14, %entry ]
+  %v35 = phi i32 [ %v15, %entry ]
+  %v36 = alloca {  }, align 1
+  %v37 = bitcast ptr %v36 to ptr
+  %v38 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v37) #0
+  br label %bb1
+bb1:
+  %v39 = trunc i64 %v38 to i32
+  %v40 = mul i32 %v28, %v33
+  %v41 = icmp uge i32 %v39, %v40
+  %v42 = xor i1 %v41, 1
+  br i1 %v42, label %bb3, label %bb2
+bb2:
+  br label %bb13
+bb3:
+  %v43 = icmp eq i32 %v33, 0
+  %v44 = xor i1 %v43, 1
+  br i1 %v44, label %bb4, label %bb14
+bb4:
+  %v45 = udiv i32 %v39, %v33
+  %v46 = urem i32 %v39, %v33
+  %v47 = zext i32 %v45 to i64
+  %v48 = extractvalue { ptr, i64 } %v27, 1
+  %v49 = icmp ult i64 %v47, %v48
+  br i1 %v49, label %bb5, label %bb15
+bb5:
+  %v50 = extractvalue { ptr, i64 } %v27, 0
+  %v51 = getelementptr inbounds i32, ptr %v50, i64 %v47
+  %v52 = load i32, ptr %v51, align 4
+  %v53 = icmp eq i32 %v34, 0
+  %v54 = xor i1 %v53, 1
+  br i1 %v54, label %bb6, label %bb16
+bb6:
+  %v55 = udiv i32 %v52, %v34
+  %v56 = urem i32 %v52, %v34
+  %v57 = mul i32 %v45, %v30
+  %v58 = add i32 %v57, %v29
+  %v59 = mul i32 %v58, %v32
+  %v60 = add i32 %v59, %v55
+  %v61 = zext i32 %v60 to i64
+  %v62 = extractvalue { ptr, i64 } %v26, 1
+  %v63 = icmp ult i64 %v61, %v62
+  br i1 %v63, label %bb7, label %bb17
+bb7:
+  %v64 = extractvalue { ptr, i64 } %v26, 0
+  %v65 = getelementptr inbounds i32, ptr %v64, i64 %v61
+  %v66 = load i32, ptr %v65, align 4
+  %v67 = zext i32 %v66 to i64
+  %v68 = zext i32 %v33 to i64
+  %v69 = mul i64 %v68, 2
+  %v70 = icmp eq i32 %v31, 0
+  br i1 %v70, label %bb9, label %bb8
+bb8:
+  %v71 = zext i32 %v34 to i64
+  %v72 = mul i64 %v71, %v69
+  br label %bb10
+bb9:
+  br label %bb10
+bb10:
+  %v73 = phi i64 [ %v72, %bb8 ], [ 0, %bb9 ]
+  %v74 = zext i32 %v35 to i64
+  %v75 = mul i64 %v67, %v74
+  %v76 = add i64 %v75, %v73
+  %v77 = zext i32 %v56 to i64
+  %v78 = mul i64 %v77, %v69
+  %v79 = add i64 %v76, %v78
+  %v80 = zext i32 %v39 to i64
+  %v81 = extractvalue { ptr, i64 } %v24, 1
+  %v82 = icmp ult i64 %v80, %v81
+  br i1 %v82, label %bb11, label %bb18
+bb11:
+  %v83 = extractvalue { ptr, i64 } %v24, 0
+  %v84 = getelementptr inbounds float, ptr %v83, i64 %v80
+  %v85 = load float, ptr %v84, align 4
+  %v86 = call i16 @cuda_kernels__oxide_kernels__kernels__f32_to_f16_bits(float %v85) #0
+  br label %bb12
+bb12:
+  %v87 = zext i32 %v46 to i64
+  %v88 = mul i64 %v87, 2
+  %v89 = add i64 %v79, %v88
+  %v90 = and i16 %v86, 255
+  %v91 = extractvalue { ptr, i64 } %v25, 0
+  %v92 = getelementptr inbounds i8, ptr %v91, i64 %v89
+  %v93 = trunc i16 %v90 to i8
+  store i8 %v93, ptr %v92, align 1
+  %v94 = trunc i32 8 to i16
+  %v95 = and i16 %v94, 15
+  %v96 = lshr i16 %v86, %v95
+  %v97 = add i64 %v89, 1
+  %v98 = getelementptr inbounds i8, ptr %v91, i64 %v97
+  %v99 = trunc i16 %v96 to i8
+  store i8 %v99, ptr %v98, align 1
+  br label %bb13
+bb13:
+  ret void
+bb14:
+  call void @llvm.trap() #0
+  unreachable
+bb15:
+  call void @llvm.trap() #0
+  unreachable
+bb16:
+  call void @llvm.trap() #0
+  unreachable
+bb17:
+  call void @llvm.trap() #0
+  unreachable
+bb18:
+  call void @llvm.trap() #0
+  unreachable
+}
+
+define ptx_kernel void @attention_paged_batch_heads(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ptr %v4, i64 %v5, ptr %v6, i64 %v7, i32 %v8, i32 %v9, i32 %v10, i32 %v11, float %v12, i32 %v13, i32 %v14, i32 %v15, i32 %v16, i32 %v17, i32 %v18, ptr %v19, i64 %v20) #0 {
+entry:
+  %v21 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v22 = insertvalue { ptr, i64 } %v21, i64 %v1, 1
+  %v23 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v24 = insertvalue { ptr, i64 } %v23, i64 %v3, 1
+  %v25 = insertvalue { ptr, i64 } undef, ptr %v4, 0
+  %v26 = insertvalue { ptr, i64 } %v25, i64 %v5, 1
+  %v27 = insertvalue { ptr, i64 } undef, ptr %v6, 0
+  %v28 = insertvalue { ptr, i64 } %v27, i64 %v7, 1
+  %v29 = insertvalue { ptr, i64 } undef, ptr %v19, 0
+  %v30 = insertvalue { ptr, i64 } %v29, i64 %v20, 1
+  br label %bb0
+bb0:
+  %v31 = phi { ptr, i64 } [ %v22, %entry ]
+  %v32 = phi { ptr, i64 } [ %v24, %entry ]
+  %v33 = phi { ptr, i64 } [ %v26, %entry ]
+  %v34 = phi { ptr, i64 } [ %v28, %entry ]
+  %v35 = phi i32 [ %v8, %entry ]
+  %v36 = phi i32 [ %v9, %entry ]
+  %v37 = phi i32 [ %v10, %entry ]
+  %v38 = phi i32 [ %v11, %entry ]
+  %v39 = phi float [ %v12, %entry ]
+  %v40 = phi i32 [ %v13, %entry ]
+  %v41 = phi i32 [ %v14, %entry ]
+  %v42 = phi i32 [ %v15, %entry ]
+  %v43 = phi i32 [ %v16, %entry ]
+  %v44 = phi i32 [ %v17, %entry ]
+  %v45 = phi i32 [ %v18, %entry ]
+  %v46 = phi { ptr, i64 } [ %v30, %entry ]
+  %v47 = alloca {  }, align 1
+  %v48 = bitcast ptr %v47 to ptr
+  %v49 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v48) #0
+  br label %bb1
+bb1:
+  %v50 = trunc i64 %v49 to i32
+  %v51 = mul i32 %v35, %v36
+  %v52 = icmp uge i32 %v50, %v51
+  %v53 = xor i1 %v52, 1
+  br i1 %v53, label %bb3, label %bb2
+bb2:
+  br label %bb43
+bb3:
+  %v54 = icmp eq i32 %v36, 0
+  %v55 = xor i1 %v54, 1
+  br i1 %v55, label %bb4, label %bb46
+bb4:
+  %v56 = udiv i32 %v50, %v36
+  %v57 = urem i32 %v50, %v36
+  %v58 = zext i32 %v38 to i64
+  %v59 = call i32 @_RNvYmNtNtCsiQ4CSjCKWVc_4core3cmp3Ord3maxCs5VsnSnoaHeT_12cuda_kernels(i32 %v37, i32 1) #0
+  br label %bb5
+bb5:
+  %v60 = icmp eq i32 %v59, 0
+  %v61 = xor i1 %v60, 1
+  br i1 %v61, label %bb6, label %bb47
+bb6:
+  %v62 = udiv i32 %v36, %v59
+  %v63 = call i32 @_RNvYmNtNtCsiQ4CSjCKWVc_4core3cmp3Ord3maxCs5VsnSnoaHeT_12cuda_kernels(i32 %v62, i32 1) #0
+  br label %bb7
+bb7:
+  %v64 = icmp eq i32 %v63, 0
+  %v65 = xor i1 %v64, 1
+  br i1 %v65, label %bb8, label %bb48
+bb8:
+  %v66 = udiv i32 %v57, %v63
+  %v67 = zext i32 %v66 to i64
+  %v68 = zext i32 %v45 to i64
+  %v69 = zext i32 %v43 to i64
+  %v70 = mul i64 %v68, 2
+  %v71 = mul i64 %v69, %v70
+  %v72 = zext i32 %v56 to i64
+  %v73 = zext i32 %v36 to i64
+  %v74 = mul i64 %v72, %v73
+  %v75 = zext i32 %v57 to i64
+  %v76 = add i64 %v74, %v75
+  %v77 = mul i64 %v76, %v58
+  br label %bb9
+bb9:
+  %v78 = phi i64 [ 0, %bb8 ], [ %v84, %bb10 ]
+  %v79 = icmp ult i64 %v78, %v58
+  %v80 = xor i1 %v79, 1
+  br i1 %v80, label %bb11, label %bb10
+bb10:
+  %v81 = add i64 %v77, %v78
+  %v82 = extractvalue { ptr, i64 } %v46, 0
+  %v83 = getelementptr inbounds float, ptr %v82, i64 %v81
+  store float 0.0, ptr %v83, align 4
+  %v84 = add i64 %v78, 1
+  br label %bb9
+bb11:
+  br label %bb12
+bb12:
+  %v85 = phi float [ 0.0, %bb11 ], [ %v161, %bb35 ]
+  %v86 = phi float [ 0.0, %bb11 ], [ %v215, %bb35 ]
+  %v87 = phi i1 [ 0, %bb11 ], [ 1, %bb35 ]
+  %v88 = phi i64 [ 0, %bb11 ], [ %v202, %bb35 ]
+  %v89 = extractvalue { ptr, i64 } %v34, 1
+  %v90 = icmp ult i64 %v72, %v89
+  br i1 %v90, label %bb13, label %bb49
+bb13:
+  %v91 = extractvalue { ptr, i64 } %v34, 0
+  %v92 = getelementptr inbounds i32, ptr %v91, i64 %v72
+  %v93 = load i32, ptr %v92, align 4
+  %v94 = zext i32 %v93 to i64
+  %v95 = icmp ult i64 %v88, %v94
+  %v96 = xor i1 %v95, 1
+  br i1 %v96, label %bb36, label %bb14
+bb14:
+  %v97 = icmp eq i64 %v69, 0
+  %v98 = xor i1 %v97, 1
+  br i1 %v98, label %bb15, label %bb50
+bb15:
+  %v99 = udiv i64 %v88, %v69
+  %v100 = urem i64 %v88, %v69
+  %v101 = mul i32 %v56, %v41
+  %v102 = add i32 %v101, %v40
+  %v103 = mul i32 %v102, %v42
+  %v104 = zext i32 %v103 to i64
+  %v105 = add i64 %v104, %v99
+  %v106 = extractvalue { ptr, i64 } %v33, 1
+  %v107 = icmp ult i64 %v105, %v106
+  br i1 %v107, label %bb16, label %bb51
+bb16:
+  %v108 = extractvalue { ptr, i64 } %v33, 0
+  %v109 = getelementptr inbounds i32, ptr %v108, i64 %v105
+  %v110 = load i32, ptr %v109, align 4
+  %v111 = zext i32 %v110 to i64
+  %v112 = zext i32 %v44 to i64
+  %v113 = mul i64 %v111, %v112
+  %v114 = mul i64 %v100, %v70
+  %v115 = add i64 %v113, %v114
+  %v116 = mul i64 %v67, %v58
+  %v117 = mul i64 %v116, 2
+  %v118 = add i64 %v115, %v117
+  br label %bb17
+bb17:
+  %v119 = phi i64 [ 0, %bb16 ], [ %v152, %bb22 ]
+  %v120 = phi float [ 0.0, %bb16 ], [ %v151, %bb22 ]
+  %v121 = icmp ult i64 %v119, %v58
+  %v122 = xor i1 %v121, 1
+  br i1 %v122, label %bb23, label %bb18
+bb18:
+  %v123 = mul i64 %v119, 2
+  %v124 = add i64 %v118, %v123
+  %v125 = extractvalue { ptr, i64 } %v32, 1
+  %v126 = icmp ult i64 %v124, %v125
+  br i1 %v126, label %bb19, label %bb52
+bb19:
+  %v127 = extractvalue { ptr, i64 } %v32, 0
+  %v128 = getelementptr inbounds i8, ptr %v127, i64 %v124
+  %v129 = load i8, ptr %v128, align 1
+  %v130 = zext i8 %v129 to i16
+  %v131 = mul i64 %v119, 2
+  %v132 = add i64 %v118, %v131
+  %v133 = add i64 %v132, 1
+  %v134 = icmp ult i64 %v133, %v125
+  br i1 %v134, label %bb20, label %bb53
+bb20:
+  %v135 = extractvalue { ptr, i64 } %v32, 0
+  %v136 = getelementptr inbounds i8, ptr %v135, i64 %v133
+  %v137 = load i8, ptr %v136, align 1
+  %v138 = zext i8 %v137 to i16
+  %v139 = trunc i32 8 to i16
+  %v140 = and i16 %v139, 15
+  %v141 = shl i16 %v138, %v140
+  %v142 = or i16 %v130, %v141
+  %v143 = add i64 %v77, %v119
+  %v144 = extractvalue { ptr, i64 } %v31, 1
+  %v145 = icmp ult i64 %v143, %v144
+  br i1 %v145, label %bb21, label %bb54
+bb21:
+  %v146 = extractvalue { ptr, i64 } %v31, 0
+  %v147 = getelementptr inbounds float, ptr %v146, i64 %v143
+  %v148 = load float, ptr %v147, align 4
+  %v149 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v142) #0
+  br label %bb22
+bb22:
+  %v150 = fmul contract float %v148, %v149
+  %v151 = fadd contract float %v120, %v150
+  %v152 = add i64 %v119, 1
+  br label %bb17
+bb23:
+  %v153 = fmul contract float %v120, %v39
+  %v154 = xor i1 %v87, 1
+  br i1 %v154, label %bb25, label %bb24
+bb24:
+  %v155 = fcmp ogt float %v153, %v85
+  %v156 = xor i1 %v155, 1
+  br i1 %v156, label %bb27, label %bb26
+bb25:
+  br label %bb29
+bb26:
+  %v157 = fsub contract float %v85, %v153
+  %v158 = call float @__nv_expf(float %v157) #0
+  br label %bb44
+bb27:
+  br label %bb28
+bb28:
+  %v159 = phi float [ %v85, %bb27 ], [ %v153, %bb44 ]
+  %v160 = phi float [ 1.0, %bb27 ], [ %v158, %bb44 ]
+  br label %bb29
+bb29:
+  %v161 = phi float [ %v153, %bb25 ], [ %v159, %bb28 ]
+  %v162 = phi float [ 0.0, %bb25 ], [ %v160, %bb28 ]
+  %v163 = fsub contract float %v153, %v161
+  %v164 = call float @__nv_expf(float %v163) #0
+  br label %bb45
+bb30:
+  %v165 = phi i64 [ %v201, %bb34 ], [ 0, %bb45 ]
+  %v166 = icmp ult i64 %v165, %v58
+  %v167 = xor i1 %v166, 1
+  br i1 %v167, label %bb35, label %bb31
+bb31:
+  %v168 = add i64 %v113, %v71
+  %v169 = add i64 %v168, %v114
+  %v170 = add i64 %v169, %v117
+  %v171 = mul i64 %v165, 2
+  %v172 = add i64 %v170, %v171
+  %v173 = extractvalue { ptr, i64 } %v32, 1
+  %v174 = icmp ult i64 %v172, %v173
+  br i1 %v174, label %bb32, label %bb55
+bb32:
+  %v175 = extractvalue { ptr, i64 } %v32, 0
+  %v176 = getelementptr inbounds i8, ptr %v175, i64 %v172
+  %v177 = load i8, ptr %v176, align 1
+  %v178 = zext i8 %v177 to i16
+  %v179 = mul i64 %v165, 2
+  %v180 = add i64 %v170, %v179
+  %v181 = add i64 %v180, 1
+  %v182 = icmp ult i64 %v181, %v173
+  br i1 %v182, label %bb33, label %bb56
+bb33:
+  %v183 = extractvalue { ptr, i64 } %v32, 0
+  %v184 = getelementptr inbounds i8, ptr %v183, i64 %v181
+  %v185 = load i8, ptr %v184, align 1
+  %v186 = zext i8 %v185 to i16
+  %v187 = trunc i32 8 to i16
+  %v188 = and i16 %v187, 15
+  %v189 = shl i16 %v186, %v188
+  %v190 = or i16 %v178, %v189
+  %v191 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v190) #0
+  br label %bb34
+bb34:
+  %v192 = add i64 %v77, %v165
+  %v193 = extractvalue { ptr, i64 } %v46, 0
+  %v194 = getelementptr inbounds float, ptr %v193, i64 %v192
+  %v195 = load float, ptr %v194, align 4
+  %v196 = fmul contract float %v195, %v162
+  %v197 = fmul contract float %v164, %v191
+  %v198 = add i64 %v77, %v165
+  %v199 = getelementptr inbounds float, ptr %v193, i64 %v198
+  %v200 = fadd contract float %v196, %v197
+  store float %v200, ptr %v199, align 4
+  %v201 = add i64 %v165, 1
+  br label %bb30
+bb35:
+  %v202 = add i64 %v88, 1
+  br label %bb12
+bb36:
+  %v203 = fcmp ogt float %v86, 0.0
+  %v204 = xor i1 %v203, 1
+  br i1 %v204, label %bb38, label %bb37
+bb37:
+  br label %bb39
+bb38:
+  br label %bb42
+bb39:
+  %v205 = phi i64 [ 0, %bb37 ], [ %v213, %bb40 ]
+  %v206 = icmp ult i64 %v205, %v58
+  %v207 = xor i1 %v206, 1
+  br i1 %v207, label %bb41, label %bb40
+bb40:
+  %v208 = add i64 %v77, %v205
+  %v209 = extractvalue { ptr, i64 } %v46, 0
+  %v210 = getelementptr inbounds float, ptr %v209, i64 %v208
+  %v211 = load float, ptr %v210, align 4
+  %v212 = fdiv contract float %v211, %v86
+  store float %v212, ptr %v210, align 4
+  %v213 = add i64 %v205, 1
+  br label %bb39
+bb41:
+  br label %bb42
+bb42:
+  br label %bb43
+bb43:
+  ret void
+bb44:
+  br label %bb28
+bb45:
+  %v214 = fmul contract float %v86, %v162
+  %v215 = fadd contract float %v214, %v164
+  br label %bb30
+bb46:
+  call void @llvm.trap() #0
+  unreachable
+bb47:
+  call void @llvm.trap() #0
+  unreachable
+bb48:
+  call void @llvm.trap() #0
+  unreachable
+bb49:
+  call void @llvm.trap() #0
+  unreachable
+bb50:
+  call void @llvm.trap() #0
+  unreachable
+bb51:
+  call void @llvm.trap() #0
+  unreachable
+bb52:
+  call void @llvm.trap() #0
+  unreachable
+bb53:
+  call void @llvm.trap() #0
+  unreachable
+bb54:
+  call void @llvm.trap() #0
+  unreachable
+bb55:
+  call void @llvm.trap() #0
+  unreachable
+bb56:
+  call void @llvm.trap() #0
+  unreachable
+}
+
+declare float @__nv_sinf(float)
+declare float @__nv_cosf(float)
+
+define ptx_kernel void @rope_batch(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ptr %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, i32 %v9, ptr %v10, i64 %v11) #0 {
+entry:
+  %v12 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v13 = insertvalue { ptr, i64 } %v12, i64 %v1, 1
+  %v14 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v15 = insertvalue { ptr, i64 } %v14, i64 %v3, 1
+  %v16 = insertvalue { ptr, i64 } undef, ptr %v4, 0
+  %v17 = insertvalue { ptr, i64 } %v16, i64 %v5, 1
+  %v18 = insertvalue { ptr, i64 } undef, ptr %v10, 0
+  %v19 = insertvalue { ptr, i64 } %v18, i64 %v11, 1
+  br label %bb0
+bb0:
+  %v20 = phi { ptr, i64 } [ %v13, %entry ]
+  %v21 = phi { ptr, i64 } [ %v15, %entry ]
+  %v22 = phi { ptr, i64 } [ %v17, %entry ]
+  %v23 = phi i32 [ %v6, %entry ]
+  %v24 = phi i32 [ %v7, %entry ]
+  %v25 = phi i32 [ %v8, %entry ]
+  %v26 = phi i32 [ %v9, %entry ]
+  %v27 = phi { ptr, i64 } [ %v19, %entry ]
+  %v28 = alloca {  }, align 1
+  %v29 = bitcast ptr %v28 to ptr
+  %v30 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v29) #0
+  br label %bb1
+bb1:
+  %v31 = zext i32 %v26 to i64
+  %v32 = icmp uge i64 %v30, %v31
+  %v33 = xor i1 %v32, 1
+  br i1 %v33, label %bb3, label %bb2
+bb2:
+  br label %bb15
+bb3:
+  %v34 = zext i32 %v24 to i64
+  %v35 = icmp eq i64 %v34, 0
+  %v36 = xor i1 %v35, 1
+  br i1 %v36, label %bb4, label %bb18
+bb4:
+  %v37 = urem i64 %v30, %v34
+  %v38 = sub i64 %v30, %v37
+  %v39 = zext i32 %v23 to i64
+  %v40 = mul i64 %v39, %v34
+  %v41 = icmp eq i64 %v40, 0
+  %v42 = xor i1 %v41, 1
+  br i1 %v42, label %bb5, label %bb19
+bb5:
+  %v43 = udiv i64 %v30, %v40
+  %v44 = zext i32 %v25 to i64
+  %v45 = icmp uge i64 %v37, %v44
+  %v46 = xor i1 %v45, 1
+  br i1 %v46, label %bb8, label %bb6
+bb6:
+  %v47 = extractvalue { ptr, i64 } %v20, 1
+  %v48 = icmp ult i64 %v30, %v47
+  br i1 %v48, label %bb7, label %bb20
+bb7:
+  %v49 = extractvalue { ptr, i64 } %v20, 0
+  %v50 = getelementptr inbounds float, ptr %v49, i64 %v30
+  %v51 = load float, ptr %v50, align 4
+  %v52 = extractvalue { ptr, i64 } %v27, 0
+  %v53 = getelementptr inbounds float, ptr %v52, i64 %v30
+  store float %v51, ptr %v53, align 4
+  br label %bb15
+bb8:
+  %v54 = urem i64 %v37, 2
+  %v55 = icmp eq i64 %v54, 1
+  br i1 %v55, label %bb9, label %bb10
+bb9:
+  br label %bb15
+bb10:
+  %v56 = extractvalue { ptr, i64 } %v22, 1
+  %v57 = icmp ult i64 %v43, %v56
+  br i1 %v57, label %bb11, label %bb21
+bb11:
+  %v58 = extractvalue { ptr, i64 } %v22, 0
+  %v59 = getelementptr inbounds i32, ptr %v58, i64 %v43
+  %v60 = load i32, ptr %v59, align 4
+  %v61 = uitofp i32 %v60 to float
+  %v62 = udiv i64 %v37, 2
+  %v63 = extractvalue { ptr, i64 } %v21, 1
+  %v64 = icmp ult i64 %v62, %v63
+  br i1 %v64, label %bb12, label %bb22
+bb12:
+  %v65 = extractvalue { ptr, i64 } %v21, 0
+  %v66 = getelementptr inbounds float, ptr %v65, i64 %v62
+  %v67 = load float, ptr %v66, align 4
+  %v68 = fmul contract float %v61, %v67
+  %v69 = call float @__nv_sinf(float %v68) #0
+  br label %bb16
+bb13:
+  %v70 = extractvalue { ptr, i64 } %v20, 0
+  %v71 = getelementptr inbounds float, ptr %v70, i64 %v88
+  %v72 = load float, ptr %v71, align 4
+  %v73 = add i64 %v88, 1
+  %v74 = icmp ult i64 %v73, %v89
+  br i1 %v74, label %bb14, label %bb23
+bb14:
+  %v75 = extractvalue { ptr, i64 } %v20, 0
+  %v76 = getelementptr inbounds float, ptr %v75, i64 %v73
+  %v77 = load float, ptr %v76, align 4
+  %v78 = fmul contract float %v72, %v87
+  %v79 = fmul contract float %v77, %v69
+  %v80 = extractvalue { ptr, i64 } %v27, 0
+  %v81 = getelementptr inbounds float, ptr %v80, i64 %v88
+  %v82 = fsub contract float %v78, %v79
+  store float %v82, ptr %v81, align 4
+  %v83 = fmul contract float %v72, %v69
+  %v84 = fmul contract float %v77, %v87
+  %v85 = getelementptr inbounds float, ptr %v80, i64 %v73
+  %v86 = fadd contract float %v83, %v84
+  store float %v86, ptr %v85, align 4
+  br label %bb15
+bb15:
+  ret void
+bb16:
+  %v87 = call float @__nv_cosf(float %v68) #0
+  br label %bb17
+bb17:
+  %v88 = add i64 %v38, %v37
+  %v89 = extractvalue { ptr, i64 } %v20, 1
+  %v90 = icmp ult i64 %v88, %v89
+  br i1 %v90, label %bb13, label %bb24
+bb18:
+  call void @llvm.trap() #0
+  unreachable
+bb19:
+  call void @llvm.trap() #0
+  unreachable
+bb20:
+  call void @llvm.trap() #0
+  unreachable
+bb21:
+  call void @llvm.trap() #0
+  unreachable
+bb22:
+  call void @llvm.trap() #0
+  unreachable
+bb23:
+  call void @llvm.trap() #0
+  unreachable
+bb24:
+  call void @llvm.trap() #0
+  unreachable
+}
+
 define ptx_kernel void @q4k_gemv_row_tiled(ptr %v0, i64 %v1, ptr %v2, i64 %v3, i32 %v4, i32 %v5, ptr %v6, i64 %v7) #0 {
 entry:
   %v8 = insertvalue { ptr, i64 } undef, ptr %v0, 0
@@ -11350,6 +12219,362 @@ bb43:
   br label %bb36
 }
 
+define ptx_kernel void @embedding_q4k_rows(ptr %v0, i64 %v1, ptr %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, ptr %v7, i64 %v8) #0 {
+entry:
+  %v9 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v10 = insertvalue { ptr, i64 } %v9, i64 %v1, 1
+  %v11 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v12 = insertvalue { ptr, i64 } %v11, i64 %v3, 1
+  %v13 = insertvalue { ptr, i64 } undef, ptr %v7, 0
+  %v14 = insertvalue { ptr, i64 } %v13, i64 %v8, 1
+  br label %bb0
+bb0:
+  %v15 = phi { ptr, i64 } [ %v10, %entry ]
+  %v16 = phi { ptr, i64 } [ %v12, %entry ]
+  %v17 = phi i32 [ %v4, %entry ]
+  %v18 = phi i32 [ %v5, %entry ]
+  %v19 = phi i32 [ %v6, %entry ]
+  %v20 = phi { ptr, i64 } [ %v14, %entry ]
+  %v21 = alloca {  }, align 1
+  %v22 = alloca [2 x i8], align 1
+  %v23 = alloca [2 x i8], align 1
+  %v24 = alloca [8 x i8], align 1
+  %v25 = alloca [8 x i8], align 1
+  %v26 = bitcast ptr %v21 to ptr
+  %v27 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v26) #0
+  br label %bb1
+bb1:
+  %v28 = zext i32 %v17 to i64
+  %v29 = zext i32 %v18 to i64
+  %v30 = mul i64 %v28, %v29
+  %v31 = icmp uge i64 %v27, %v30
+  %v32 = xor i1 %v31, 1
+  br i1 %v32, label %bb3, label %bb2
+bb2:
+  br label %bb34
+bb3:
+  %v33 = icmp eq i64 %v29, 0
+  %v34 = xor i1 %v33, 1
+  br i1 %v34, label %bb4, label %bb42
+bb4:
+  %v35 = udiv i64 %v27, %v29
+  %v36 = urem i64 %v27, %v29
+  %v37 = zext i32 %v19 to i64
+  %v38 = mul i64 %v37, 144
+  %v39 = udiv i64 %v36, 256
+  %v40 = urem i64 %v36, 256
+  %v41 = extractvalue { ptr, i64 } %v16, 1
+  %v42 = icmp ult i64 %v35, %v41
+  br i1 %v42, label %bb5, label %bb43
+bb5:
+  %v43 = extractvalue { ptr, i64 } %v16, 0
+  %v44 = getelementptr inbounds i32, ptr %v43, i64 %v35
+  %v45 = load i32, ptr %v44, align 4
+  %v46 = zext i32 %v45 to i64
+  %v47 = mul i64 %v46, %v38
+  %v48 = mul i64 %v39, 144
+  %v49 = add i64 %v47, %v48
+  %v50 = extractvalue { ptr, i64 } %v15, 1
+  %v51 = icmp ult i64 %v49, %v50
+  br i1 %v51, label %bb6, label %bb44
+bb6:
+  %v52 = extractvalue { ptr, i64 } %v15, 0
+  %v53 = getelementptr inbounds i8, ptr %v52, i64 %v49
+  %v54 = load i8, ptr %v53, align 1
+  %v55 = add i64 %v49, 1
+  %v56 = icmp ult i64 %v55, %v50
+  br i1 %v56, label %bb7, label %bb45
+bb7:
+  %v57 = extractvalue { ptr, i64 } %v15, 0
+  %v58 = getelementptr inbounds i8, ptr %v57, i64 %v55
+  %v59 = load i8, ptr %v58, align 1
+  %v60 = getelementptr inbounds [2 x i8], ptr %v22, i32 0, i64 0
+  store i8 %v54, ptr %v60, align 1
+  %v61 = getelementptr inbounds [2 x i8], ptr %v22, i32 0, i64 1
+  store i8 %v59, ptr %v61, align 1
+  %v62 = load [2 x i8], ptr %v22, align 1
+  %v63 = alloca [2 x i8], align 2
+  store [2 x i8] %v62, ptr %v63, align 2
+  %v64 = load i16, ptr %v63, align 2
+  %v65 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v64) #0
+  br label %bb8
+bb8:
+  %v66 = add i64 %v49, 2
+  %v67 = icmp ult i64 %v66, %v50
+  br i1 %v67, label %bb9, label %bb46
+bb9:
+  %v68 = extractvalue { ptr, i64 } %v15, 0
+  %v69 = getelementptr inbounds i8, ptr %v68, i64 %v66
+  %v70 = load i8, ptr %v69, align 1
+  %v71 = add i64 %v49, 3
+  %v72 = icmp ult i64 %v71, %v50
+  br i1 %v72, label %bb10, label %bb47
+bb10:
+  %v73 = extractvalue { ptr, i64 } %v15, 0
+  %v74 = getelementptr inbounds i8, ptr %v73, i64 %v71
+  %v75 = load i8, ptr %v74, align 1
+  %v76 = getelementptr inbounds [2 x i8], ptr %v23, i32 0, i64 0
+  store i8 %v70, ptr %v76, align 1
+  %v77 = getelementptr inbounds [2 x i8], ptr %v23, i32 0, i64 1
+  store i8 %v75, ptr %v77, align 1
+  %v78 = load [2 x i8], ptr %v23, align 1
+  %v79 = alloca [2 x i8], align 2
+  store [2 x i8] %v78, ptr %v79, align 2
+  %v80 = load i16, ptr %v79, align 2
+  %v81 = call float @cuda_kernels__oxide_kernels__f16_to_f32(i16 %v80) #0
+  br label %bb11
+bb11:
+  %v82 = add i64 %v49, 4
+  %v83 = icmp ult i64 %v82, %v50
+  br i1 %v83, label %bb12, label %bb48
+bb12:
+  %v84 = extractvalue { ptr, i64 } %v15, 0
+  %v85 = getelementptr inbounds i8, ptr %v84, i64 %v82
+  %v86 = load i8, ptr %v85, align 1
+  %v87 = add i64 %v49, 5
+  %v88 = icmp ult i64 %v87, %v50
+  br i1 %v88, label %bb13, label %bb49
+bb13:
+  %v89 = extractvalue { ptr, i64 } %v15, 0
+  %v90 = getelementptr inbounds i8, ptr %v89, i64 %v87
+  %v91 = load i8, ptr %v90, align 1
+  %v92 = add i64 %v49, 6
+  %v93 = icmp ult i64 %v92, %v50
+  br i1 %v93, label %bb14, label %bb50
+bb14:
+  %v94 = extractvalue { ptr, i64 } %v15, 0
+  %v95 = getelementptr inbounds i8, ptr %v94, i64 %v92
+  %v96 = load i8, ptr %v95, align 1
+  %v97 = add i64 %v49, 7
+  %v98 = icmp ult i64 %v97, %v50
+  br i1 %v98, label %bb15, label %bb51
+bb15:
+  %v99 = extractvalue { ptr, i64 } %v15, 0
+  %v100 = getelementptr inbounds i8, ptr %v99, i64 %v97
+  %v101 = load i8, ptr %v100, align 1
+  %v102 = add i64 %v49, 8
+  %v103 = icmp ult i64 %v102, %v50
+  br i1 %v103, label %bb16, label %bb52
+bb16:
+  %v104 = extractvalue { ptr, i64 } %v15, 0
+  %v105 = getelementptr inbounds i8, ptr %v104, i64 %v102
+  %v106 = load i8, ptr %v105, align 1
+  %v107 = add i64 %v49, 9
+  %v108 = icmp ult i64 %v107, %v50
+  br i1 %v108, label %bb17, label %bb53
+bb17:
+  %v109 = extractvalue { ptr, i64 } %v15, 0
+  %v110 = getelementptr inbounds i8, ptr %v109, i64 %v107
+  %v111 = load i8, ptr %v110, align 1
+  %v112 = add i64 %v49, 10
+  %v113 = icmp ult i64 %v112, %v50
+  br i1 %v113, label %bb18, label %bb54
+bb18:
+  %v114 = extractvalue { ptr, i64 } %v15, 0
+  %v115 = getelementptr inbounds i8, ptr %v114, i64 %v112
+  %v116 = load i8, ptr %v115, align 1
+  %v117 = add i64 %v49, 11
+  %v118 = icmp ult i64 %v117, %v50
+  br i1 %v118, label %bb19, label %bb55
+bb19:
+  %v119 = extractvalue { ptr, i64 } %v15, 0
+  %v120 = getelementptr inbounds i8, ptr %v119, i64 %v117
+  %v121 = load i8, ptr %v120, align 1
+  %v122 = add i64 %v49, 12
+  %v123 = icmp ult i64 %v122, %v50
+  br i1 %v123, label %bb20, label %bb56
+bb20:
+  %v124 = extractvalue { ptr, i64 } %v15, 0
+  %v125 = getelementptr inbounds i8, ptr %v124, i64 %v122
+  %v126 = load i8, ptr %v125, align 1
+  %v127 = add i64 %v49, 13
+  %v128 = icmp ult i64 %v127, %v50
+  br i1 %v128, label %bb21, label %bb57
+bb21:
+  %v129 = extractvalue { ptr, i64 } %v15, 0
+  %v130 = getelementptr inbounds i8, ptr %v129, i64 %v127
+  %v131 = load i8, ptr %v130, align 1
+  %v132 = add i64 %v49, 14
+  %v133 = icmp ult i64 %v132, %v50
+  br i1 %v133, label %bb22, label %bb58
+bb22:
+  %v134 = extractvalue { ptr, i64 } %v15, 0
+  %v135 = getelementptr inbounds i8, ptr %v134, i64 %v132
+  %v136 = load i8, ptr %v135, align 1
+  %v137 = add i64 %v49, 15
+  %v138 = icmp ult i64 %v137, %v50
+  br i1 %v138, label %bb23, label %bb59
+bb23:
+  %v139 = extractvalue { ptr, i64 } %v15, 0
+  %v140 = getelementptr inbounds i8, ptr %v139, i64 %v137
+  %v141 = load i8, ptr %v140, align 1
+  %v142 = call { [8 x i8], [8 x i8] } @cuda_kernels__oxide_kernels__decode_scales_mins(i8 %v86, i8 %v91, i8 %v96, i8 %v101, i8 %v106, i8 %v111, i8 %v116, i8 %v121, i8 %v126, i8 %v131, i8 %v136, i8 %v141) #0
+  br label %bb24
+bb24:
+  %v143 = extractvalue { [8 x i8], [8 x i8] } %v142, 0
+  store [8 x i8] %v143, ptr %v24, align 1
+  %v144 = extractvalue { [8 x i8], [8 x i8] } %v142, 1
+  store [8 x i8] %v144, ptr %v25, align 1
+  %v145 = udiv i64 %v40, 32
+  %v146 = urem i64 %v40, 32
+  %v147 = add i64 %v49, 16
+  %v148 = udiv i64 %v40, 64
+  %v149 = mul i64 %v148, 32
+  %v150 = add i64 %v147, %v149
+  %v151 = urem i64 %v40, 64
+  %v152 = icmp ult i64 %v151, 32
+  %v153 = xor i1 %v152, 1
+  br i1 %v153, label %bb27, label %bb25
+bb25:
+  %v154 = add i64 %v150, %v146
+  %v155 = icmp ult i64 %v154, %v50
+  br i1 %v155, label %bb26, label %bb60
+bb26:
+  %v156 = extractvalue { ptr, i64 } %v15, 0
+  %v157 = getelementptr inbounds i8, ptr %v156, i64 %v154
+  %v158 = load i8, ptr %v157, align 1
+  %v159 = and i8 %v158, 15
+  %v160 = uitofp i8 %v159 to float
+  br label %bb29
+bb27:
+  %v161 = add i64 %v150, %v146
+  %v162 = icmp ult i64 %v161, %v50
+  br i1 %v162, label %bb28, label %bb61
+bb28:
+  %v163 = extractvalue { ptr, i64 } %v15, 0
+  %v164 = getelementptr inbounds i8, ptr %v163, i64 %v161
+  %v165 = load i8, ptr %v164, align 1
+  %v166 = trunc i32 4 to i8
+  %v167 = and i8 %v166, 7
+  %v168 = lshr i8 %v165, %v167
+  %v169 = uitofp i8 %v168 to float
+  br label %bb29
+bb29:
+  %v170 = phi float [ %v160, %bb26 ], [ %v169, %bb28 ]
+  %v171 = icmp eq i64 %v27, 18446744073709551615
+  br i1 %v171, label %bb38, label %bb35
+bb30:
+  %v172 = extractvalue { ptr } %v195, 0
+  %v173 = icmp ult i64 %v145, 8
+  br i1 %v173, label %bb31, label %bb62
+bb31:
+  %v174 = getelementptr inbounds [8 x i8], ptr %v24, i32 0, i64 %v145
+  %v175 = load i8, ptr %v174, align 1
+  %v176 = uitofp i8 %v175 to float
+  %v177 = fmul contract float %v65, %v176
+  %v178 = fmul contract float %v177, %v170
+  %v179 = getelementptr inbounds [8 x i8], ptr %v25, i32 0, i64 %v145
+  %v180 = load i8, ptr %v179, align 1
+  %v181 = uitofp i8 %v180 to float
+  %v182 = fmul contract float %v81, %v181
+  %v183 = fsub contract float %v178, %v182
+  store float %v183, ptr %v172, align 4
+  br label %bb33
+bb32:
+  br label %bb33
+bb33:
+  br label %bb34
+bb34:
+  ret void
+bb35:
+  %v184 = extractvalue { ptr, i64 } %v20, 1
+  %v185 = icmp ult i64 %v27, %v184
+  %v186 = xor i1 %v185, 1
+  br i1 %v186, label %bb37, label %bb36
+bb36:
+  %v187 = extractvalue { ptr, i64 } %v20, 0
+  %v188 = getelementptr inbounds float, ptr %v187, i64 %v27
+  %v189 = insertvalue { ptr } undef, ptr %v188, 0
+  %v190 = extractvalue { ptr } %v189, 0
+  br label %bb39
+bb37:
+  br label %bb38
+bb38:
+  %v191 = inttoptr i64 0 to ptr
+  %v192 = insertvalue { ptr } undef, ptr %v191, 0
+  %v193 = extractvalue { ptr } %v192, 0
+  br label %bb39
+bb39:
+  %v194 = phi ptr [ %v190, %bb36 ], [ %v193, %bb38 ]
+  %v195 = insertvalue { ptr } undef, ptr %v194, 0
+  %v196 = extractvalue { ptr } %v195, 0
+  %v197 = ptrtoint ptr %v196 to i64
+  %v198 = sub i64 %v197, 0
+  %v199 = icmp ule i64 %v198, 0
+  %v200 = add i64 %v198, 0
+  %v201 = select i1 %v199, i64 %v200, i64 1
+  %v202 = icmp eq i64 %v201, 1
+  br i1 %v202, label %bb30, label %bb40
+bb40:
+  %v203 = icmp eq i64 %v201, 0
+  br i1 %v203, label %bb32, label %bb41
+bb41:
+  unreachable
+bb42:
+  call void @llvm.trap() #0
+  unreachable
+bb43:
+  call void @llvm.trap() #0
+  unreachable
+bb44:
+  call void @llvm.trap() #0
+  unreachable
+bb45:
+  call void @llvm.trap() #0
+  unreachable
+bb46:
+  call void @llvm.trap() #0
+  unreachable
+bb47:
+  call void @llvm.trap() #0
+  unreachable
+bb48:
+  call void @llvm.trap() #0
+  unreachable
+bb49:
+  call void @llvm.trap() #0
+  unreachable
+bb50:
+  call void @llvm.trap() #0
+  unreachable
+bb51:
+  call void @llvm.trap() #0
+  unreachable
+bb52:
+  call void @llvm.trap() #0
+  unreachable
+bb53:
+  call void @llvm.trap() #0
+  unreachable
+bb54:
+  call void @llvm.trap() #0
+  unreachable
+bb55:
+  call void @llvm.trap() #0
+  unreachable
+bb56:
+  call void @llvm.trap() #0
+  unreachable
+bb57:
+  call void @llvm.trap() #0
+  unreachable
+bb58:
+  call void @llvm.trap() #0
+  unreachable
+bb59:
+  call void @llvm.trap() #0
+  unreachable
+bb60:
+  call void @llvm.trap() #0
+  unreachable
+bb61:
+  call void @llvm.trap() #0
+  unreachable
+bb62:
+  call void @llvm.trap() #0
+  unreachable
+}
+
 define ptx_kernel void @attention_canvas_heads(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ptr %v4, i64 %v5, ptr %v6, i64 %v7, ptr %v8, i64 %v9, i32 %v10, i32 %v11, i32 %v12, i32 %v13, i32 %v14, float %v15, ptr %v16, i64 %v17) #0 {
 entry:
   %v18 = insertvalue { ptr, i64 } undef, ptr %v0, 0
@@ -11962,9 +13187,6 @@ bb43:
   unreachable
 }
 
-declare float @__nv_sinf(float)
-declare float @__nv_cosf(float)
-
 define ptx_kernel void @rope(ptr %v0, i64 %v1, ptr %v2, i64 %v3, i32 %v4, i32 %v5, i32 %v6, float %v7, i32 %v8, ptr %v9, i64 %v10) #0 {
 entry:
   %v11 = insertvalue { ptr, i64 } undef, ptr %v0, 0
@@ -12096,6 +13318,218 @@ bb22:
   call void @llvm.trap() #0
   unreachable
 bb23:
+  call void @llvm.trap() #0
+  unreachable
+}
+
+define ptx_kernel void @shortconv_mix_rows(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ptr %v4, i64 %v5, i32 %v6, i32 %v7, i32 %v8, ptr %v9, i64 %v10) #0 {
+entry:
+  %v11 = insertvalue { ptr, i64 } undef, ptr %v0, 0
+  %v12 = insertvalue { ptr, i64 } %v11, i64 %v1, 1
+  %v13 = insertvalue { ptr, i64 } undef, ptr %v2, 0
+  %v14 = insertvalue { ptr, i64 } %v13, i64 %v3, 1
+  %v15 = insertvalue { ptr, i64 } undef, ptr %v4, 0
+  %v16 = insertvalue { ptr, i64 } %v15, i64 %v5, 1
+  %v17 = insertvalue { ptr, i64 } undef, ptr %v9, 0
+  %v18 = insertvalue { ptr, i64 } %v17, i64 %v10, 1
+  br label %bb0
+bb0:
+  %v19 = phi { ptr, i64 } [ %v12, %entry ]
+  %v20 = phi { ptr, i64 } [ %v14, %entry ]
+  %v21 = phi { ptr, i64 } [ %v16, %entry ]
+  %v22 = phi i32 [ %v6, %entry ]
+  %v23 = phi i32 [ %v7, %entry ]
+  %v24 = phi i32 [ %v8, %entry ]
+  %v25 = phi { ptr, i64 } [ %v18, %entry ]
+  %v26 = alloca {  }, align 1
+  %v27 = bitcast ptr %v26 to ptr
+  %v28 = call i64 @_RINvNtNtCs52pM6xjztaY_11cuda_device6thread10___internal8index_1dNtB2_13UnknownDomainNtB2_17NativeCoordinatesECs5VsnSnoaHeT_12cuda_kernels(ptr %v27) #0
+  br label %bb1
+bb1:
+  %v29 = zext i32 %v22 to i64
+  %v30 = zext i32 %v24 to i64
+  %v31 = mul i64 %v29, %v30
+  %v32 = icmp uge i64 %v28, %v31
+  %v33 = xor i1 %v32, 1
+  br i1 %v33, label %bb3, label %bb2
+bb2:
+  br label %bb4
+bb3:
+  %v34 = icmp eq i32 %v23, 0
+  br i1 %v34, label %bb4, label %bb5
+bb4:
+  br label %bb24
+bb5:
+  %v35 = icmp eq i64 %v29, 0
+  %v36 = xor i1 %v35, 1
+  br i1 %v36, label %bb6, label %bb32
+bb6:
+  %v37 = udiv i64 %v28, %v29
+  %v38 = urem i64 %v28, %v29
+  %v39 = zext i32 %v23 to i64
+  %v40 = sub i64 %v39, 1
+  %v41 = mul i64 %v37, 3
+  %v42 = mul i64 %v41, %v29
+  %v43 = mul i64 %v37, %v40
+  %v44 = mul i64 %v43, %v29
+  %v45 = add i64 %v42, %v38
+  %v46 = extractvalue { ptr, i64 } %v19, 1
+  %v47 = icmp ult i64 %v45, %v46
+  br i1 %v47, label %bb7, label %bb33
+bb7:
+  %v48 = extractvalue { ptr, i64 } %v19, 0
+  %v49 = getelementptr inbounds float, ptr %v48, i64 %v45
+  %v50 = load float, ptr %v49, align 4
+  %v51 = add i64 %v42, %v29
+  %v52 = add i64 %v51, %v38
+  %v53 = icmp ult i64 %v52, %v46
+  br i1 %v53, label %bb8, label %bb34
+bb8:
+  %v54 = extractvalue { ptr, i64 } %v19, 0
+  %v55 = getelementptr inbounds float, ptr %v54, i64 %v52
+  %v56 = load float, ptr %v55, align 4
+  %v57 = mul i64 2, %v29
+  %v58 = add i64 %v42, %v57
+  %v59 = add i64 %v58, %v38
+  %v60 = icmp ult i64 %v59, %v46
+  br i1 %v60, label %bb9, label %bb35
+bb9:
+  %v61 = extractvalue { ptr, i64 } %v19, 0
+  %v62 = getelementptr inbounds float, ptr %v61, i64 %v59
+  %v63 = load float, ptr %v62, align 4
+  %v64 = fmul contract float %v50, %v63
+  %v65 = mul i64 %v38, %v39
+  %v66 = add i64 %v65, %v40
+  %v67 = extractvalue { ptr, i64 } %v20, 1
+  %v68 = icmp ult i64 %v66, %v67
+  br i1 %v68, label %bb10, label %bb36
+bb10:
+  %v69 = extractvalue { ptr, i64 } %v20, 0
+  %v70 = getelementptr inbounds float, ptr %v69, i64 %v66
+  %v71 = load float, ptr %v70, align 4
+  %v72 = fmul contract float %v64, %v71
+  br label %bb11
+bb11:
+  %v73 = phi float [ %v72, %bb10 ], [ %v89, %bb13 ]
+  %v74 = phi i64 [ 0, %bb10 ], [ %v90, %bb13 ]
+  %v75 = icmp ult i64 %v74, %v40
+  %v76 = xor i1 %v75, 1
+  br i1 %v76, label %bb14, label %bb12
+bb12:
+  %v77 = mul i64 %v74, %v29
+  %v78 = add i64 %v44, %v77
+  %v79 = add i64 %v78, %v38
+  %v80 = extractvalue { ptr, i64 } %v21, 0
+  %v81 = getelementptr inbounds float, ptr %v80, i64 %v79
+  %v82 = load float, ptr %v81, align 4
+  %v83 = add i64 %v65, %v74
+  %v84 = icmp ult i64 %v83, %v67
+  br i1 %v84, label %bb13, label %bb37
+bb13:
+  %v85 = extractvalue { ptr, i64 } %v20, 0
+  %v86 = getelementptr inbounds float, ptr %v85, i64 %v83
+  %v87 = load float, ptr %v86, align 4
+  %v88 = fmul contract float %v82, %v87
+  %v89 = fadd contract float %v73, %v88
+  %v90 = add i64 %v74, 1
+  br label %bb11
+bb14:
+  %v91 = icmp eq i64 %v28, 18446744073709551615
+  br i1 %v91, label %bb28, label %bb25
+bb15:
+  %v92 = extractvalue { ptr } %v125, 0
+  %v93 = fmul contract float %v56, %v73
+  store float %v93, ptr %v92, align 4
+  br label %bb17
+bb16:
+  br label %bb17
+bb17:
+  br label %bb18
+bb18:
+  %v94 = phi i64 [ 0, %bb17 ], [ %v113, %bb22 ]
+  %v95 = icmp ult i64 %v94, %v40
+  %v96 = xor i1 %v95, 1
+  br i1 %v96, label %bb23, label %bb19
+bb19:
+  %v97 = add i64 %v94, 1
+  %v98 = icmp ult i64 %v97, %v40
+  %v99 = xor i1 %v98, 1
+  br i1 %v99, label %bb21, label %bb20
+bb20:
+  %v100 = add i64 %v94, 1
+  %v101 = mul i64 %v100, %v29
+  %v102 = add i64 %v44, %v101
+  %v103 = add i64 %v102, %v38
+  %v104 = extractvalue { ptr, i64 } %v21, 0
+  %v105 = getelementptr inbounds float, ptr %v104, i64 %v103
+  %v106 = load float, ptr %v105, align 4
+  br label %bb22
+bb21:
+  br label %bb22
+bb22:
+  %v107 = phi float [ %v106, %bb20 ], [ %v64, %bb21 ]
+  %v108 = mul i64 %v94, %v29
+  %v109 = add i64 %v44, %v108
+  %v110 = add i64 %v109, %v38
+  %v111 = extractvalue { ptr, i64 } %v21, 0
+  %v112 = getelementptr inbounds float, ptr %v111, i64 %v110
+  store float %v107, ptr %v112, align 4
+  %v113 = add i64 %v94, 1
+  br label %bb18
+bb23:
+  br label %bb24
+bb24:
+  ret void
+bb25:
+  %v114 = extractvalue { ptr, i64 } %v25, 1
+  %v115 = icmp ult i64 %v28, %v114
+  %v116 = xor i1 %v115, 1
+  br i1 %v116, label %bb27, label %bb26
+bb26:
+  %v117 = extractvalue { ptr, i64 } %v25, 0
+  %v118 = getelementptr inbounds float, ptr %v117, i64 %v28
+  %v119 = insertvalue { ptr } undef, ptr %v118, 0
+  %v120 = extractvalue { ptr } %v119, 0
+  br label %bb29
+bb27:
+  br label %bb28
+bb28:
+  %v121 = inttoptr i64 0 to ptr
+  %v122 = insertvalue { ptr } undef, ptr %v121, 0
+  %v123 = extractvalue { ptr } %v122, 0
+  br label %bb29
+bb29:
+  %v124 = phi ptr [ %v120, %bb26 ], [ %v123, %bb28 ]
+  %v125 = insertvalue { ptr } undef, ptr %v124, 0
+  %v126 = extractvalue { ptr } %v125, 0
+  %v127 = ptrtoint ptr %v126 to i64
+  %v128 = sub i64 %v127, 0
+  %v129 = icmp ule i64 %v128, 0
+  %v130 = add i64 %v128, 0
+  %v131 = select i1 %v129, i64 %v130, i64 1
+  %v132 = icmp eq i64 %v131, 1
+  br i1 %v132, label %bb15, label %bb30
+bb30:
+  %v133 = icmp eq i64 %v131, 0
+  br i1 %v133, label %bb16, label %bb31
+bb31:
+  unreachable
+bb32:
+  call void @llvm.trap() #0
+  unreachable
+bb33:
+  call void @llvm.trap() #0
+  unreachable
+bb34:
+  call void @llvm.trap() #0
+  unreachable
+bb35:
+  call void @llvm.trap() #0
+  unreachable
+bb36:
+  call void @llvm.trap() #0
+  unreachable
+bb37:
   call void @llvm.trap() #0
   unreachable
 }
@@ -13793,6 +15227,104 @@ bb4:
   ret i64 %v12
 }
 
+define i16 @cuda_kernels__oxide_kernels__kernels__f32_to_f16_bits(float %v0) #0 {
+entry:
+  br label %bb0
+bb0:
+  %v1 = phi float [ %v0, %entry ]
+  %v2 = bitcast float %v1 to i32
+  %v3 = and i32 16, 31
+  %v4 = lshr i32 %v2, %v3
+  %v5 = and i32 %v4, 32768
+  %v6 = and i32 23, 31
+  %v7 = lshr i32 %v2, %v6
+  %v8 = and i32 %v7, 255
+  %v9 = bitcast i32 %v8 to i32
+  %v10 = and i32 %v2, 8388607
+  %v11 = icmp eq i32 %v9, 255
+  br i1 %v11, label %bb1, label %bb5
+bb1:
+  %v12 = or i32 %v5, 31744
+  %v13 = icmp eq i32 %v10, 0
+  br i1 %v13, label %bb3, label %bb2
+bb2:
+  br label %bb4
+bb3:
+  br label %bb4
+bb4:
+  %v14 = phi i32 [ 512, %bb2 ], [ 0, %bb3 ]
+  %v15 = or i32 %v12, %v14
+  %v16 = trunc i32 %v15 to i16
+  br label %bb19
+bb5:
+  %v17 = sub i32 %v9, 127
+  %v18 = add i32 %v17, 15
+  %v19 = icmp sge i32 %v18, 31
+  %v20 = xor i1 %v19, 1
+  br i1 %v20, label %bb7, label %bb6
+bb6:
+  %v21 = or i32 %v5, 31744
+  %v22 = trunc i32 %v21 to i16
+  br label %bb19
+bb7:
+  %v23 = icmp sle i32 %v18, 0
+  %v24 = xor i1 %v23, 1
+  br i1 %v24, label %bb9, label %bb8
+bb8:
+  %v25 = icmp slt i32 %v18, 4294967286
+  %v26 = xor i1 %v25, 1
+  br i1 %v26, label %bb11, label %bb10
+bb9:
+  %v27 = bitcast i32 %v18 to i32
+  %v28 = and i32 10, 31
+  %v29 = shl i32 %v27, %v28
+  %v30 = and i32 13, 31
+  %v31 = lshr i32 %v10, %v30
+  %v32 = or i32 %v29, %v31
+  %v33 = and i32 %v10, 4096
+  %v34 = icmp eq i32 %v33, 0
+  br i1 %v34, label %bb16, label %bb15
+bb10:
+  %v35 = trunc i32 %v5 to i16
+  br label %bb18
+bb11:
+  %v36 = or i32 %v10, 8388608
+  %v37 = sub i32 1, %v18
+  %v38 = and i32 %v37, 31
+  %v39 = lshr i32 %v36, %v38
+  %v40 = and i32 13, 31
+  %v41 = lshr i32 %v39, %v40
+  %v42 = and i32 %v39, 4096
+  %v43 = icmp eq i32 %v42, 0
+  br i1 %v43, label %bb13, label %bb12
+bb12:
+  br label %bb14
+bb13:
+  br label %bb14
+bb14:
+  %v44 = phi i32 [ 1, %bb12 ], [ 0, %bb13 ]
+  %v45 = add i32 %v41, %v44
+  %v46 = or i32 %v5, %v45
+  %v47 = trunc i32 %v46 to i16
+  br label %bb18
+bb15:
+  br label %bb17
+bb16:
+  br label %bb17
+bb17:
+  %v48 = phi i32 [ 1, %bb15 ], [ 0, %bb16 ]
+  %v49 = add i32 %v32, %v48
+  %v50 = or i32 %v5, %v49
+  %v51 = trunc i32 %v50 to i16
+  br label %bb19
+bb18:
+  %v52 = phi i16 [ %v35, %bb10 ], [ %v47, %bb14 ]
+  br label %bb19
+bb19:
+  %v53 = phi i16 [ %v16, %bb4 ], [ %v22, %bb6 ], [ %v51, %bb17 ], [ %v52, %bb18 ]
+  ret i16 %v53
+}
+
 define i32 @_RNvYmNtNtCsiQ4CSjCKWVc_4core3cmp3Ord3minCs5VsnSnoaHeT_12cuda_kernels(i32 %v0, i32 %v1) #0 {
 entry:
   br label %bb0
@@ -14159,104 +15691,6 @@ bb46:
   unreachable
 }
 
-define i16 @cuda_kernels__oxide_kernels__kernels__f32_to_f16_bits(float %v0) #0 {
-entry:
-  br label %bb0
-bb0:
-  %v1 = phi float [ %v0, %entry ]
-  %v2 = bitcast float %v1 to i32
-  %v3 = and i32 16, 31
-  %v4 = lshr i32 %v2, %v3
-  %v5 = and i32 %v4, 32768
-  %v6 = and i32 23, 31
-  %v7 = lshr i32 %v2, %v6
-  %v8 = and i32 %v7, 255
-  %v9 = bitcast i32 %v8 to i32
-  %v10 = and i32 %v2, 8388607
-  %v11 = icmp eq i32 %v9, 255
-  br i1 %v11, label %bb1, label %bb5
-bb1:
-  %v12 = or i32 %v5, 31744
-  %v13 = icmp eq i32 %v10, 0
-  br i1 %v13, label %bb3, label %bb2
-bb2:
-  br label %bb4
-bb3:
-  br label %bb4
-bb4:
-  %v14 = phi i32 [ 512, %bb2 ], [ 0, %bb3 ]
-  %v15 = or i32 %v12, %v14
-  %v16 = trunc i32 %v15 to i16
-  br label %bb19
-bb5:
-  %v17 = sub i32 %v9, 127
-  %v18 = add i32 %v17, 15
-  %v19 = icmp sge i32 %v18, 31
-  %v20 = xor i1 %v19, 1
-  br i1 %v20, label %bb7, label %bb6
-bb6:
-  %v21 = or i32 %v5, 31744
-  %v22 = trunc i32 %v21 to i16
-  br label %bb19
-bb7:
-  %v23 = icmp sle i32 %v18, 0
-  %v24 = xor i1 %v23, 1
-  br i1 %v24, label %bb9, label %bb8
-bb8:
-  %v25 = icmp slt i32 %v18, 4294967286
-  %v26 = xor i1 %v25, 1
-  br i1 %v26, label %bb11, label %bb10
-bb9:
-  %v27 = bitcast i32 %v18 to i32
-  %v28 = and i32 10, 31
-  %v29 = shl i32 %v27, %v28
-  %v30 = and i32 13, 31
-  %v31 = lshr i32 %v10, %v30
-  %v32 = or i32 %v29, %v31
-  %v33 = and i32 %v10, 4096
-  %v34 = icmp eq i32 %v33, 0
-  br i1 %v34, label %bb16, label %bb15
-bb10:
-  %v35 = trunc i32 %v5 to i16
-  br label %bb18
-bb11:
-  %v36 = or i32 %v10, 8388608
-  %v37 = sub i32 1, %v18
-  %v38 = and i32 %v37, 31
-  %v39 = lshr i32 %v36, %v38
-  %v40 = and i32 13, 31
-  %v41 = lshr i32 %v39, %v40
-  %v42 = and i32 %v39, 4096
-  %v43 = icmp eq i32 %v42, 0
-  br i1 %v43, label %bb13, label %bb12
-bb12:
-  br label %bb14
-bb13:
-  br label %bb14
-bb14:
-  %v44 = phi i32 [ 1, %bb12 ], [ 0, %bb13 ]
-  %v45 = add i32 %v41, %v44
-  %v46 = or i32 %v5, %v45
-  %v47 = trunc i32 %v46 to i16
-  br label %bb18
-bb15:
-  br label %bb17
-bb16:
-  br label %bb17
-bb17:
-  %v48 = phi i32 [ 1, %bb15 ], [ 0, %bb16 ]
-  %v49 = add i32 %v32, %v48
-  %v50 = or i32 %v5, %v49
-  %v51 = trunc i32 %v50 to i16
-  br label %bb19
-bb18:
-  %v52 = phi i16 [ %v35, %bb10 ], [ %v47, %bb14 ]
-  br label %bb19
-bb19:
-  %v53 = phi i16 [ %v16, %bb4 ], [ %v22, %bb6 ], [ %v51, %bb17 ], [ %v52, %bb18 ]
-  ret i16 %v53
-}
-
 declare i32 @llvm.nvvm.read.ptx.sreg.ntid.y()
 declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
 declare i32 @llvm.nvvm.read.ptx.sreg.ntid.z()
@@ -14586,6 +16020,6 @@ bb0:
 }
 
 
-@llvm.used = appending global [54 x ptr] [ptr @add_f32, ptr @add_in_place_f32, ptr @add_inplace_f32, ptr @argmax_token, ptr @attention_canvas_heads, ptr @attention_canvas_paged_heads, ptr @attention_fa2_decode_paged, ptr @attention_fa2_prefill_paged, ptr @attention_fa3_decode_paged, ptr @attention_heads, ptr @attention_paged_heads, ptr @attention_paged_warp, ptr @embedding_f32, ptr @embedding_q4k_row, ptr @embedding_q6k_row, ptr @embedding_q6k_rows, ptr @embedding_q8_0_row, ptr @fill_u32, ptr @kv_write_row, ptr @moe_count_assignments, ptr @moe_prefix_offsets, ptr @moe_q4k_project, ptr @moe_q4k_project_warp, ptr @moe_q5_0_project, ptr @moe_q5_0_project_warp, ptr @moe_q6k_project, ptr @moe_q8_0_project, ptr @moe_q8_0_project_warp, ptr @moe_route_topk, ptr @moe_scatter_assignments, ptr @moe_weighted_reduce, ptr @mul_f32, ptr @q4k_gate_up_swiglu_multiwarp, ptr @q4k_gemm_warp, ptr @q4k_gemv_row, ptr @q4k_gemv_row_tiled, ptr @q4k_q8_gemv_multiwarp, ptr @q4k_q8_gemv_warp4, ptr @q5_0_gemm_element, ptr @q5_0_gemm_warp, ptr @q6k_gemm_warp, ptr @q6k_gemv_row, ptr @q6k_gemv_warp4, ptr @q6k_q8_gemv_multiwarp, ptr @q6k_q8_gemv_warp4, ptr @q8_0_gemm_element, ptr @q8_0_gemm_warp, ptr @quantize_q8_32, ptr @rmsnorm_group, ptr @rope, ptr @scale_f32, ptr @shortconv_mix, ptr @silu_gate, ptr @weighted_embedding_q6k_topk], section "llvm.metadata"
+@llvm.used = appending global [61 x ptr] [ptr @add_f32, ptr @add_in_place_f32, ptr @add_inplace_f32, ptr @argmax_token, ptr @attention_canvas_heads, ptr @attention_canvas_paged_heads, ptr @attention_fa2_decode_paged, ptr @attention_fa2_prefill_paged, ptr @attention_fa3_decode_paged, ptr @attention_heads, ptr @attention_paged_batch_heads, ptr @attention_paged_heads, ptr @attention_paged_warp, ptr @embedding_f32, ptr @embedding_f32_rows, ptr @embedding_q4k_row, ptr @embedding_q4k_rows, ptr @embedding_q6k_row, ptr @embedding_q6k_rows, ptr @embedding_q8_0_row, ptr @embedding_q8_0_rows, ptr @fill_u32, ptr @kv_write_batch, ptr @kv_write_row, ptr @moe_count_assignments, ptr @moe_prefix_offsets, ptr @moe_q4k_project, ptr @moe_q4k_project_warp, ptr @moe_q5_0_project, ptr @moe_q5_0_project_warp, ptr @moe_q6k_project, ptr @moe_q8_0_project, ptr @moe_q8_0_project_warp, ptr @moe_route_topk, ptr @moe_scatter_assignments, ptr @moe_weighted_reduce, ptr @mul_f32, ptr @q4k_gate_up_swiglu_multiwarp, ptr @q4k_gemm_warp, ptr @q4k_gemv_row, ptr @q4k_gemv_row_tiled, ptr @q4k_q8_gemv_multiwarp, ptr @q4k_q8_gemv_warp4, ptr @q5_0_gemm_element, ptr @q5_0_gemm_warp, ptr @q6k_gemm_warp, ptr @q6k_gemv_row, ptr @q6k_gemv_warp4, ptr @q6k_q8_gemv_multiwarp, ptr @q6k_q8_gemv_warp4, ptr @q8_0_gemm_element, ptr @q8_0_gemm_warp, ptr @quantize_q8_32, ptr @rmsnorm_group, ptr @rope, ptr @rope_batch, ptr @scale_f32, ptr @shortconv_mix, ptr @shortconv_mix_rows, ptr @silu_gate, ptr @weighted_embedding_q6k_topk], section "llvm.metadata"
 
 attributes #0 = { convergent }

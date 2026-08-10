@@ -67,6 +67,344 @@ pub fn build_step_graph(gguf: &GgufFile, spec: &ModelSpec) -> Result<Graph> {
     gb.build()
 }
 
+/// Build one physical autoregressive batch. Each row may belong to a different
+/// sequence; the runtime supplies row-specific positions and block tables in
+/// the paged-KV context.
+pub fn build_batch_step_graph(gguf: &GgufFile, spec: &ModelSpec, rows: usize) -> Result<Graph> {
+    if rows == 0 {
+        return Err(fellm_core::error::FellmError::other(
+            "batch must contain rows",
+        ));
+    }
+    let mut gb = GraphBuilder::new();
+    let d_model = spec.d_model;
+    let vocab = spec.vocab_size;
+    let token_embd = gb.constant("token_embd", gguf.tensor("token_embd.weight")?);
+    let output_w = gb.constant(
+        "output_w",
+        gguf.tensor(if spec.tied_embeddings {
+            "token_embd.weight"
+        } else {
+            "output.weight"
+        })?,
+    );
+    let final_norm_w = gb.constant(
+        "output_norm_w",
+        gguf.tensor(if gguf.has_tensor("output_norm.weight") {
+            "output_norm.weight"
+        } else {
+            "token_embd_norm.weight"
+        })?,
+    );
+    let inv_freqs = gb.constant(
+        "rope_inv_freqs",
+        make_f32_tensor(&compute_rope_inv_freqs(spec)),
+    );
+    let token_ids = gb.input("token_id", DType::U32, Shape::new(&[rows as u64])?);
+    let mut x = gb.op(
+        OpKind::Embedding,
+        OpAttrs::default(),
+        DType::F32,
+        Shape::new(&[rows as u64, d_model as u64])?,
+        &[token_embd, token_ids],
+        "batch_tok_embed",
+    );
+    for layer in &spec.layers {
+        x = build_batch_layer(&mut gb, gguf, spec, layer, x, inv_freqs, rows)?;
+    }
+    let normalized = gb.op(
+        OpKind::RmsNorm,
+        norm_attrs(spec),
+        DType::F32,
+        Shape::new(&[rows as u64, d_model as u64])?,
+        &[x, final_norm_w],
+        "batch_final_norm",
+    );
+    let logits = gb.op(
+        OpKind::MatMul,
+        OpAttrs::default(),
+        DType::F32,
+        Shape::new(&[rows as u64, vocab as u64])?,
+        &[output_w, normalized],
+        "batch_lm_head",
+    );
+    gb.mark_output("logits", logits);
+    gb.build()
+}
+
+fn build_batch_layer(
+    gb: &mut GraphBuilder,
+    gguf: &GgufFile,
+    spec: &ModelSpec,
+    layer: &crate::probe::LayerSpec,
+    x: NodeId,
+    inv_freqs: NodeId,
+    rows: usize,
+) -> Result<NodeId> {
+    let i = layer.index;
+    let shape = Shape::new(&[rows as u64, spec.d_model as u64])?;
+    let attn_norm = gb.constant(
+        format!("blk.{i}.attn_norm"),
+        gguf.tensor(&format!("blk.{i}.attn_norm.weight"))?,
+    );
+    let ffn_norm = gb.constant(
+        format!("blk.{i}.ffn_norm"),
+        gguf.tensor(&format!("blk.{i}.ffn_norm.weight"))?,
+    );
+    let normalized = gb.op(
+        OpKind::RmsNorm,
+        norm_attrs(spec),
+        DType::F32,
+        shape.clone(),
+        &[x, attn_norm],
+        format!("blk.{i}.batch_attn_norm"),
+    );
+    let mix = match layer.mix {
+        MixKind::Attention { .. } => build_batch_autoregressive_attention(
+            gb, gguf, spec, layer, normalized, inv_freqs, rows,
+        )?,
+        MixKind::ShortConv => build_batch_shortconv(gb, gguf, spec, layer, normalized, rows)?,
+    };
+    let after_attention = gb.op(
+        OpKind::Add,
+        OpAttrs::default(),
+        DType::F32,
+        shape.clone(),
+        &[x, mix],
+        format!("blk.{i}.batch_residual1"),
+    );
+    let normalized = gb.op(
+        OpKind::RmsNorm,
+        norm_attrs(spec),
+        DType::F32,
+        shape.clone(),
+        &[after_attention, ffn_norm],
+        format!("blk.{i}.batch_ffn_norm"),
+    );
+    let ffn = match layer.ffn {
+        FfnKind::Dense => build_dense_ffn_batch(gb, gguf, spec, layer, normalized, rows)?,
+        FfnKind::MoE => build_moe_batch(gb, gguf, spec, layer, normalized, rows)?,
+    };
+    Ok(gb.op(
+        OpKind::Add,
+        OpAttrs::default(),
+        DType::F32,
+        shape,
+        &[after_attention, ffn],
+        format!("blk.{i}.batch_residual2"),
+    ))
+}
+
+fn build_batch_shortconv(
+    gb: &mut GraphBuilder,
+    gguf: &GgufFile,
+    spec: &ModelSpec,
+    layer: &crate::probe::LayerSpec,
+    x: NodeId,
+    rows: usize,
+) -> Result<NodeId> {
+    let i = layer.index;
+    let n = spec.d_model;
+    let conv_ord = layer.conv_ordinal.expect("ShortConv ordinal");
+    let in_proj = gb.constant(
+        format!("blk.{i}.shortconv.in_proj"),
+        gguf.tensor(&format!("blk.{i}.shortconv.in_proj.weight"))?,
+    );
+    let conv = gb.constant(
+        format!("blk.{i}.shortconv.conv"),
+        gguf.tensor(&format!("blk.{i}.shortconv.conv.weight"))?,
+    );
+    let out_proj = gb.constant(
+        format!("blk.{i}.shortconv.out_proj"),
+        gguf.tensor(&format!("blk.{i}.shortconv.out_proj.weight"))?,
+    );
+    let state_elements = spec.shortconv_l_cache.saturating_sub(1) * n;
+    let state = gb.input(
+        format!("conv_in_{conv_ord}"),
+        DType::F32,
+        Shape::new(&[rows as u64, state_elements as u64])?,
+    );
+    Ok(gb.op(
+        OpKind::ShortConv,
+        OpAttrs {
+            shortconv_l_cache: spec.shortconv_l_cache as u32,
+            n_embd: n as u32,
+            ..Default::default()
+        },
+        DType::F32,
+        Shape::new(&[rows as u64, n as u64])?,
+        &[x, in_proj, conv, out_proj, state],
+        format!("blk.{i}.batch_shortconv"),
+    ))
+}
+
+fn build_batch_autoregressive_attention(
+    gb: &mut GraphBuilder,
+    gguf: &GgufFile,
+    spec: &ModelSpec,
+    layer: &crate::probe::LayerSpec,
+    x: NodeId,
+    inv_freqs: NodeId,
+    rows: usize,
+) -> Result<NodeId> {
+    let MixKind::Attention {
+        n_kv_heads,
+        qk_norm,
+        head_dim,
+        rope_dim,
+        value_reuses_key,
+        ..
+    } = layer.mix
+    else {
+        return Err(fellm_core::error::FellmError::other(
+            "batch layer is not attention",
+        ));
+    };
+    let i = layer.index;
+    let n_heads = spec.n_heads;
+    let q_width = n_heads * head_dim;
+    let kv_width = n_kv_heads * head_dim;
+    let attn_ord = layer.attn_ordinal.expect("attention ordinal");
+    let wq = gb.constant(
+        format!("blk.{i}.attn_q"),
+        gguf.tensor(&format!("blk.{i}.attn_q.weight"))?,
+    );
+    let wk = gb.constant(
+        format!("blk.{i}.attn_k"),
+        gguf.tensor(&format!("blk.{i}.attn_k.weight"))?,
+    );
+    let wv = if value_reuses_key {
+        None
+    } else {
+        Some(gb.constant(
+            format!("blk.{i}.attn_v"),
+            gguf.tensor(&format!("blk.{i}.attn_v.weight"))?,
+        ))
+    };
+    let wo = gb.constant(
+        format!("blk.{i}.attn_o"),
+        gguf.tensor(&format!("blk.{i}.attn_output.weight"))?,
+    );
+    let projection = |gb: &mut GraphBuilder, weight, width, label: String| {
+        gb.op(
+            OpKind::MatMul,
+            OpAttrs::default(),
+            DType::F32,
+            Shape::new(&[rows as u64, width as u64]).expect("batch projection shape"),
+            &[weight, x],
+            label,
+        )
+    };
+    let q = projection(gb, wq, q_width, format!("blk.{i}.batch_q"));
+    let k = projection(gb, wk, kv_width, format!("blk.{i}.batch_k"));
+    let v = if value_reuses_key {
+        k
+    } else {
+        projection(
+            gb,
+            wv.expect("v weight"),
+            kv_width,
+            format!("blk.{i}.batch_v"),
+        )
+    };
+    let normalize =
+        |gb: &mut GraphBuilder, input, heads, weight_name: &str, label: String| -> Result<NodeId> {
+            if !qk_norm {
+                return Ok(input);
+            }
+            let weight = gb.constant(label.clone() + "_weight", gguf.tensor(weight_name)?);
+            Ok(gb.op(
+                OpKind::RmsNorm,
+                OpAttrs {
+                    eps: spec.norm_eps,
+                    n_heads: heads as u32,
+                    head_dim: head_dim as u32,
+                    ..Default::default()
+                },
+                DType::F32,
+                Shape::new(&[rows as u64, (heads * head_dim) as u64])?,
+                &[input, weight],
+                label,
+            ))
+        };
+    let q = normalize(
+        gb,
+        q,
+        n_heads,
+        &format!("blk.{i}.attn_q_norm.weight"),
+        format!("blk.{i}.batch_q_norm"),
+    )?;
+    let k = normalize(
+        gb,
+        k,
+        n_kv_heads,
+        &format!("blk.{i}.attn_k_norm.weight"),
+        format!("blk.{i}.batch_k_norm"),
+    )?;
+    let rope =
+        |gb: &mut GraphBuilder, input, heads, custom_op_id, label: String| -> Result<NodeId> {
+            Ok(gb.op(
+                OpKind::Rope,
+                OpAttrs {
+                    n_heads: heads as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    rope_base: spec.rope_base,
+                    layer_ord: attn_ord as u32,
+                    custom_op_id,
+                    ..Default::default()
+                },
+                DType::F32,
+                Shape::new(&[rows as u64, (heads * head_dim) as u64])?,
+                &[input, inv_freqs],
+                label,
+            ))
+        };
+    let q = rope(gb, q, n_heads, 0, format!("blk.{i}.batch_q_rope"))?;
+    let k = rope(gb, k, n_kv_heads, 1, format!("blk.{i}.batch_k_rope"))?;
+    let cache_shape = Shape::new(&[spec.context_length as u64, kv_width as u64])?;
+    let k_in = gb.input(format!("k_in_{attn_ord}"), DType::F32, cache_shape.clone());
+    let v_in = gb.input(format!("v_in_{attn_ord}"), DType::F32, cache_shape.clone());
+    let write = |gb: &mut GraphBuilder, input, cache, slot, label: String| {
+        gb.op_in_place(
+            OpKind::KvWrite,
+            OpAttrs {
+                layer_ord: attn_ord as u32,
+                kv_slot: slot,
+                block_size: 16,
+                ..Default::default()
+            },
+            DType::F32,
+            cache_shape.clone(),
+            &[input, cache],
+            1,
+            label,
+        )
+    };
+    let k_cache = write(gb, k, k_in, 0, format!("blk.{i}.batch_k_write"));
+    let v_cache = write(gb, v, v_in, 1, format!("blk.{i}.batch_v_write"));
+    let attention = gb.op(
+        OpKind::Attention,
+        OpAttrs {
+            layer_ord: attn_ord as u32,
+            query_len: rows as u32,
+            ..attention_attrs(spec, n_kv_heads, head_dim)
+        },
+        DType::F32,
+        Shape::new(&[rows as u64, q_width as u64])?,
+        &[q, k_cache, v_cache],
+        format!("blk.{i}.batch_attention"),
+    );
+    Ok(gb.op(
+        OpKind::MatMul,
+        OpAttrs::default(),
+        DType::F32,
+        Shape::new(&[rows as u64, spec.d_model as u64])?,
+        &[wo, attention],
+        format!("blk.{i}.batch_o"),
+    ))
+}
+
 /// Build DiffusionGemma's reusable full-canvas denoising graph.
 ///
 /// The graph has one embedding/transformer pass for the complete canvas and
@@ -529,33 +867,48 @@ fn build_moe_batch(
     rows: usize,
 ) -> Result<NodeId> {
     let i = layer.index;
-    let inputs = vec![
-        x,
-        gb.constant(
-            format!("blk.{i}.ffn_gate_inp"),
-            gguf.tensor(&format!("blk.{i}.ffn_gate_inp.weight"))?,
-        ),
-        gb.constant(
-            format!("blk.{i}.ffn_gate_up_exps"),
-            gguf.tensor(&format!("blk.{i}.ffn_gate_up_exps.weight"))?,
-        ),
-        gb.constant(
-            format!("blk.{i}.ffn_down_exps"),
-            gguf.tensor(&format!("blk.{i}.ffn_down_exps.weight"))?,
-        ),
-        gb.constant(
-            format!("blk.{i}.ffn_gate"),
-            gguf.tensor(&format!("blk.{i}.ffn_gate.weight"))?,
-        ),
-        gb.constant(
-            format!("blk.{i}.ffn_up"),
-            gguf.tensor(&format!("blk.{i}.ffn_up.weight"))?,
-        ),
-        gb.constant(
-            format!("blk.{i}.ffn_down"),
-            gguf.tensor(&format!("blk.{i}.ffn_down.weight"))?,
-        ),
-    ];
+    let gate_inp = gb.constant(
+        format!("blk.{i}.ffn_gate_inp"),
+        gguf.tensor(&format!("blk.{i}.ffn_gate_inp.weight"))?,
+    );
+    let mut inputs = vec![x, gate_inp];
+    if gguf.has_tensor(&format!("blk.{i}.ffn_gate_up_exps.weight")) {
+        inputs.extend([
+            gb.constant(
+                format!("blk.{i}.ffn_gate_up_exps"),
+                gguf.tensor(&format!("blk.{i}.ffn_gate_up_exps.weight"))?,
+            ),
+            gb.constant(
+                format!("blk.{i}.ffn_down_exps"),
+                gguf.tensor(&format!("blk.{i}.ffn_down_exps.weight"))?,
+            ),
+            gb.constant(
+                format!("blk.{i}.ffn_gate"),
+                gguf.tensor(&format!("blk.{i}.ffn_gate.weight"))?,
+            ),
+            gb.constant(
+                format!("blk.{i}.ffn_up"),
+                gguf.tensor(&format!("blk.{i}.ffn_up.weight"))?,
+            ),
+            gb.constant(
+                format!("blk.{i}.ffn_down"),
+                gguf.tensor(&format!("blk.{i}.ffn_down.weight"))?,
+            ),
+        ]);
+    } else {
+        for name in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+            inputs.push(gb.constant(
+                format!("blk.{i}.{name}"),
+                gguf.tensor(&format!("blk.{i}.{name}.weight"))?,
+            ));
+        }
+    }
+    if spec.use_expert_bias && gguf.has_tensor(&format!("blk.{i}.exp_probs_b.bias")) {
+        inputs.push(gb.constant(
+            format!("blk.{i}.exp_probs_b"),
+            gguf.tensor(&format!("blk.{i}.exp_probs_b.bias"))?,
+        ));
+    }
     Ok(gb.op(
         OpKind::MoE,
         moe_attrs(spec),

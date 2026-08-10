@@ -47,6 +47,22 @@ struct Args {
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: usize,
 
+    /// Exact KV arena bytes (0 selects automatic device/system budgeting).
+    #[arg(long, default_value_t = 0)]
+    kv_cache_bytes: u64,
+
+    /// Fraction of available memory considered by automatic KV budgeting.
+    #[arg(long, default_value_t = 0.25)]
+    kv_memory_fraction: f64,
+
+    /// Host swap-tier bytes reserved for paged KV.
+    #[arg(long, default_value_t = 0)]
+    kv_swap_bytes: u64,
+
+    /// Bytes kept free as a safety reserve.
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+    kv_safety_reserve_bytes: u64,
+
     /// Default max tokens when the request omits it.
     #[arg(long, default_value_t = 128)]
     max_tokens: u32,
@@ -102,10 +118,18 @@ async fn main() {
         std::process::exit(1);
     });
     let select = BackendSelect::new(preference, !args.no_cpu_fallback);
+    let kv_cache = fellm_runtime::KvCacheConfig {
+        budget_bytes: (args.kv_cache_bytes > 0).then_some(args.kv_cache_bytes),
+        memory_fraction: args.kv_memory_fraction,
+        safety_reserve_bytes: args.kv_safety_reserve_bytes,
+        swap_bytes: args.kv_swap_bytes,
+        ..fellm_runtime::KvCacheConfig::default()
+    };
     let mut settings = EngineSettings::default()
         .batch_size(args.batch_size)
         .ubatch_size(args.ubatch_size)
-        .backend_select(select);
+        .backend_select(select)
+        .kv_cache(kv_cache);
     settings = if args.ctx_size == 0 {
         settings.ctx_from_model()
     } else {
@@ -119,18 +143,25 @@ async fn main() {
         top_p: args.top_p,
         seed: args.seed,
         repetition_penalty: args.repetition_penalty,
+        priority: 0,
     };
 
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: install Prometheus recorder: {error}");
+            std::process::exit(1);
+        });
     let (task_tx, task_rx) = mpsc::channel(64);
     if let Err(e) = worker::spawn_worker(&args.model, settings, task_rx) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
     }
-
     let state = AppState {
         task_tx,
         model_id: model_id.clone(),
         defaults,
+        metrics,
     };
 
     let app = routes::router(state)

@@ -8,6 +8,122 @@ use fellm_model::parse_assistant_output;
 use fellm_tokenizer::{AssistantOutput, Message, ToolDef};
 use std::collections::VecDeque;
 
+/// Stable request identity used by scheduling plans and cancellation commands.
+pub type SequenceId = u64;
+
+/// Kind of inference work assigned to one sequence in a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkKind {
+    /// One latency-sensitive autoregressive token.
+    Decode,
+    /// A bounded range of prompt tokens.
+    Prefill,
+}
+
+/// Work for one sequence within a physical inference batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchItem {
+    pub id: SequenceId,
+    pub kind: WorkKind,
+    pub token_start: usize,
+    pub token_count: usize,
+    pub compute_logits: bool,
+}
+
+/// First-class description of all work in one scheduler iteration.
+#[derive(Debug, Clone, Default)]
+pub struct BatchPlan {
+    pub items: Vec<BatchItem>,
+    pub token_budget: usize,
+    pub scheduled_tokens: usize,
+    pub decode_tokens: usize,
+    pub prefill_tokens: usize,
+}
+
+/// Policy-visible sequence state. It contains decisions inputs, not ownership.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulingCandidate {
+    pub id: SequenceId,
+    pub status: SequenceStatus,
+    pub waiting_ticks: u64,
+    pub remaining_prefill: usize,
+    pub has_decode: bool,
+    pub priority: i32,
+}
+
+/// Owns which runnable work is selected; the scheduler retains lifecycle/KV state.
+pub trait SchedulingPolicy: Send {
+    fn plan(
+        &mut self,
+        candidates: &[SchedulingCandidate],
+        token_budget: usize,
+        physical_granularity: usize,
+    ) -> BatchPlan;
+}
+
+/// Interactive serving policy: schedule every possible decode first, then fill
+/// remaining capacity with age-ordered, chunked prefills.
+#[derive(Debug, Default)]
+pub struct InteractivePolicy;
+
+impl SchedulingPolicy for InteractivePolicy {
+    fn plan(
+        &mut self,
+        candidates: &[SchedulingCandidate],
+        token_budget: usize,
+        physical_granularity: usize,
+    ) -> BatchPlan {
+        let budget = token_budget.max(1);
+        let granularity = physical_granularity.max(1).min(budget);
+        let mut plan = BatchPlan {
+            token_budget: budget,
+            ..BatchPlan::default()
+        };
+        let mut ordered = candidates.to_vec();
+        ordered.sort_unstable_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.priority),
+                std::cmp::Reverse(candidate.waiting_ticks),
+                candidate.id,
+            )
+        });
+        for candidate in ordered.iter().filter(|candidate| candidate.has_decode) {
+            if plan.scheduled_tokens == budget {
+                break;
+            }
+            plan.items.push(BatchItem {
+                id: candidate.id,
+                kind: WorkKind::Decode,
+                token_start: 0,
+                token_count: 1,
+                compute_logits: true,
+            });
+            plan.scheduled_tokens += 1;
+            plan.decode_tokens += 1;
+        }
+        for candidate in ordered
+            .iter()
+            .filter(|candidate| candidate.remaining_prefill > 0)
+        {
+            let remaining = budget.saturating_sub(plan.scheduled_tokens);
+            if remaining == 0 {
+                break;
+            }
+            let count = candidate.remaining_prefill.min(remaining).min(granularity);
+            plan.items.push(BatchItem {
+                id: candidate.id,
+                kind: WorkKind::Prefill,
+                token_start: 0,
+                token_count: count,
+                compute_logits: count == candidate.remaining_prefill,
+            });
+            plan.scheduled_tokens += count;
+            plan.prefill_tokens += count;
+        }
+        plan
+    }
+}
+
 /// Lifecycle of a scheduled sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceStatus {
@@ -64,6 +180,8 @@ struct Sequence {
     id: u64,
     status: SequenceStatus,
     seq_cache: SequenceCache,
+    /// Request-owned recurrent state; absent for attention-only models.
+    conv_state: Option<crate::HybridConvState>,
     prompt_ids: Vec<u32>,
     /// Prefill cursor into `prompt_ids`.
     prefill_pos: usize,
@@ -80,8 +198,12 @@ struct Sequence {
     prompt_tokens: u32,
     gen_start: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
+    last_token_at: Option<std::time::Instant>,
+    admitted_at: Option<std::time::Instant>,
+    prefill_done_at: Option<std::time::Instant>,
     hit_stop: bool,
     generated_tokens: Vec<u32>,
+    sampling: crate::sampling::SamplingWorkspace,
 }
 
 /// Round-robin scheduler owning waiting/running queues.
@@ -90,6 +212,9 @@ pub struct Scheduler {
     waiting: VecDeque<Sequence>,
     running: VecDeque<Sequence>,
     clock: u64,
+    policy: Box<dyn SchedulingPolicy>,
+    pending_events: VecDeque<SequenceEvent>,
+    last_plan: BatchPlan,
 }
 
 impl Scheduler {
@@ -101,7 +226,34 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: VecDeque::new(),
             clock: 0,
+            policy: Box::<InteractivePolicy>::default(),
+            pending_events: VecDeque::new(),
+            last_plan: BatchPlan::default(),
         }
+    }
+
+    /// Replace the scheduling policy without changing sequence/KV ownership.
+    pub fn set_policy(&mut self, policy: impl SchedulingPolicy + 'static) {
+        self.policy = Box::new(policy);
+    }
+
+    /// Most recently executed plan, useful for metrics and diagnostics.
+    #[must_use]
+    pub fn last_plan(&self) -> &BatchPlan {
+        &self.last_plan
+    }
+
+    /// Intentionally cancel a request and immediately release its KV state.
+    pub fn cancel(&mut self, engine: &mut Engine, id: SequenceId) -> bool {
+        for queue in [&mut self.waiting, &mut self.running] {
+            if let Some(index) = queue.iter().position(|sequence| sequence.id == id) {
+                let mut sequence = queue.remove(index).expect("located sequence");
+                engine.release_seq_cache(&mut sequence.seq_cache);
+                metrics::counter!("fellm_requests_cancelled_total").increment(1);
+                return true;
+            }
+        }
+        false
     }
 
     /// Enqueue a chat request (already mapped messages/tools).
@@ -154,6 +306,7 @@ impl Scheduler {
             id,
             status: SequenceStatus::Waiting,
             seq_cache,
+            conv_state: engine.new_hybrid_state()?,
             prompt_ids: ids,
             prefill_pos: matched,
             position: matched,
@@ -168,10 +321,15 @@ impl Scheduler {
             prompt_tokens: 0,
             gen_start: std::time::Instant::now(),
             first_token_at: None,
+            last_token_at: None,
+            admitted_at: None,
+            prefill_done_at: None,
             hit_stop: false,
             generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            sampling: crate::sampling::SamplingWorkspace::default(),
         };
         self.waiting.push_back(seq);
+        metrics::counter!("fellm_requests_total").increment(1);
         Ok(SequenceHandle { id })
     }
 
@@ -183,41 +341,302 @@ impl Scheduler {
 
     /// Run until one event is produced, or return `None` if idle.
     pub fn poll_event(&mut self, engine: &mut Engine) -> Option<SequenceEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(event);
+        }
         self.clock = self.clock.wrapping_add(1);
+        metrics::gauge!("fellm_scheduler_waiting_requests").set(self.waiting.len() as f64);
+        metrics::gauge!("fellm_scheduler_running_requests").set(self.running.len() as f64);
+        metrics::gauge!("fellm_scheduler_preempted_requests").set(
+            self.waiting
+                .iter()
+                .filter(|sequence| sequence.status == SequenceStatus::Preempted)
+                .count() as f64,
+        );
         self.try_admit(engine);
 
         if self.running.is_empty() {
             return None;
         }
 
-        // Round-robin: pop front, step, push back if still running.
-        let mut seq = self.running.pop_front()?;
-        seq.last_used = self.clock;
-        seq.status = SequenceStatus::Running;
-
-        match self.step_one(engine, &mut seq) {
-            Ok(Some(ev)) => {
-                if matches!(ev, SequenceEvent::Done { .. } | SequenceEvent::Error { .. }) {
-                    engine.release_seq_cache(&mut seq.seq_cache);
-                    Some(ev)
-                } else {
-                    self.running.push_back(seq);
-                    Some(ev)
-                }
-            }
-            Ok(None) => {
-                self.running.push_back(seq);
-                None
-            }
-            Err(e) => {
-                let id = seq.id;
-                engine.release_seq_cache(&mut seq.seq_cache);
-                Some(SequenceEvent::Error {
-                    id,
-                    message: e.to_string(),
-                })
+        let candidates: Vec<_> = self
+            .running
+            .iter()
+            .map(|sequence| SchedulingCandidate {
+                id: sequence.id,
+                status: sequence.status,
+                waiting_ticks: self.clock.saturating_sub(sequence.last_used),
+                remaining_prefill: {
+                    let remaining = sequence
+                        .prompt_ids
+                        .len()
+                        .saturating_sub(sequence.prefill_pos);
+                    if engine.spec().is_hybrid() {
+                        remaining.min(1)
+                    } else {
+                        remaining
+                    }
+                },
+                has_decode: sequence.prefill_pos == sequence.prompt_ids.len()
+                    && sequence.pending_logits.is_some(),
+                priority: sequence.params.priority,
+            })
+            .collect();
+        let mut plan = self.policy.plan(
+            &candidates,
+            engine.settings().n_batch,
+            engine.settings().n_ubatch,
+        );
+        for item in &mut plan.items {
+            if item.kind == WorkKind::Prefill
+                && let Some(sequence) = self.running.iter().find(|sequence| sequence.id == item.id)
+            {
+                item.token_start = sequence.prefill_pos;
+                item.compute_logits =
+                    sequence.prefill_pos + item.token_count == sequence.prompt_ids.len();
             }
         }
+        self.last_plan = plan.clone();
+        metrics::gauge!("fellm_scheduler_active_batch_size").set(plan.items.len() as f64);
+        metrics::histogram!("fellm_scheduler_batch_size").record(plan.items.len() as f64);
+        metrics::gauge!("fellm_scheduler_scheduled_tokens").set(plan.scheduled_tokens as f64);
+        metrics::gauge!("fellm_scheduler_decode_tokens_per_batch").set(plan.decode_tokens as f64);
+        metrics::gauge!("fellm_scheduler_prefill_tokens_per_batch").set(plan.prefill_tokens as f64);
+        metrics::gauge!("fellm_scheduler_batch_utilization")
+            .set(plan.scheduled_tokens as f64 / plan.token_budget.max(1) as f64);
+        metrics::counter!("fellm_prompt_tokens_total").increment(plan.prefill_tokens as u64);
+        metrics::counter!("fellm_decode_tokens_total").increment(plan.decode_tokens as u64);
+        metrics::counter!("fellm_tokens_total").increment(plan.scheduled_tokens as u64);
+        self.execute_physical_batch(engine, plan.items);
+        self.pending_events.pop_front()
+    }
+
+    fn execute_physical_batch(&mut self, engine: &mut Engine, items: Vec<BatchItem>) {
+        struct Selected {
+            item: BatchItem,
+            sequence: Sequence,
+            terminal: bool,
+        }
+        #[derive(Clone, Copy)]
+        enum RowKind {
+            Prefill { final_prompt_row: bool },
+            Decode,
+        }
+        #[derive(Clone, Copy)]
+        struct RowOwner {
+            selected: usize,
+            kind: RowKind,
+        }
+
+        let mut selected = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(index) = self
+                .running
+                .iter()
+                .position(|sequence| sequence.id == item.id)
+            else {
+                continue;
+            };
+            let mut sequence = self.running.remove(index).expect("planned sequence");
+            sequence.last_used = self.clock;
+            selected.push(Selected {
+                item,
+                sequence,
+                terminal: false,
+            });
+        }
+
+        let mut rows = Vec::new();
+        let mut owners = Vec::new();
+        for (selected_index, entry) in selected.iter_mut().enumerate() {
+            if entry.sequence.seq_cache.swapped
+                && let Err(error) = engine.swap_in_sequence(&mut entry.sequence.seq_cache)
+            {
+                self.pending_events.push_back(SequenceEvent::Error {
+                    id: entry.sequence.id,
+                    message: error.to_string(),
+                });
+                entry.terminal = true;
+                continue;
+            }
+            match entry.item.kind {
+                WorkKind::Prefill => {
+                    let start = entry.sequence.prefill_pos;
+                    let end = (start + entry.item.token_count).min(entry.sequence.prompt_ids.len());
+                    for position in start..end {
+                        let final_prompt_row = position + 1 == entry.sequence.prompt_ids.len();
+                        rows.push(crate::engine::BatchToken {
+                            sequence: selected_index,
+                            token: entry.sequence.prompt_ids[position],
+                            position,
+                            compute_logits: final_prompt_row,
+                        });
+                        owners.push(RowOwner {
+                            selected: selected_index,
+                            kind: RowKind::Prefill { final_prompt_row },
+                        });
+                    }
+                }
+                WorkKind::Decode => match self.prepare_decode(engine, &mut entry.sequence) {
+                    Ok((event, forward)) => {
+                        if let Some(event) = event {
+                            entry.terminal = matches!(event, SequenceEvent::Done { .. });
+                            self.pending_events.push_back(event);
+                        }
+                        if let Some((token, position)) = forward {
+                            rows.push(crate::engine::BatchToken {
+                                sequence: selected_index,
+                                token,
+                                position,
+                                compute_logits: true,
+                            });
+                            owners.push(RowOwner {
+                                selected: selected_index,
+                                kind: RowKind::Decode,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        self.pending_events.push_back(SequenceEvent::Error {
+                            id: entry.sequence.id,
+                            message: error.to_string(),
+                        });
+                        entry.terminal = true;
+                    }
+                },
+            }
+        }
+
+        if !rows.is_empty() {
+            let granularity = engine.settings().n_ubatch.max(1);
+            for (row_chunk, owner_chunk) in rows.chunks(granularity).zip(owners.chunks(granularity))
+            {
+                metrics::histogram!("fellm_scheduler_physical_batch_rows")
+                    .record(row_chunk.len() as f64);
+                let mut owned_states: Vec<_> = selected
+                    .iter_mut()
+                    .map(|entry| entry.sequence.conv_state.take())
+                    .collect();
+                let result = {
+                    let mut caches: Vec<_> = selected
+                        .iter_mut()
+                        .map(|entry| &mut entry.sequence.seq_cache)
+                        .collect();
+                    let mut conv_states: Vec<_> = owned_states.iter_mut().collect();
+                    engine.step_batch(&mut caches, &mut conv_states, row_chunk)
+                };
+                for (entry, state) in selected.iter_mut().zip(owned_states) {
+                    entry.sequence.conv_state = state;
+                }
+                match result {
+                    Ok(outputs) => {
+                        for (owner, output) in owner_chunk.iter().copied().zip(outputs) {
+                            let entry = &mut selected[owner.selected];
+                            match owner.kind {
+                                RowKind::Prefill { final_prompt_row } => {
+                                    entry.sequence.prefill_pos += 1;
+                                    entry.sequence.position = entry.sequence.prefill_pos;
+                                    if final_prompt_row {
+                                        entry.sequence.pending_logits = output;
+                                        entry.sequence.prompt_tokens =
+                                            entry.sequence.prompt_ids.len() as u32;
+                                        entry.sequence.prefill_done_at =
+                                            Some(std::time::Instant::now());
+                                        if let Err(error) = engine.insert_prefix(
+                                            &entry.sequence.prompt_ids,
+                                            &entry.sequence.seq_cache,
+                                        ) {
+                                            self.pending_events.push_back(SequenceEvent::Error {
+                                                id: entry.sequence.id,
+                                                message: error.to_string(),
+                                            });
+                                            entry.terminal = true;
+                                        }
+                                    }
+                                }
+                                RowKind::Decode => {
+                                    entry.sequence.position += 1;
+                                    entry.sequence.pending_logits = output;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for entry in &mut selected {
+                            if !entry.terminal {
+                                self.pending_events.push_back(SequenceEvent::Error {
+                                    id: entry.sequence.id,
+                                    message: error.to_string(),
+                                });
+                                entry.terminal = true;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for mut entry in selected {
+            if entry.terminal {
+                engine.release_seq_cache(&mut entry.sequence.seq_cache);
+            } else {
+                self.running.push_back(entry.sequence);
+            }
+        }
+    }
+
+    fn prepare_decode(
+        &mut self,
+        engine: &Engine,
+        seq: &mut Sequence,
+    ) -> Result<(Option<SequenceEvent>, Option<(u32, usize)>)> {
+        let Some(logits_owned) = seq.pending_logits.take() else {
+            return Ok((None, None));
+        };
+        let token = crate::sampling::sample_with_workspace(
+            logits_owned.as_slice::<f32>()?,
+            crate::sampling::SamplingOptions {
+                temperature: seq.params.temperature,
+                top_k: seq.params.top_k,
+                top_p: seq.params.top_p,
+                seed: seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+                repetition_penalty: seq.params.repetition_penalty,
+                recent_tokens: &seq.generated_tokens,
+            },
+            &mut seq.sampling,
+        );
+        seq.generated_tokens.push(token);
+        seq.emitted += 1;
+        if seq.first_token_at.is_none() {
+            let now = std::time::Instant::now();
+            seq.first_token_at = Some(now);
+            metrics::histogram!("fellm_time_to_first_token_seconds")
+                .record(now.duration_since(seq.gen_start).as_secs_f64());
+        } else if let Some(previous) = seq.last_token_at {
+            metrics::histogram!("fellm_inter_token_latency_seconds")
+                .record(previous.elapsed().as_secs_f64());
+        }
+        seq.last_token_at = Some(std::time::Instant::now());
+
+        if engine.stop_token_ids_pub().contains(&token) {
+            seq.hit_stop = true;
+            return Ok((Some(self.finish_seq(seq, engine)?), None));
+        }
+        let bytes = engine.tokenizer().decode_token(token)?;
+        if !bytes.is_empty() {
+            seq.full_bytes.extend_from_slice(&bytes);
+            seq.byte_buf.extend_from_slice(&bytes);
+        }
+        let event = if seq.stream && !seq.has_tools {
+            let text = flush_utf8(&mut seq.byte_buf);
+            (!text.is_empty()).then_some(SequenceEvent::Token { id: seq.id, text })
+        } else {
+            None
+        };
+        if seq.emitted >= seq.params.max_tokens || seq.position + 1 >= engine.n_ctx() {
+            return Ok((Some(self.finish_seq(seq, engine)?), None));
+        }
+        Ok((event, Some((token, seq.position))))
     }
 
     fn try_admit(&mut self, engine: &mut Engine) {
@@ -225,8 +644,9 @@ impl Scheduler {
             // Need at least one free block per layer to start / continue.
             let need = engine.spec().n_attn_layers().max(1);
             if engine.cache_free_blocks() < need {
+                engine.evict_prefixes_for_blocks(need);
                 // Try swap of LRU running/preempted — for simplicity swap oldest running.
-                if !self.try_swap_out(engine) {
+                if engine.cache_free_blocks() < need && !self.try_swap_out(engine) {
                     self.waiting.push_front(seq);
                     break;
                 }
@@ -246,6 +666,12 @@ impl Scheduler {
                 }
             }
             seq.status = SequenceStatus::Running;
+            if seq.admitted_at.is_none() {
+                let now = std::time::Instant::now();
+                metrics::histogram!("fellm_queue_latency_seconds")
+                    .record(now.duration_since(seq.gen_start).as_secs_f64());
+                seq.admitted_at = Some(now);
+            }
             self.running.push_back(seq);
         }
     }
@@ -264,6 +690,7 @@ impl Scheduler {
         let mut victim = self.running.remove(idx).expect("index");
         if engine.swap_out_sequence(&mut victim.seq_cache).is_ok() {
             victim.status = SequenceStatus::Preempted;
+            metrics::counter!("fellm_kv_swap_out_total").increment(1);
             victim.swapped_mark();
             self.waiting.push_back(victim);
             true
@@ -271,101 +698,6 @@ impl Scheduler {
             self.running.insert(idx, victim);
             false
         }
-    }
-
-    fn step_one(
-        &mut self,
-        engine: &mut Engine,
-        seq: &mut Sequence,
-    ) -> Result<Option<SequenceEvent>> {
-        // Resume from swap if needed.
-        if seq.seq_cache.swapped {
-            engine.swap_in_sequence(&mut seq.seq_cache)?;
-        }
-
-        // Prefill remaining prompt tokens.
-        if seq.prefill_pos < seq.prompt_ids.len() {
-            let tok = seq.prompt_ids[seq.prefill_pos];
-            let pos = seq.prefill_pos;
-            let need_logits = seq.prefill_pos + 1 == seq.prompt_ids.len();
-            let logits = engine.step_sequence(&mut seq.seq_cache, tok, pos, need_logits)?;
-            seq.prefill_pos += 1;
-            seq.position = seq.prefill_pos;
-            if need_logits {
-                seq.pending_logits = Some(logits);
-                seq.prompt_tokens = seq.prompt_ids.len() as u32;
-                // Insert prefix into radix tree for sharing.
-                engine.insert_prefix(&seq.prompt_ids, &seq.seq_cache)?;
-            }
-            return Ok(None);
-        }
-
-        // Decode
-        let Some(mut logits_owned) = seq.pending_logits.take() else {
-            return Ok(None);
-        };
-        let tok = if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
-            crate::sampling::sample(
-                work,
-                seq.params.temperature,
-                seq.params.top_k,
-                seq.params.top_p,
-                seq.params.seed.wrapping_add(u64::from(seq.emitted)),
-                seq.params.repetition_penalty,
-                &seq.generated_tokens,
-            )
-        } else {
-            let logits = logits_owned.as_slice::<f32>()?;
-            let mut work = logits.to_vec();
-            crate::sampling::sample(
-                &mut work,
-                seq.params.temperature,
-                seq.params.top_k,
-                seq.params.top_p,
-                seq.params.seed.wrapping_add(u64::from(seq.emitted)),
-                seq.params.repetition_penalty,
-                &seq.generated_tokens,
-            )
-        };
-        seq.generated_tokens.push(tok);
-        seq.emitted += 1;
-        if seq.first_token_at.is_none() {
-            seq.first_token_at = Some(std::time::Instant::now());
-        }
-
-        let stop_ids = engine.stop_token_ids_pub();
-        if stop_ids.contains(&tok) {
-            seq.hit_stop = true;
-            return Ok(Some(self.finish_seq(seq, engine)?));
-        }
-
-        let bytes = engine.tokenizer().decode_token(tok)?;
-        if !bytes.is_empty() {
-            seq.full_bytes.extend_from_slice(&bytes);
-            seq.byte_buf.extend_from_slice(&bytes);
-        }
-
-        let emit_live = seq.stream && !seq.has_tools;
-        let mut token_ev = None;
-        if emit_live {
-            let chunk = flush_utf8(&mut seq.byte_buf);
-            if !chunk.is_empty() {
-                token_ev = Some(SequenceEvent::Token {
-                    id: seq.id,
-                    text: chunk,
-                });
-            }
-        }
-
-        if seq.emitted >= seq.params.max_tokens || seq.position + 1 >= engine.n_ctx() {
-            return Ok(Some(self.finish_seq(seq, engine)?));
-        }
-
-        let next = engine.step_sequence(&mut seq.seq_cache, tok, seq.position, true)?;
-        seq.position += 1;
-        seq.pending_logits = Some(next);
-
-        Ok(token_ev)
     }
 
     fn finish_seq(&mut self, seq: &mut Sequence, _engine: &Engine) -> Result<SequenceEvent> {
@@ -397,13 +729,18 @@ impl Scheduler {
         let usage = GenStats {
             prompt_tokens: seq.prompt_tokens,
             predicted_tokens: seq.emitted,
-            prompt_ms: 0.0,
+            prompt_ms: seq.prefill_done_at.map_or(0.0, |time| {
+                time.duration_since(seq.gen_start).as_secs_f64() * 1000.0
+            }),
             time_to_first_token_ms: seq.first_token_at.map_or(0.0, |t| {
                 t.duration_since(seq.gen_start).as_secs_f64() * 1000.0
             }),
             predicted_ms: 0.0,
             total_ms: seq.gen_start.elapsed().as_secs_f64() * 1000.0,
         };
+        metrics::histogram!("fellm_request_completion_latency_seconds")
+            .record(seq.gen_start.elapsed().as_secs_f64());
+        metrics::counter!("fellm_requests_completed_total").increment(1);
 
         // Tools+stream: content already buffered; Done carries tool_calls.
         let _ = seq.stream;
@@ -446,3 +783,65 @@ fn flush_utf8(buf: &mut Vec<u8>) -> String {
 // Silence unused import in some cfgs.
 #[allow(dead_code)]
 fn _cache_ty(_: &CacheManager) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_policy_prioritizes_decode_then_chunks_prefill() {
+        let candidates = [
+            SchedulingCandidate {
+                id: 1,
+                status: SequenceStatus::Running,
+                waiting_ticks: 2,
+                remaining_prefill: 100,
+                has_decode: false,
+                priority: 0,
+            },
+            SchedulingCandidate {
+                id: 2,
+                status: SequenceStatus::Running,
+                waiting_ticks: 1,
+                remaining_prefill: 0,
+                has_decode: true,
+                priority: 0,
+            },
+            SchedulingCandidate {
+                id: 3,
+                status: SequenceStatus::Running,
+                waiting_ticks: 3,
+                remaining_prefill: 0,
+                has_decode: true,
+                priority: 0,
+            },
+        ];
+        let plan = InteractivePolicy.plan(&candidates, 10, 4);
+        assert_eq!(plan.decode_tokens, 2);
+        assert_eq!(plan.prefill_tokens, 4);
+        assert_eq!(plan.items[0].id, 3);
+        assert_eq!(plan.items[1].id, 2);
+        assert_eq!(plan.items[2].kind, WorkKind::Prefill);
+        assert_eq!(plan.items[2].token_count, 4);
+    }
+
+    #[test]
+    fn policy_never_exceeds_iteration_budget() {
+        let candidates = (0..20)
+            .map(|id| SchedulingCandidate {
+                id,
+                status: SequenceStatus::Running,
+                waiting_ticks: id,
+                remaining_prefill: if id % 2 == 0 { 100 } else { 0 },
+                has_decode: id % 2 == 1,
+                priority: 0,
+            })
+            .collect::<Vec<_>>();
+        let plan = InteractivePolicy.plan(&candidates, 7, 4);
+        assert!(plan.scheduled_tokens <= 7);
+        assert_eq!(
+            plan.scheduled_tokens,
+            plan.decode_tokens + plan.prefill_tokens
+        );
+    }
+}

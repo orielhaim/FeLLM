@@ -4,7 +4,6 @@ pub mod block_diffusion;
 pub mod compiled;
 pub mod cuda_lowering;
 pub mod engine;
-pub mod executor;
 pub mod hybrid_state;
 pub mod kv_cache;
 pub mod paged;
@@ -22,6 +21,12 @@ pub use fellm_plugin_abi::capability::{PluginConfig, ProviderSelection};
 pub use fellm_tokenizer::{AssistantOutput, Message, ToolCall, ToolDef};
 pub use hybrid_state::HybridConvState;
 pub use kv_cache::KvCache;
-pub use paged::{BLOCK_SIZE, CacheManager, PhysicalPool, PrefixTree, SequenceCache};
+pub use paged::{
+    BLOCK_SIZE, CacheManager, KvCacheConfig, KvMemoryPlan, PhysicalPool, PrefixCacheStats,
+    PrefixTree, SequenceCache,
+};
 pub use providers::{PreparedProviders, ProviderManager};
-pub use scheduler::{Scheduler, SequenceEvent, SequenceHandle, SequenceStatus};
+pub use scheduler::{
+    BatchItem, BatchPlan, InteractivePolicy, Scheduler, SchedulingCandidate, SchedulingPolicy,
+    SequenceEvent, SequenceHandle, SequenceId, SequenceStatus, WorkKind,
+};

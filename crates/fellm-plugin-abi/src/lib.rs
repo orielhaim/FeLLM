@@ -48,9 +48,10 @@ pub use sequence_state::{
 pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{
     Architecture, ArchitectureConfig, ArchitectureProvider, Backend, BackendCapabilities,
-    BackendCaps, CacheCommit, DeviceKind, DriverAction, DriverEvent, GenerationDriver,
-    GenerationRequest, GraphId, GraphOutput, GraphSpec, InputBinding, InputBindings, KernelHandle,
-    ModelProgram, ModelSource, StateBinding, StateBindings, TokenBatch,
+    BackendCaps, CacheCommit, DeviceKind, DeviceMemoryInfo, DriverAction, DriverEvent,
+    GenerationDriver, GenerationRequest, GraphId, GraphOutput, GraphSpec, InputBinding,
+    InputBindings, KernelHandle, ModelProgram, ModelSource, StateBinding, StateBindings,
+    TokenBatch,
 };
 
 /// A stream handle. On CPU this is always 0; on GPU backends this wraps

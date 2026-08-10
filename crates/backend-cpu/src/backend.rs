@@ -14,7 +14,9 @@ use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi as paged_ctx;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
-use fellm_plugin_abi::traits::{Backend, BackendCaps, DeviceKind, KernelDescriptor, KernelHandle};
+use fellm_plugin_abi::traits::{
+    Backend, BackendCaps, DeviceKind, DeviceMemoryInfo, KernelDescriptor, KernelHandle,
+};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use rayon::ThreadPool;
 use rayon::prelude::*;
@@ -126,6 +128,16 @@ impl Backend for CpuBackend {
 
     fn capabilities(&self) -> BackendCaps {
         self.caps
+    }
+
+    fn memory_info(&self) -> Option<DeviceMemoryInfo> {
+        let system = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+        );
+        Some(DeviceMemoryInfo {
+            total_bytes: system.total_memory(),
+            available_bytes: system.available_memory(),
+        })
     }
 
     fn resolve_kernel(
@@ -624,32 +636,27 @@ fn launch_rope(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut])
     let inv_freqs = as_f32_slice(&inputs[1])?;
     let x_out = as_f32_slice_mut(y_out)?;
     x_out.copy_from_slice(x_in);
-    // Pre-RoPE key snapshot for sequence-state policies (custom_op_id=1).
-    if attrs.custom_op_id == 1 {
-        let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
-        if row_width > 0 && !x_in.is_empty() {
-            // One decode row (or last row of a multi-row tile).
-            let row = if x_in.len() >= row_width {
-                &x_in[x_in.len() - row_width..]
-            } else {
-                x_in
-            };
-            fellm_plugin_abi::pre_rope_write(
-                attrs.layer_ord as usize,
-                attrs.position as usize,
-                row,
-            );
-        }
-    }
     let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
+    let paged = paged_ctx::snapshot_paged_context();
     if row_width == 0 || x_in.len().is_multiple_of(row_width) {
         for (row, values) in x_out.chunks_exact_mut(row_width).enumerate() {
+            let position = paged
+                .as_ref()
+                .and_then(|ctx| ctx.row_rope_positions.get(row).copied())
+                .unwrap_or_else(|| attrs.position.saturating_add(row as u32));
+            if attrs.custom_op_id == 1 {
+                fellm_plugin_abi::pre_rope_write(
+                    attrs.layer_ord as usize,
+                    position as usize,
+                    &x_in[row * row_width..(row + 1) * row_width],
+                );
+            }
             crate::kernels::rope::rope_inplace_with_freqs(
                 values,
                 attrs.n_heads as usize,
                 attrs.head_dim as usize,
                 attrs.rope_dim as usize,
-                attrs.position.saturating_add(row as u32),
+                position,
                 inv_freqs,
             );
         }
@@ -730,13 +737,52 @@ fn launch_attention(
 
     if use_paged {
         let layer = attrs.layer_ord as usize;
+        let ctx = paged_ctx::snapshot_paged_context()
+            .ok_or_else(|| FellmError::other("attention: missing paged ctx"))?;
+        let row_width = n_heads * head_dim;
+        if ctx.batch_size() > 1 || q.len() > row_width {
+            if q.len() != ctx.batch_size() * row_width || out.len() != q.len() {
+                return Err(FellmError::other(
+                    "attention: physical batch shape mismatch",
+                ));
+            }
+            for row in 0..ctx.batch_size() {
+                let q_row = &q[row * row_width..(row + 1) * row_width];
+                let out_row = &mut out[row * row_width..(row + 1) * row_width];
+                let seq = ctx.row_lengths[row] as usize;
+                fellm_plugin_abi::fa2_style_attention_paged_f32(
+                    q_row,
+                    out_row,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    seq,
+                    scale,
+                    true,
+                    attrs.attention_window as usize,
+                    br,
+                    bc,
+                    |t, is_v, values| {
+                        let full = unsafe {
+                            if is_v {
+                                ctx.v_row_for(row, layer, t)
+                            } else {
+                                ctx.k_row_for(row, layer, t)
+                            }
+                        };
+                        for (dst, &src) in values.iter_mut().zip(full.iter()) {
+                            *dst = src.to_f32();
+                        }
+                    },
+                );
+            }
+            return Ok(());
+        }
         if use_fa2_host {
             // Prepared FA2-style path over paged storage (host).
             let seq = past + 1;
             let window = attrs.attention_window as usize;
             let causal = attrs.attention_mode == 0;
-            let ctx = paged_ctx::snapshot_paged_context()
-                .ok_or_else(|| FellmError::other("attention: missing paged ctx"))?;
             fellm_plugin_abi::fa2_style_attention_paged_f32(
                 q,
                 out,
@@ -1121,17 +1167,24 @@ fn launch_kv_write(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorM
         let is_v = attrs.kv_slot != 0;
         return paged_ctx::with_paged_context_mut(|ctx| {
             let ctx = ctx.ok_or_else(|| FellmError::other("kv_write: missing paged ctx"))?;
-            if row.len() > ctx.tokens_stride {
+            if !row.len().is_multiple_of(ctx.tokens_stride)
+                || row.len() / ctx.tokens_stride != ctx.batch_size()
+            {
                 return Err(FellmError::other(format!(
-                    "kv_write: row len {} > tokens_stride {}",
+                    "kv_write: {} values do not match {} rows of stride {}",
                     row.len(),
+                    ctx.batch_size(),
                     ctx.tokens_stride
                 )));
             }
-            // SAFETY: runtime uniquely owns arena for this step.
-            let dst = unsafe { ctx.row_mut(layer, pos, is_v) };
-            for (d, &s) in dst.iter_mut().zip(row.iter()) {
-                *d = half::f16::from_f32(s);
+            let stride = ctx.tokens_stride;
+            for batch_row in 0..ctx.batch_size() {
+                let pos = ctx.row_positions[batch_row] as usize;
+                let dst = unsafe { ctx.row_mut_for(batch_row, layer, pos, is_v) };
+                let src = &row[batch_row * stride..(batch_row + 1) * stride];
+                for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                    *d = half::f16::from_f32(s);
+                }
             }
             Ok(())
         });
@@ -1203,18 +1256,32 @@ fn launch_shortconv(
         .dtype()
         .ok_or_else(|| FellmError::other("shortconv: out_proj dtype"))?;
 
-    crate::kernels::shortconv::shortconv_decode(
-        x,
-        as_bytes_slice(in_proj),
-        in_proj_dtype,
-        conv,
-        as_bytes_slice(out_proj),
-        out_proj_dtype,
-        state,
-        y,
-        n_embd,
-        l_cache,
-    )
+    let state_elements = l_cache.saturating_sub(1) * n_embd;
+    if !x.len().is_multiple_of(n_embd)
+        || y.len() != x.len()
+        || state.len() != x.len() / n_embd * state_elements
+    {
+        return Err(FellmError::other("shortconv: batched shape mismatch"));
+    }
+    for ((x_row, y_row), state_row) in x
+        .chunks_exact(n_embd)
+        .zip(y.chunks_exact_mut(n_embd))
+        .zip(state.chunks_exact_mut(state_elements))
+    {
+        crate::kernels::shortconv::shortconv_decode(
+            x_row,
+            as_bytes_slice(in_proj),
+            in_proj_dtype,
+            conv,
+            as_bytes_slice(out_proj),
+            out_proj_dtype,
+            state_row,
+            y_row,
+            n_embd,
+            l_cache,
+        )?;
+    }
+    Ok(())
 }
 
 fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
@@ -1376,23 +1443,29 @@ fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) 
         None
     };
 
-    crate::kernels::moe::moe_decode(
-        x,
-        gate_inp,
-        as_bytes_slice(&inputs[2]),
-        gate_exps_dtype,
-        as_bytes_slice(&inputs[3]),
-        up_exps_dtype,
-        as_bytes_slice(&inputs[4]),
-        down_exps_dtype,
-        bias,
-        y,
-        n_experts,
-        n_expert_used,
-        n_ff,
-        n_embd,
-        attrs.expert_gating_func,
-        attrs.routed_scaling_factor,
-        attrs.norm_topk_prob != 0,
-    )
+    if !x.len().is_multiple_of(n_embd) || y.len() != x.len() {
+        return Err(FellmError::other("moe: batched shape mismatch"));
+    }
+    for (x_row, y_row) in x.chunks_exact(n_embd).zip(y.chunks_exact_mut(n_embd)) {
+        crate::kernels::moe::moe_decode(
+            x_row,
+            gate_inp,
+            as_bytes_slice(&inputs[2]),
+            gate_exps_dtype,
+            as_bytes_slice(&inputs[3]),
+            up_exps_dtype,
+            as_bytes_slice(&inputs[4]),
+            down_exps_dtype,
+            bias,
+            y_row,
+            n_experts,
+            n_expert_used,
+            n_ff,
+            n_embd,
+            attrs.expert_gating_func,
+            attrs.routed_scaling_factor,
+            attrs.norm_topk_prob != 0,
+        )?;
+    }
+    Ok(())
 }

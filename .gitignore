@@ -7,6 +7,9 @@ Cargo.lock.bak
 .*
 
 # cuda-oxide / LLVM build artifacts
+*.ll
+*.opt.ll
+*.linked.opt.ll
 *.linked.ll
 *.linked.bc
 *.bc

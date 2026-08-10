@@ -265,6 +265,13 @@ pub struct BackendCaps {
     pub has_blackwell_features: bool,
 }
 
+/// Current allocatable memory reported by a backend's physical device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceMemoryInfo {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
 impl BackendCaps {
     /// Convert hardware flags into a [`crate::capability::FeatureSet`] for
     /// provider negotiation. Prefer this over stringly-typed GPU product names.
@@ -330,6 +337,11 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Capabilities.
     fn capabilities(&self) -> BackendCaps;
+
+    /// Live memory capacity for the device that owns model and KV allocations.
+    fn memory_info(&self) -> Option<DeviceMemoryInfo> {
+        None
+    }
 
     /// Resolve a kernel.
     fn resolve_kernel(

@@ -105,4 +105,23 @@ impl Tensor {
         bytemuck::try_cast_slice_mut(bytes)
             .map_err(|e| FellmError::other(format!("bytemuck cast failed: {e:?}")))
     }
+
+    /// Create a zero-copy view of one row from a contiguous rank-2 tensor.
+    pub fn row(&self, index: usize) -> Result<Self> {
+        let dims = self.layout.shape.dims();
+        if dims.len() != 2 || !self.layout.is_contiguous() {
+            return Err(FellmError::other("row requires a contiguous rank-2 tensor"));
+        }
+        let rows = dims[0] as usize;
+        let columns = dims[1] as usize;
+        if index >= rows {
+            return Err(FellmError::other(format!(
+                "row index {index} out of bounds for {rows} rows"
+            )));
+        }
+        let mut layout = Layout::contiguous(self.layout.dtype, Shape::new(&[dims[1]])?);
+        layout.offset_bytes =
+            self.layout.offset_bytes + index * self.layout.dtype.byte_size(columns);
+        Ok(Self::from_storage(layout, self.storage.clone()))
+    }
 }

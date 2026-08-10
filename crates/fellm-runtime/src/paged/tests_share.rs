@@ -15,7 +15,7 @@ fn prefix_sharing_saves_blocks() {
         mgr.ensure_writable(&mut seq_a, pos).unwrap();
     }
     let blocks_a: usize = (0..n_layers).map(|l| seq_a.table(l).num_blocks()).sum();
-    mgr.prefix.insert_prompt(&tokens, &seq_a);
+    mgr.prefix.insert_prompt(&mut mgr.pool, &tokens, &seq_a);
 
     // Five more sequences share the same prefix.
     let mut total_unique = blocks_a;
@@ -50,7 +50,7 @@ fn cow_on_write_forks_block() {
     for pos in 0..16 {
         mgr.ensure_writable(&mut seq_a, pos).unwrap();
     }
-    mgr.prefix.insert_prompt(&tokens, &seq_a);
+    mgr.prefix.insert_prompt(&mut mgr.pool, &tokens, &seq_a);
 
     let mut seq_b = mgr.new_sequence(64);
     assert_eq!(

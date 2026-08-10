@@ -4,13 +4,12 @@ use crate::architecture::{
     ArchitectureGenerationMode, ArchitecturePluginHandle, ArchitecturePreparation,
 };
 use crate::backend_select::{BackendPreference, BackendSelect};
-use crate::compiled::CompiledStep;
+use crate::compiled::{CompiledStep, MutableBinding};
 #[cfg(feature = "backend-cuda")]
 use crate::cuda_lowering::{LoweredDecodeGraph, compile_cuda_layout, lower_decode_graph};
-use crate::executor::MutableBinding;
 use crate::hybrid_state::HybridConvState;
 use crate::kv_cache::KvCache;
-use crate::paged::{CacheManager, SequenceCache};
+use crate::paged::{CacheManager, KvCacheConfig, KvMemoryPlan, PhysicalPool, SequenceCache};
 use crate::sampling;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
@@ -23,7 +22,8 @@ use fellm_graph::Graph;
 use fellm_graph::graph::OpValue;
 use fellm_graph::plan::ExecutionPlan;
 use fellm_model::{
-    ModelSpec, StepBindings, build_step_graph, collect_step_bindings, parse_assistant_output,
+    ModelSpec, StepBindings, build_batch_step_graph, build_step_graph, collect_step_bindings,
+    parse_assistant_output,
 };
 use fellm_plugin_abi::{
     AttentionDispatch, AttentionKernelPath, AttentionPathKind, Backend, DriverAction, DriverEvent,
@@ -32,6 +32,7 @@ use fellm_plugin_abi::{
 };
 use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -66,6 +67,8 @@ pub struct EngineSettings {
     pub providers: crate::providers::ProviderSelection,
     /// Optional plugin directory for dynamic capability plugins.
     pub plugin_dir: Option<std::path::PathBuf>,
+    /// Byte-oriented paged-KV allocation policy.
+    pub kv_cache: KvCacheConfig,
 }
 
 impl Default for EngineSettings {
@@ -78,6 +81,7 @@ impl Default for EngineSettings {
             backend: BackendSelect::from_env(),
             providers: crate::providers::ProviderSelection::new(),
             plugin_dir: None,
+            kv_cache: KvCacheConfig::default(),
         }
     }
 }
@@ -145,6 +149,12 @@ impl EngineSettings {
     #[must_use]
     pub fn plugin_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.plugin_dir = Some(dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn kv_cache(mut self, config: KvCacheConfig) -> Self {
+        self.kv_cache = config;
         self
     }
 
@@ -242,6 +252,8 @@ pub struct GenParams {
     pub seed: u64,
     /// Repetition penalty. Values <= 1.0 disable it.
     pub repetition_penalty: f32,
+    /// Scheduler priority; larger values are selected first within a work class.
+    pub priority: i32,
 }
 
 impl Default for GenParams {
@@ -253,6 +265,7 @@ impl Default for GenParams {
             top_p: 1.0,
             seed: 0,
             repetition_penalty: 1.05,
+            priority: 0,
         }
     }
 }
@@ -357,6 +370,10 @@ struct LoadedModel {
     bindings: StepBindings,
     /// Compiled step schedule, built once on first step and reused.
     compiled: Option<CompiledStep>,
+    /// Reusable physical-batch graphs keyed by row count (`<= n_ubatch`).
+    batches: HashMap<usize, CompiledBatch>,
+    /// Worst-case physical-batch arena reserved in KV budget calculations.
+    batch_activation_reserve: usize,
     /// Device-native physical plan. This owns stable decode arena/control
     /// allocations and is the replacement execution path for `CompiledStep`.
     #[cfg(feature = "backend-cuda")]
@@ -369,6 +386,26 @@ struct LoadedModel {
     /// Reused self-conditioning input storage.  Sparse mode is normally only
     /// a few hundred KiB; dense mode remains available as an explicit fallback.
     self_conditioning_buffer: Option<Rc<RefCell<AlignedBuffer>>>,
+}
+
+struct CompiledBatch {
+    graph: Graph,
+    bindings: StepBindings,
+    step: CompiledStep,
+    conv_buffers: Vec<Rc<RefCell<AlignedBuffer>>>,
+}
+
+/// One token row in a physical inference batch.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchToken {
+    /// Index into the sequence-cache slice passed to [`Engine::step_batch`].
+    pub sequence: usize,
+    /// Input token id.
+    pub token: u32,
+    /// Absolute model position used by RoPE.
+    pub position: usize,
+    /// Whether the caller needs this row's logits.
+    pub compute_logits: bool,
 }
 
 #[cfg(feature = "backend-cuda")]
@@ -476,7 +513,16 @@ impl Engine {
         }
         let architecture_program = preparation.as_ref().map(|p| p.program.clone());
         let n_attn_layers = spec.n_attn_layers().max(1);
-        let mut model = LoadedModel::new(&gguf, spec, max_seq, model_max_ctx, preparation)?;
+        let mut model = LoadedModel::new(
+            &gguf,
+            spec,
+            max_seq,
+            model_max_ctx,
+            preparation,
+            &settings.kv_cache,
+            backend.memory_info(),
+            n_ubatch,
+        )?;
 
         // B2: size VRAM KV arena to match the host PhysicalPool.
         #[cfg(feature = "backend-cuda")]
@@ -511,6 +557,7 @@ impl Engine {
                 backend: settings.backend,
                 providers: settings.providers.clone(),
                 plugin_dir: settings.plugin_dir.clone(),
+                kv_cache: settings.kv_cache.clone(),
             },
             providers,
             seq_attn: SequenceAttentionState::new(n_attn_layers),
@@ -867,6 +914,7 @@ impl Engine {
             finished: false,
             stop_token_ids,
             generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            sampling: sampling::SamplingWorkspace::default(),
             stats: GenStats {
                 prompt_tokens: ids.len() as u32,
                 predicted_tokens: 0,
@@ -1024,6 +1072,7 @@ impl Engine {
             finished: false,
             stop_token_ids,
             generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            sampling: sampling::SamplingWorkspace::default(),
             stats: GenStats {
                 prompt_tokens: ids.len() as u32,
                 predicted_tokens: 0,
@@ -1077,6 +1126,60 @@ impl Engine {
         self.model.cache.pool.free_count()
     }
 
+    #[must_use]
+    pub fn backend_memory_info(&self) -> Option<fellm_plugin_abi::DeviceMemoryInfo> {
+        self.backend.memory_info()
+    }
+
+    #[must_use]
+    pub fn model_bytes(&self) -> u64 {
+        self.gguf.tensors().fold(0u64, |total, tensor| {
+            total.saturating_add(tensor.dtype.byte_size(tensor.shape.num_elements()) as u64)
+        })
+    }
+
+    #[must_use]
+    pub fn activation_arena_bytes(&self) -> usize {
+        self.model
+            .step_plan
+            .memory
+            .arena_bytes
+            .saturating_add(
+                self.model
+                    .canvas_plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.memory.arena_bytes),
+            )
+            .saturating_add(self.model.batch_activation_reserve)
+    }
+
+    #[must_use]
+    pub fn cache_total_blocks(&self) -> usize {
+        self.model.cache.pool.n_blocks()
+    }
+
+    #[must_use]
+    pub fn cache_bytes(&self) -> usize {
+        self.model
+            .cache
+            .pool
+            .n_blocks()
+            .saturating_mul(self.model.cache.pool.block_bytes())
+    }
+
+    #[must_use]
+    pub fn prefix_cache_stats(&self) -> crate::paged::PrefixCacheStats {
+        self.model.cache.prefix.stats()
+    }
+
+    /// Reclaim idle cached prefixes, preserving every active sequence reference.
+    pub fn evict_prefixes_for_blocks(&mut self, required_free: usize) -> usize {
+        self.model
+            .cache
+            .prefix
+            .evict_until(&mut self.model.cache.pool, required_free)
+    }
+
     /// Attach radix-prefix blocks for `ids` onto `seq_cache`. Returns matched token count.
     ///
     /// Matched tokens become **immutable shared prefix** (`shared_prefix_len`);
@@ -1116,18 +1219,45 @@ impl Engine {
         {
             cuda.sync_kv_device_to_host(self.model.cache.pool.arena_bytes_mut())?;
         }
-        self.model.cache.prefix.insert_prompt(ids, seq_cache);
+        self.model
+            .cache
+            .prefix
+            .insert_prompt(&mut self.model.cache.pool, ids, seq_cache);
         Ok(())
     }
 
     /// Ensure `pos` is writable in `seq_cache` (alloc / `CoW`).
     pub fn ensure_seq_writable(&mut self, seq_cache: &mut SequenceCache, pos: usize) -> Result<()> {
-        self.model.cache.ensure_writable(seq_cache, pos)
+        match self.model.cache.ensure_writable(seq_cache, pos) {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                let required = self.model.spec.n_attn_layers().max(1);
+                if self.evict_prefixes_for_blocks(required) == 0 {
+                    return Err(first);
+                }
+                self.model.cache.ensure_writable(seq_cache, pos)
+            }
+        }
     }
 
     /// Release physical refs held by a sequence cache.
     pub fn release_seq_cache(&mut self, seq_cache: &mut SequenceCache) {
         self.model.cache.release_sequence(seq_cache);
+    }
+
+    /// Allocate isolated recurrent state for one scheduled sequence.
+    pub fn new_hybrid_state(&self) -> Result<Option<HybridConvState>> {
+        self.model
+            .spec
+            .is_hybrid()
+            .then(|| {
+                HybridConvState::new(
+                    &self.model.spec.layer_kv_heads_for_state(),
+                    self.model.spec.d_model,
+                    self.model.spec.shortconv_l_cache,
+                )
+            })
+            .transpose()
     }
 
     /// Swap a sequence's blocks to secondary RAM.
@@ -1170,6 +1300,7 @@ impl Engine {
 
     /// Restore a swapped sequence's blocks.
     pub fn swap_in_sequence(&mut self, seq_cache: &mut SequenceCache) -> Result<()> {
+        metrics::counter!("fellm_kv_swap_in_total").increment(1);
         let mut buf = vec![0u8; self.model.cache.pool.block_bytes()];
         for layer in 0..seq_cache.n_layers() {
             let n = seq_cache.table(layer).num_blocks();
@@ -1215,6 +1346,42 @@ impl Engine {
         std::mem::swap(&mut self.model.seq, seq_cache);
         result
     }
+
+    /// Run one forward step with request-owned recurrent state.
+    pub fn step_sequence_state(
+        &mut self,
+        seq_cache: &mut SequenceCache,
+        conv: &mut Option<HybridConvState>,
+        tok: u32,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<Tensor> {
+        std::mem::swap(&mut self.model.seq, seq_cache);
+        std::mem::swap(&mut self.model.conv, conv);
+        let result = self
+            .model
+            .step(self.backend.as_ref(), tok, pos, compute_logits);
+        std::mem::swap(&mut self.model.conv, conv);
+        std::mem::swap(&mut self.model.seq, seq_cache);
+        result
+    }
+
+    /// Execute token rows from several sequence caches as one graph batch.
+    /// Rows may also refer to the same sequence, enabling chunked prefill.
+    pub fn step_batch(
+        &mut self,
+        sequences: &mut [&mut SequenceCache],
+        conv_states: &mut [&mut Option<HybridConvState>],
+        rows: &[BatchToken],
+    ) -> Result<Vec<Option<Tensor>>> {
+        self.model.step_batch(
+            &self.gguf,
+            self.backend.as_ref(),
+            sequences,
+            conv_states,
+            rows,
+        )
+    }
 }
 
 impl LoadedModel {
@@ -1224,32 +1391,11 @@ impl LoadedModel {
         max_seq: usize,
         model_max_ctx: usize,
         preparation: Option<ArchitecturePreparation>,
+        kv_config: &KvCacheConfig,
+        memory_info: Option<fellm_plugin_abi::DeviceMemoryInfo>,
+        physical_batch: usize,
     ) -> Result<Self> {
         let n_attn = spec.n_attn_layers().max(1);
-        let cache = CacheManager::with_capacity(
-            max_seq,
-            n_attn,
-            spec.n_kv_heads.max(1),
-            spec.head_dim.max(1),
-            4,
-        )?;
-        let seq = cache.new_sequence(max_seq);
-        let dummy_kv = KvCache::new(
-            n_attn,
-            max_seq.max(1),
-            spec.n_kv_heads.max(1),
-            spec.head_dim.max(1),
-        )?;
-        let conv = if spec.is_hybrid() {
-            Some(HybridConvState::new(
-                &spec.layer_kv_heads_for_state(),
-                spec.d_model,
-                spec.shortconv_l_cache,
-            )?)
-        } else {
-            None
-        };
-
         let step_graph = build_step_graph(gguf, &spec)?;
         let step_plan = ExecutionPlan::from_graph(&step_graph)?;
         let bindings = collect_step_bindings(&step_graph);
@@ -1285,6 +1431,73 @@ impl LoadedModel {
         } else {
             None
         };
+        let weights_bytes = gguf.tensors().fold(0u64, |total, tensor| {
+            total.saturating_add(tensor.dtype.byte_size(tensor.shape.num_elements()) as u64)
+        });
+        let batch_activation_reserve = if spec.is_hybrid() || physical_batch <= 1 {
+            0
+        } else {
+            let graph = build_batch_step_graph(gguf, &spec, physical_batch)?;
+            ExecutionPlan::from_graph(&graph)?
+                .memory
+                .arena_bytes
+                .saturating_mul(2)
+        };
+        let activation_bytes = (step_plan.memory.arena_bytes as u64)
+            .saturating_add(
+                canvas_plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.memory.arena_bytes as u64),
+            )
+            .saturating_add(
+                self_conditioning_buffer
+                    .as_ref()
+                    .map_or(0, |buffer| buffer.borrow().len() as u64),
+            )
+            .saturating_add(batch_activation_reserve as u64);
+        let block_bytes =
+            PhysicalPool::block_bytes_for(spec.n_kv_heads.max(1), spec.head_dim.max(1));
+        let memory_plan = KvMemoryPlan::resolve(
+            kv_config,
+            memory_info,
+            weights_bytes,
+            activation_bytes,
+            block_bytes,
+            n_attn,
+        )?;
+        let cache = CacheManager::new(
+            memory_plan.blocks,
+            n_attn,
+            spec.n_kv_heads.max(1),
+            spec.head_dim.max(1),
+            memory_plan.swap_blocks,
+        )?;
+        let seq = cache.new_sequence(max_seq);
+        let dummy_kv = KvCache::new(
+            n_attn,
+            max_seq.max(1),
+            spec.n_kv_heads.max(1),
+            spec.head_dim.max(1),
+        )?;
+        let conv = if spec.is_hybrid() {
+            Some(HybridConvState::new(
+                &spec.layer_kv_heads_for_state(),
+                spec.d_model,
+                spec.shortconv_l_cache,
+            )?)
+        } else {
+            None
+        };
+        tracing::info!(
+            weights_bytes = memory_plan.weights_bytes,
+            activation_bytes = memory_plan.activation_bytes,
+            kv_block_bytes = memory_plan.block_bytes,
+            kv_blocks = memory_plan.blocks,
+            kv_bytes = memory_plan.kv_bytes,
+            swap_bytes = memory_plan.swap_bytes,
+            remaining_reserve_bytes = ?memory_plan.remaining_reserve_bytes,
+            "resolved runtime memory budget"
+        );
         tracing::info!(
             nodes = step_graph.node_count(),
             rope = bindings.rope.len(),
@@ -1309,6 +1522,8 @@ impl LoadedModel {
             step_plan,
             bindings,
             compiled: None,
+            batches: HashMap::new(),
+            batch_activation_reserve,
             #[cfg(feature = "backend-cuda")]
             cuda_decode: None,
             canvas_graph,
@@ -1428,16 +1643,13 @@ impl LoadedModel {
             self.cuda_decode.as_ref(),
             self.compiled.as_ref(),
         ) {
-            let mut bound = std::collections::HashSet::new();
             for (id, host_ptr, byte_len) in compiled.arena_bindings() {
                 let Some(device_tensor) = plan.tensors.get(&id) else {
                     continue;
                 };
-                // In-place semantic nodes share one host allocation. Register it once;
-                // all aliases consequently use exactly one stable device address.
-                if bound.insert(host_ptr as usize) {
-                    cuda.register_device_tensor(host_ptr, byte_len, device_tensor.ptr)?;
-                }
+                // One arena offset can host differently-sized tensors at
+                // non-overlapping lifetimes; register each typed byte view.
+                cuda.register_device_tensor(host_ptr, byte_len, device_tensor.ptr)?;
             }
         }
         if let (Some(graph), Some(plan)) = (&self.canvas_graph, &self.canvas_plan) {
@@ -1449,6 +1661,232 @@ impl LoadedModel {
             )?);
         }
         Ok(())
+    }
+
+    fn compile_batch(&mut self, gguf: &GgufFile, backend: &dyn Backend, rows: usize) -> Result<()> {
+        if self.batches.contains_key(&rows) {
+            return Ok(());
+        }
+        if self.batches.len() >= 2
+            && let Some(evicted) = self.batches.keys().copied().next()
+        {
+            self.batches.remove(&evicted);
+        }
+        let graph = build_batch_step_graph(gguf, &self.spec, rows)?;
+        let plan = ExecutionPlan::from_graph(&graph)?;
+        let bindings = collect_step_bindings(&graph);
+        let mut mutable_inputs = HashMap::new();
+        let mut conv_buffers = Vec::new();
+        let dim = self.dummy_kv.tokens_stride;
+        let shape = Shape::new(&[self.dummy_kv.max_seq as u64, dim as u64])?;
+        for layer in 0..self.spec.n_attn_layers() {
+            mutable_inputs.insert(
+                format!("k_in_{layer}"),
+                MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.dummy_kv.k_buffer(layer),
+                },
+            );
+            mutable_inputs.insert(
+                format!("v_in_{layer}"),
+                MutableBinding {
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                    buffer: self.dummy_kv.v_buffer(layer),
+                },
+            );
+        }
+        if self.spec.is_hybrid() {
+            let elements = self.spec.shortconv_l_cache.saturating_sub(1) * self.spec.d_model;
+            for conv_ord in 0..self.spec.n_conv_layers() {
+                let buffer = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(
+                    rows.saturating_mul(elements).saturating_mul(4),
+                    64,
+                )));
+                mutable_inputs.insert(
+                    format!("conv_in_{conv_ord}"),
+                    MutableBinding {
+                        dtype: DType::F32,
+                        shape: Shape::new(&[rows as u64, elements as u64])?,
+                        buffer: buffer.clone(),
+                    },
+                );
+                conv_buffers.push(buffer);
+            }
+        }
+        let step = CompiledStep::compile(&graph, &plan, backend, &mutable_inputs)?;
+        self.batches.insert(
+            rows,
+            CompiledBatch {
+                graph,
+                bindings,
+                step,
+                conv_buffers,
+            },
+        );
+        Ok(())
+    }
+
+    fn step_batch(
+        &mut self,
+        gguf: &GgufFile,
+        backend: &dyn Backend,
+        sequences: &mut [&mut SequenceCache],
+        conv_states: &mut [&mut Option<HybridConvState>],
+        rows: &[BatchToken],
+    ) -> Result<Vec<Option<Tensor>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.compile_batch(gguf, backend, rows.len())?;
+        if self.spec.is_hybrid() {
+            let elements = self.spec.shortconv_l_cache.saturating_sub(1) * self.spec.d_model;
+            let batch = self.batches.get_mut(&rows.len()).expect("compiled batch");
+            for (conv_ord, packed) in batch.conv_buffers.iter().enumerate() {
+                let mut packed = packed.borrow_mut();
+                for (batch_row, row) in rows.iter().enumerate() {
+                    let state = conv_states
+                        .get(row.sequence)
+                        .and_then(|state| state.as_ref())
+                        .ok_or_else(|| FellmError::other("missing per-sequence ShortConv state"))?;
+                    let source = state.conv_buffer(conv_ord);
+                    let source = source.borrow();
+                    let start = batch_row * elements * 4;
+                    packed.as_mut_slice()[start..start + elements * 4]
+                        .copy_from_slice(source.as_slice());
+                }
+            }
+        }
+        let mut row_positions = Vec::with_capacity(rows.len());
+        let mut row_lengths = Vec::with_capacity(rows.len());
+        let mut rope_positions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sequence = sequences
+                .get_mut(row.sequence)
+                .ok_or_else(|| FellmError::other("batch sequence index out of bounds"))?;
+            let kv_position = if sequence.is_compressed() {
+                sequence.kv_write_index()
+            } else {
+                row.position
+            };
+            self.cache.ensure_writable(sequence, kv_position)?;
+            if sequence.is_compressed() {
+                if sequence.original_positions.len() == kv_position {
+                    sequence.original_positions.push(row.position as u32);
+                } else if kv_position < sequence.original_positions.len() {
+                    sequence.original_positions[kv_position] = row.position as u32;
+                } else {
+                    return Err(FellmError::other(
+                        "compressed batch KV position skipped its live index",
+                    ));
+                }
+            }
+            sequence.absolute_pos = row.position + 1;
+            row_positions.push(kv_position as u32);
+            row_lengths.push(sequence.len_tokens as u32);
+            rope_positions.push(row.position as u32);
+        }
+        self.cache.tick();
+
+        let n_logical = sequences[0].table(0).num_blocks().max(1);
+        let mut block_tables =
+            Vec::with_capacity(rows.len() * self.cache.pool.n_layers() * n_logical);
+        for row in rows {
+            let sequence = &sequences[row.sequence];
+            if sequence.table(0).num_blocks().max(1) != n_logical {
+                return Err(FellmError::other("batch block-table widths differ"));
+            }
+            block_tables.extend(sequence.flatten_block_tables());
+        }
+        let (device_arena, device_arena_len) = {
+            #[cfg(feature = "backend-cuda")]
+            {
+                if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+                    cuda.sync_kv_if_dirty(self.cache.pool.arena_bytes())?;
+                    if cuda.plugins_enabled() {
+                        cuda.device_kv_ptr().unwrap_or((std::ptr::null_mut(), 0))
+                    } else {
+                        (std::ptr::null_mut(), 0)
+                    }
+                } else {
+                    (std::ptr::null_mut(), 0)
+                }
+            }
+            #[cfg(not(feature = "backend-cuda"))]
+            {
+                (std::ptr::null_mut(), 0usize)
+            }
+        };
+        let (arena, arena_len) = self.cache.pool.arena_ptr_mut();
+        set_paged_context(Some(PagedKvContext {
+            arena,
+            arena_len,
+            block_table: Arc::from(block_tables),
+            n_logical_blocks: n_logical,
+            n_layers: self.cache.pool.n_layers(),
+            tokens_stride: self.cache.pool.tokens_stride(),
+            block_bytes: self.cache.pool.block_bytes(),
+            block_size: crate::paged::BLOCK_SIZE,
+            elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
+            device_arena,
+            device_arena_len,
+            row_positions: Arc::from(row_positions),
+            row_lengths: Arc::from(row_lengths),
+            row_rope_positions: Arc::from(rope_positions),
+        }));
+
+        backend.begin_step();
+        let result = (|| {
+            let batch = self.batches.get_mut(&rows.len()).expect("compiled batch");
+            for &id in &batch.bindings.rope {
+                let attrs = batch.graph.node(id).attrs;
+                batch.step.set_attrs(id, attrs);
+            }
+            for &id in &batch.bindings.kv_write {
+                let mut attrs = batch.graph.node(id).attrs;
+                attrs.block_size = crate::paged::BLOCK_SIZE as u32;
+                batch.step.set_attrs(id, attrs);
+            }
+            for &id in &batch.bindings.attention {
+                let mut attrs = batch.graph.node(id).attrs;
+                attrs.block_size = crate::paged::BLOCK_SIZE as u32;
+                attrs.query_len = rows.len() as u32;
+                attrs.custom_op_id = fellm_plugin_abi::attention_dispatch().prefill.as_u32();
+                batch.step.set_attrs(id, attrs);
+            }
+            batch.step.bind_input(
+                "token_id",
+                u32_tensor(&rows.iter().map(|row| row.token).collect::<Vec<_>>())?,
+            );
+            let logits = batch
+                .step
+                .run(backend, rows.iter().any(|row| row.compute_logits))?;
+            let outputs = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| row.compute_logits.then(|| logits.row(index)).transpose())
+                .collect::<Result<Vec<_>>>()?;
+            if self.spec.is_hybrid() {
+                let elements = self.spec.shortconv_l_cache.saturating_sub(1) * self.spec.d_model;
+                for (conv_ord, packed) in batch.conv_buffers.iter().enumerate() {
+                    let packed = packed.borrow();
+                    for (batch_row, row) in rows.iter().enumerate() {
+                        let state = conv_states[row.sequence].as_mut().expect("validated state");
+                        let target = state.conv_buffer(conv_ord);
+                        let mut target = target.borrow_mut();
+                        let start = batch_row * elements * 4;
+                        target
+                            .as_mut_slice()
+                            .copy_from_slice(&packed.as_slice()[start..start + elements * 4]);
+                    }
+                }
+            }
+            Ok(outputs)
+        })();
+        backend.end_step();
+        set_paged_context(None);
+        result
     }
 
     fn reset(&mut self) {
@@ -1532,6 +1970,9 @@ impl LoadedModel {
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
+            row_positions: std::sync::Arc::from([kv_pos as u32]),
+            row_lengths: std::sync::Arc::from([self.seq.len_tokens as u32]),
+            row_rope_positions: std::sync::Arc::from([pos as u32]),
         }));
 
         #[cfg(feature = "backend-cuda")]
@@ -1662,6 +2103,9 @@ impl LoadedModel {
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
+            row_positions: std::sync::Arc::from([prompt_len as u32]),
+            row_lengths: std::sync::Arc::from([prompt_len as u32]),
+            row_rope_positions: std::sync::Arc::from([prompt_len as u32]),
         }));
         backend.begin_step();
         let result = (|| {
@@ -1709,12 +2153,6 @@ impl LoadedModel {
         set_paged_context(None);
         result
     }
-
-    /// Access the shared cache manager (scheduler / multi-seq).
-    #[allow(dead_code)]
-    fn cache_mut(&mut self) -> &mut CacheManager {
-        &mut self.cache
-    }
 }
 
 /// A streaming generator.
@@ -1728,6 +2166,7 @@ pub struct TokenStream<'a> {
     finished: bool,
     stop_token_ids: Vec<u32>,
     generated_tokens: Vec<u32>,
+    sampling: sampling::SamplingWorkspace,
     stats: GenStats,
     gen_start: Instant,
     first_token_at: Option<Instant>,
@@ -1827,35 +2266,25 @@ impl Iterator for TokenStream<'_> {
         }
         let tok = if let Some(token) = device_token {
             token
-        } else if let Ok(work) = logits_owned.as_mut_slice::<f32>() {
-            sampling::sample(
-                work,
-                self.params.temperature,
-                self.params.top_k,
-                self.params.top_p,
-                self.params.seed.wrapping_add(u64::from(self.emitted)),
-                self.params.repetition_penalty,
-                &self.generated_tokens,
-            )
         } else {
-            // Fallback if storage is shared / non-owned (should not happen
-            // on the compiled path).
             let logits = match logits_owned.as_slice::<f32>() {
-                Ok(s) => s,
-                Err(e) => {
+                Ok(logits) => logits,
+                Err(error) => {
                     self.finished = true;
-                    return Some(Err(e));
+                    return Some(Err(error));
                 }
             };
-            let mut work = logits.to_vec();
-            sampling::sample(
-                &mut work,
-                self.params.temperature,
-                self.params.top_k,
-                self.params.top_p,
-                self.params.seed.wrapping_add(u64::from(self.emitted)),
-                self.params.repetition_penalty,
-                &self.generated_tokens,
+            sampling::sample_with_workspace(
+                logits,
+                sampling::SamplingOptions {
+                    temperature: self.params.temperature,
+                    top_k: self.params.top_k,
+                    top_p: self.params.top_p,
+                    seed: self.params.seed.wrapping_add(u64::from(self.emitted)),
+                    repetition_penalty: self.params.repetition_penalty,
+                    recent_tokens: &self.generated_tokens,
+                },
+                &mut self.sampling,
             )
         };
         self.generated_tokens.push(tok);

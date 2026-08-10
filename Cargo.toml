@@ -73,6 +73,10 @@ axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
+tokio-util = "0.7"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 async-openai = { version = "0.41", default-features = false, features = [
   "chat-completion-types",
 ] }

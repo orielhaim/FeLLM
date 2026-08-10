@@ -490,6 +490,9 @@ mod tests {
             elem_bytes: 2,
             device_arena: std::ptr::null_mut(),
             device_arena_len: 0,
+            row_positions: std::sync::Arc::from([past as u32]),
+            row_lengths: std::sync::Arc::from([seq as u32]),
+            row_rope_positions: std::sync::Arc::from([past as u32]),
         }));
 
         let mut out_paged = vec![0.0f32; n_heads * head_dim];

@@ -292,21 +292,24 @@ pub unsafe extern "C" fn launch_rope(
         if x.len() != out.len() {
             return Err(-2);
         }
+        let batch = host_paged_snapshot().filter(|snapshot| snapshot.batch_size > 1);
         // Host-side pre-RoPE key snapshot before device rotation (device-resident
         // path still uses device rope; scoring policies read this host mirror).
         if attrs.custom_op_id == 1 {
             let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
             if row_width > 0 && !x.is_empty() {
-                let row = if x.len() >= row_width {
-                    &x[x.len() - row_width..]
-                } else {
-                    x
-                };
-                fellm_plugin_abi::pre_rope_write(
-                    attrs.layer_ord as usize,
-                    attrs.position as usize,
-                    row,
-                );
+                for row in 0..x.len() / row_width {
+                    let position = batch
+                        .as_ref()
+                        .map_or(attrs.position + row as u32, |snapshot| unsafe {
+                            *snapshot.row_rope_positions.add(row)
+                        });
+                    fellm_plugin_abi::pre_rope_write(
+                        attrs.layer_ord as usize,
+                        position as usize,
+                        &x[row * row_width..(row + 1) * row_width],
+                    );
+                }
             }
         }
         let n = x.len();
@@ -319,21 +322,46 @@ pub unsafe extern "C" fn launch_rope(
         let (fd, _) = buffers::take_f32(f_key)?;
         let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
-        let rc = unsafe {
-            module
-                .rope(
+        let rc = if let Some(snapshot) = batch {
+            let positions = unsafe {
+                std::slice::from_raw_parts(snapshot.row_rope_positions, snapshot.batch_size)
+            };
+            let p_key = buffers::ensure_u32(&stream, positions)?;
+            let pd = buffers::take_u32(p_key)?;
+            let result = unsafe {
+                module.rope_batch(
                     &stream,
                     cfg_1d(n as u32),
                     &xd,
                     &fd,
+                    &pd,
                     attrs.n_heads,
                     attrs.head_dim,
                     attrs.rope_dim,
-                    attrs.position as f32,
                     n as u32,
                     &mut od,
                 )
                 .map_err(|_| -4)
+            };
+            buffers::put_u32(p_key, pd)?;
+            result
+        } else {
+            unsafe {
+                module
+                    .rope(
+                        &stream,
+                        cfg_1d(n as u32),
+                        &xd,
+                        &fd,
+                        attrs.n_heads,
+                        attrs.head_dim,
+                        attrs.rope_dim,
+                        attrs.position as f32,
+                        n as u32,
+                        &mut od,
+                    )
+                    .map_err(|_| -4)
+            }
         };
         buffers::put_f32(x_key, xd, true)?;
         buffers::put_f32(f_key, fd, true)?;
@@ -452,32 +480,37 @@ pub unsafe extern "C" fn launch_embedding_f32(
         if ids.is_empty() {
             return Err(-2);
         }
-        let token_id = ids[0];
         let out = f32_slice_mut(out_t)?;
-        if out.len() != dim || table.len() < (token_id as usize + 1) * dim {
+        if out.len() != ids.len() * dim
+            || table.len() < (ids.iter().copied().max().unwrap_or(0) as usize + 1) * dim
+        {
             return Err(-2);
         }
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
         // Weight table: cache via ensure_f32 (stable host ptr).
         let w_key = buffers::ensure_f32(&stream, table, false)?;
+        let i_key = buffers::ensure_u32(&stream, ids)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let (wd, _) = buffers::take_f32(w_key)?;
+        let id = buffers::take_u32(i_key)?;
         let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
         let rc = unsafe {
             module
-                .embedding_f32(
+                .embedding_f32_rows(
                     &stream,
-                    cfg_1d(dim as u32),
+                    cfg_1d(out.len() as u32),
                     &wd,
-                    token_id,
+                    &id,
+                    ids.len() as u32,
                     dim as u32,
                     &mut od,
                 )
                 .map_err(|_| -4)
         };
         buffers::put_f32(w_key, wd, true)?;
+        buffers::put_u32(i_key, id)?;
         buffers::put_f32(o_key, od, false)?;
         rc?;
         finish_out(&stream, o_key, out, false)
@@ -517,13 +550,12 @@ pub unsafe extern "C" fn launch_embedding_q4k(
         if ids.is_empty() {
             return Err(-2);
         }
-        let token_id = ids[0];
         let out = f32_slice_mut(out_t)?;
-        if out.len() != dim {
+        if out.len() != ids.len() * dim {
             return Err(-2);
         }
         let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
-        let need = (token_id as usize + 1) * row_bytes;
+        let need = (ids.iter().copied().max().unwrap_or(0) as usize + 1) * row_bytes;
         if wb.len() < need {
             return Err(-2);
         }
@@ -531,22 +563,26 @@ pub unsafe extern "C" fn launch_embedding_q4k(
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
         let w_key = buffers::ensure_weight(&stream, wb)?;
+        let i_key = buffers::ensure_u32(&stream, ids)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let id = buffers::take_u32(i_key)?;
         let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
         let rc = buffers::with_weight(w_key, |wd| unsafe {
             module
-                .embedding_q4k_row(
+                .embedding_q4k_rows(
                     &stream,
-                    cfg_1d(dim as u32),
+                    cfg_1d(out.len() as u32),
                     wd,
-                    token_id,
+                    &id,
+                    ids.len() as u32,
                     dim as u32,
                     n_blocks,
                     &mut od,
                 )
                 .map_err(|_| -4)
         });
+        buffers::put_u32(i_key, id)?;
         buffers::put_f32(o_key, od, false)?;
         rc??;
         finish_out(&stream, o_key, out, false)
@@ -885,13 +921,14 @@ pub unsafe extern "C" fn launch_shortconv_q4k(
         let conv = f32_slice(conv_t)?;
         let y = f32_slice_mut(y_t)?;
         let state = f32_slice_mut(state_t)?;
-        if x.len() != n
-            || y.len() != n
+        if !x.len().is_multiple_of(n)
+            || y.len() != x.len()
             || conv.len() != n * l_cache
-            || state.len() != (l_cache - 1) * n
+            || state.len() != x.len() / n * (l_cache - 1) * n
         {
             return Err(-2);
         }
+        let rows = x.len() / n;
         let in_w = bytes_slice(in_w_t);
         let out_w = bytes_slice(out_w_t);
         let blocks = (n / Q4K_BLOCK_ELEMS as usize) as u32;
@@ -907,25 +944,27 @@ pub unsafe extern "C" fn launch_shortconv_q4k(
         let out_w_key = buffers::ensure_weight(&stream, out_w)?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let conv_key = buffers::ensure_f32(&stream, conv, false)?;
-        let state_key = buffers::ensure_f32(&stream, state, false)?;
+        // Scheduler batches repack request-owned recurrent state into row slots,
+        // so the host buffer is authoritative at every batch boundary.
+        let state_key = buffers::ensure_f32(&stream, state, true)?;
         let y_key = buffers::ensure_f32_out(&stream, y)?;
         let (xd, _) = buffers::take_f32(x_key)?;
         let (convd, _) = buffers::take_f32(conv_key)?;
         let (mut stated, _) = buffers::take_f32(state_key)?;
         let (mut yd, _) = buffers::take_f32(y_key)?;
-        let mut bcx = buffers::take_scratch_f32(&stream, 3 * n)?;
-        let mut y_pre = buffers::take_scratch_f32(&stream, n)?;
+        let mut bcx = buffers::take_scratch_f32(&stream, 3 * n * rows)?;
+        let mut y_pre = buffers::take_scratch_f32(&stream, n * rows)?;
 
         let first = buffers::with_weight(in_w_key, |wd| unsafe {
             module
                 .q4k_gemv_row(
                     &stream,
-                    cfg_1d((3 * n) as u32),
+                    cfg_1d((3 * n * rows) as u32),
                     wd,
                     &xd,
                     (3 * n) as u32,
                     blocks,
-                    1,
+                    rows as u32,
                     &mut bcx,
                 )
                 .map_err(|_| -4)
@@ -933,14 +972,15 @@ pub unsafe extern "C" fn launch_shortconv_q4k(
         first??;
         unsafe {
             module
-                .shortconv_mix(
+                .shortconv_mix_rows(
                     &stream,
-                    cfg_1d(n as u32),
+                    cfg_1d((n * rows) as u32),
                     &bcx,
                     &convd,
                     &mut stated,
                     n as u32,
                     l_cache as u32,
+                    rows as u32,
                     &mut y_pre,
                 )
                 .map_err(|_| -4)?;
@@ -949,12 +989,12 @@ pub unsafe extern "C" fn launch_shortconv_q4k(
             module
                 .q4k_gemv_row(
                     &stream,
-                    cfg_1d(n as u32),
+                    cfg_1d((n * rows) as u32),
                     wd,
                     &y_pre,
                     n as u32,
                     blocks,
-                    1,
+                    rows as u32,
                     &mut yd,
                 )
                 .map_err(|_| -4)
@@ -967,6 +1007,7 @@ pub unsafe extern "C" fn launch_shortconv_q4k(
         buffers::put_scratch_f32(y_pre)?;
         last??;
         buffers::mark_valid(state_key)?;
+        finish_out(&stream, state_key, state, false)?;
         finish_out(&stream, y_key, y, false)
     })
 }
@@ -2106,31 +2147,39 @@ pub unsafe extern "C" fn launch_embedding_q8_0(
             return Err(-2);
         }
         let out = f32_slice_mut(out_t)?;
-        if out.len() != dim {
+        if out.len() != ids.len() * dim {
             return Err(-2);
         }
         let wb = bytes_slice(w_t);
-        if wb.len() < (ids[0] as usize + 1) * n_blocks * Q8_0_BLOCK_BYTES as usize {
+        if wb.len()
+            < (ids.iter().copied().max().unwrap_or(0) as usize + 1)
+                * n_blocks
+                * Q8_0_BLOCK_BYTES as usize
+        {
             return Err(-2);
         }
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
         let w_key = buffers::ensure_weight(&stream, wb)?;
+        let i_key = buffers::ensure_u32(&stream, ids)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let id = buffers::take_u32(i_key)?;
         let (mut od, _) = buffers::take_f32(o_key)?;
         let rc = buffers::with_weight(w_key, |wd| unsafe {
             oxide_module()
-                .embedding_q8_0_row(
+                .embedding_q8_0_rows(
                     &stream,
-                    cfg_1d(dim as u32),
+                    cfg_1d(out.len() as u32),
                     wd,
-                    ids[0],
+                    &id,
+                    ids.len() as u32,
                     dim as u32,
                     n_blocks as u32,
                     &mut od,
                 )
                 .map_err(|_| -4)
         });
+        buffers::put_u32(i_key, id)?;
         buffers::put_f32(o_key, od, false)?;
         rc??;
         finish_out(&stream, o_key, out, false)
@@ -2234,6 +2283,67 @@ pub unsafe extern "C" fn launch_attention(
             buffers::put_f32(ok, od, false)?;
             rc?;
             return finish_out(&stream, ok, out, false);
+        }
+        if attrs.block_size > 0
+            && let Some(snap) = host_paged_snapshot()
+            && snap.batch_size > 1
+        {
+            let width = n_heads * head_dim;
+            if q.len() != snap.batch_size * width || out.len() != q.len() {
+                return Err(-2);
+            }
+            if snap.device_arena.is_null() || snap.device_arena_len == 0 {
+                return Err(-21);
+            }
+            let ctx = oxide_ctx();
+            let stream = oxide_stream().clone();
+            let table = unsafe { std::slice::from_raw_parts(snap.block_table, snap.n_block_table) };
+            let lengths = unsafe { std::slice::from_raw_parts(snap.row_lengths, snap.batch_size) };
+            let q_key = buffers::ensure_f32(&stream, q, false)?;
+            let table_key = buffers::ensure_block_table(&stream, table)?;
+            let lengths_key = buffers::ensure_u32(&stream, lengths)?;
+            let out_key = buffers::ensure_f32_out(&stream, out)?;
+            let (qd, _) = buffers::take_f32(q_key)?;
+            let table_device = buffers::take_u32(table_key)?;
+            let lengths_device = buffers::take_u32(lengths_key)?;
+            let (mut out_device, _) = buffers::take_f32(out_key)?;
+            let arena = unsafe {
+                buffers::wrap_device_bytes(
+                    snap.device_arena,
+                    snap.device_arena_len,
+                    std::sync::Arc::clone(ctx),
+                )
+            };
+            let result = unsafe {
+                oxide_module().attention_paged_batch_heads(
+                    &stream,
+                    cfg_1d((snap.batch_size * n_heads) as u32),
+                    &qd,
+                    &arena,
+                    &table_device,
+                    &lengths_device,
+                    snap.batch_size as u32,
+                    n_heads as u32,
+                    n_kv as u32,
+                    head_dim as u32,
+                    scale,
+                    attrs.layer_ord,
+                    snap.n_layers as u32,
+                    snap.n_logical_blocks as u32,
+                    snap.block_size as u32,
+                    snap.block_bytes as u32,
+                    snap.tokens_stride as u32,
+                    &mut out_device,
+                )
+                .map_err(|_| -4)
+            };
+            buffers::release_wrap(arena);
+            buffers::put_f32(q_key, qd, true)?;
+            buffers::put_u32(table_key, table_device)?;
+            buffers::put_u32(lengths_key, lengths_device)?;
+            buffers::put_f32(out_key, out_device, false)?;
+            result?;
+            return finish_out(&stream, out_key, out, false);
         }
         if q.len() != n_heads * head_dim || out.len() != n_heads * head_dim {
             eprintln!(
@@ -2479,6 +2589,88 @@ pub unsafe extern "C" fn launch_kv_write(
             return Err(-21);
         }
         let snap = host_paged_snapshot().ok_or(-20)?;
+        if snap.batch_size > 1 {
+            if row.len() != snap.batch_size * snap.tokens_stride {
+                return Err(-2);
+            }
+            let positions = unsafe {
+                std::slice::from_raw_parts(snap.row_positions, snap.batch_size)
+            };
+            if snap.device_arena.is_null() || snap.device_arena_len == 0 {
+                for (batch_row, (&position, values)) in positions
+                    .iter()
+                    .zip(row.chunks_exact(snap.tokens_stride))
+                    .enumerate()
+                {
+                    let logical = position as usize / snap.block_size;
+                    let slot = position as usize % snap.block_size;
+                    let phys = snap.physical_for(
+                        batch_row,
+                        attrs.layer_ord as usize,
+                        logical,
+                    ) as usize;
+                    let row_bytes = snap.tokens_stride * snap.elem_bytes;
+                    let v_base = if is_v { snap.block_size * row_bytes } else { 0 };
+                    let base = phys * snap.block_bytes + v_base + slot * row_bytes;
+                    if base + row_bytes > snap.arena_len {
+                        return Err(-22);
+                    }
+                    let destination = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            snap.arena.add(base) as *mut f16,
+                            snap.tokens_stride,
+                        )
+                    };
+                    for (destination, &source) in destination.iter_mut().zip(values) {
+                        *destination = f16::from_f32(source);
+                    }
+                }
+                return Ok(());
+            }
+            let ctx = oxide_ctx();
+            let stream = oxide_stream().clone();
+            let table = unsafe {
+                std::slice::from_raw_parts(snap.block_table, snap.n_block_table)
+            };
+            let row_key = buffers::ensure_f32(&stream, row, false)?;
+            let table_key = buffers::ensure_block_table(&stream, table)?;
+            let position_key = buffers::ensure_u32(&stream, positions)?;
+            let (row_device, _) = buffers::take_f32(row_key)?;
+            let table_device = buffers::take_u32(table_key)?;
+            let position_device = buffers::take_u32(position_key)?;
+            let mut arena = unsafe {
+                buffers::wrap_device_bytes(
+                    snap.device_arena,
+                    snap.device_arena_len,
+                    std::sync::Arc::clone(ctx),
+                )
+            };
+            let result = unsafe {
+                oxide_module().kv_write_batch(
+                    &stream,
+                    cfg_1d(row.len() as u32),
+                    &row_device,
+                    &mut arena,
+                    &table_device,
+                    &position_device,
+                    snap.batch_size as u32,
+                    attrs.layer_ord,
+                    snap.n_layers as u32,
+                    u32::from(is_v),
+                    snap.n_logical_blocks as u32,
+                    snap.tokens_stride as u32,
+                    snap.block_size as u32,
+                    snap.block_bytes as u32,
+                )
+                .map_err(|_| -4)
+            };
+            buffers::release_wrap(arena);
+            buffers::put_f32(row_key, row_device, true)?;
+            buffers::put_u32(table_key, table_device)?;
+            buffers::put_u32(position_key, position_device)?;
+            result?;
+            return Ok(());
+        }
         if row.len() > snap.tokens_stride {
             eprintln!(
                 "cuda_kernels: kv_write shape mismatch row={} stride={} layer={} position={}",

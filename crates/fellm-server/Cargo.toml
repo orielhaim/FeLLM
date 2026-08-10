@@ -33,7 +33,10 @@ axum.workspace = true
 tower-http.workspace = true
 futures-util.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 async-openai.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 [lints]
 workspace = true

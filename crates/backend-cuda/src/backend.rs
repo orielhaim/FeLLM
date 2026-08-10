@@ -356,6 +356,21 @@ impl Backend for CudaBackend {
         self.caps
     }
 
+    fn memory_info(&self) -> Option<fellm_plugin_abi::DeviceMemoryInfo> {
+        #[cfg(feature = "cuda")]
+        {
+            let (available, total) = self.device.context().mem_get_info().ok()?;
+            Some(fellm_plugin_abi::DeviceMemoryInfo {
+                total_bytes: total as u64,
+                available_bytes: available as u64,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     fn synchronize(&self) -> Result<()> {
         // No GPU work when plugins are off — skip driver sync.
         if !self.use_plugins {

@@ -51,7 +51,7 @@ impl Default for BlockDiffusionConfig {
 }
 
 /// Result of one sampler update.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SamplerStep {
     /// Updated canvas ids.
     pub canvas: Vec<u32>,
@@ -74,6 +74,9 @@ pub struct EntropyBoundSampler {
     previous_argmax: Vec<u32>,
     stable_steps: usize,
     rng: ChaCha8Rng,
+    /// Reused probability scratch; avoids one vocabulary-sized allocation per row.
+    weights: Vec<f32>,
+    positions: Vec<usize>,
 }
 
 impl EntropyBoundSampler {
@@ -85,6 +88,8 @@ impl EntropyBoundSampler {
             previous_argmax: Vec::new(),
             stable_steps: 0,
             rng: ChaCha8Rng::seed_from_u64(seed),
+            weights: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -111,6 +116,20 @@ impl EntropyBoundSampler {
         vocab_size: usize,
         step: usize,
     ) -> Result<SamplerStep> {
+        let mut output = SamplerStep::default();
+        self.step_into(current, logits, vocab_size, step, &mut output)?;
+        Ok(output)
+    }
+
+    /// Update a caller-owned result, reusing all canvas-sized scratch buffers.
+    pub fn step_into(
+        &mut self,
+        current: &[u32],
+        logits: &[f32],
+        vocab_size: usize,
+        step: usize,
+        output: &mut SamplerStep,
+    ) -> Result<()> {
         let n = self.config.canvas_length;
         if current.len() != n || logits.len() != n.saturating_mul(vocab_size) || vocab_size == 0 {
             return Err(FellmError::other(format!(
@@ -122,50 +141,52 @@ impl EntropyBoundSampler {
             )));
         }
         let temperature = self.temperature(step);
-        let mut candidates = vec![0u32; n];
-        let mut entropies = vec![0.0f32; n];
+        output.argmax.resize(n, 0);
+        output.entropy.resize(n, 0.0);
         for row in 0..n {
             let slice = &logits[row * vocab_size..(row + 1) * vocab_size];
-            let (candidate, entropy) = sample_row(slice, temperature, &mut self.rng);
-            candidates[row] = candidate;
-            entropies[row] = entropy;
+            let (candidate, entropy) =
+                sample_row(slice, temperature, &mut self.rng, &mut self.weights);
+            output.argmax[row] = candidate;
+            output.entropy[row] = entropy;
         }
 
-        let mut positions: Vec<usize> = (0..n).collect();
-        positions.sort_unstable_by(|&a, &b| entropies[a].total_cmp(&entropies[b]).then(a.cmp(&b)));
-        let mut accepted = vec![false; n];
+        self.positions.clear();
+        self.positions.extend(0..n);
+        self.positions.sort_unstable_by(|&a, &b| {
+            output.entropy[a]
+                .total_cmp(&output.entropy[b])
+                .then(a.cmp(&b))
+        });
+        output.accepted.clear();
+        output.accepted.resize(n, false);
         let mut cumulative = 0.0f32;
         let mut max_entropy = 0.0f32;
-        for position in positions {
-            cumulative += entropies[position];
-            max_entropy = max_entropy.max(entropies[position]);
+        for &position in &self.positions {
+            cumulative += output.entropy[position];
+            max_entropy = max_entropy.max(output.entropy[position]);
             if cumulative - max_entropy <= self.config.entropy_bound {
-                accepted[position] = true;
+                output.accepted[position] = true;
             }
         }
 
-        let mut next = current.to_vec();
-        for (i, accepted) in accepted.iter().copied().enumerate() {
-            next[i] = if accepted {
-                candidates[i]
+        output.canvas.clear();
+        output.canvas.extend_from_slice(current);
+        for (i, accepted) in output.accepted.iter().copied().enumerate() {
+            output.canvas[i] = if accepted {
+                output.argmax[i]
             } else {
                 self.rng.random_range(0..vocab_size) as u32
             };
         }
-        let same = self.previous_argmax == candidates;
+        let same = self.previous_argmax == output.argmax;
         self.stable_steps = if same { self.stable_steps + 1 } else { 0 };
-        self.previous_argmax = candidates.clone();
-        let mean_entropy = entropies.iter().sum::<f32>() / n.max(1) as f32;
-        let done = mean_entropy <= self.config.confidence_threshold
+        self.previous_argmax.clear();
+        self.previous_argmax.extend_from_slice(&output.argmax);
+        output.mean_entropy = output.entropy.iter().sum::<f32>() / n.max(1) as f32;
+        output.done = output.mean_entropy <= self.config.confidence_threshold
             && self.stable_steps >= self.config.stability_threshold.saturating_add(1);
-        Ok(SamplerStep {
-            canvas: next,
-            argmax: candidates,
-            accepted,
-            entropy: entropies,
-            mean_entropy,
-            done,
-        })
+        Ok(())
     }
 
     /// Linear temperature schedule, matching the HF implementation.
@@ -178,13 +199,16 @@ impl EntropyBoundSampler {
     }
 }
 
-fn sample_row(logits: &[f32], temperature: f32, rng: &mut ChaCha8Rng) -> (u32, f32) {
+fn sample_row(
+    logits: &[f32],
+    temperature: f32,
+    rng: &mut ChaCha8Rng,
+    weights: &mut Vec<f32>,
+) -> (u32, f32) {
     let inv_temperature = 1.0 / temperature.max(f32::EPSILON);
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut weights: Vec<f32> = logits
-        .iter()
-        .map(|v| ((*v - max) * inv_temperature).exp())
-        .collect();
+    weights.clear();
+    weights.extend(logits.iter().map(|v| ((*v - max) * inv_temperature).exp()));
     let sum = weights.iter().sum::<f32>();
     if !sum.is_finite() || sum <= 0.0 {
         let best = logits
@@ -194,7 +218,7 @@ fn sample_row(logits: &[f32], temperature: f32, rng: &mut ChaCha8Rng) -> (u32, f
             .map_or(0, |(i, _)| i);
         return (best as u32, 0.0);
     }
-    for weight in &mut weights {
+    for weight in weights.iter_mut() {
         *weight /= sum;
     }
     let entropy = weights
@@ -230,11 +254,13 @@ pub struct BlockDiffusionDriver {
     graphs: BlockDiffusionGraphs,
     request: GenerationRequest,
     sampler: EntropyBoundSampler,
+    sampler_step: SamplerStep,
     vocab_size: usize,
     canvas: Vec<u32>,
     emitted: Vec<u32>,
     commit_canvas: Vec<u32>,
     self_conditioning_logits: Vec<f32>,
+    self_conditioning_indices: Vec<usize>,
     denoise_step: usize,
     awaiting_commit: bool,
     done: bool,
@@ -270,6 +296,7 @@ impl BlockDiffusionDriver {
             graphs,
             request,
             sampler,
+            sampler_step: SamplerStep::default(),
             vocab_size,
             canvas,
             emitted: Vec::new(),
@@ -283,6 +310,7 @@ impl BlockDiffusionDriver {
                         config.self_conditioning_top_k.min(vocab_size) * 2
                     }
             ],
+            self_conditioning_indices: Vec::with_capacity(vocab_size),
             denoise_step: 0,
             awaiting_commit: false,
             done: false,
@@ -345,31 +373,36 @@ impl GenerationDriver for BlockDiffusionDriver {
                     .iter()
                     .find(|output| output.name == "logits")
                     .ok_or_else(|| FellmError::other("denoising graph did not return logits"))?;
-                let update = self.sampler.step(
+                self.sampler.step_into(
                     &self.canvas,
                     &output.values,
                     output.cols,
                     self.denoise_step,
+                    &mut self.sampler_step,
                 )?;
-                self.canvas = update.canvas;
-                self.self_conditioning_logits = if self.config.self_conditioning_top_k == 0 {
-                    output.values.clone()
+                std::mem::swap(&mut self.canvas, &mut self.sampler_step.canvas);
+                if self.config.self_conditioning_top_k == 0 {
+                    self.self_conditioning_logits.clear();
+                    self.self_conditioning_logits
+                        .extend_from_slice(&output.values);
                 } else {
-                    sparse_self_conditioning_pairs(
+                    sparse_self_conditioning_pairs_into(
                         &output.values,
-                        update.argmax.len(),
+                        self.sampler_step.argmax.len(),
                         output.cols,
                         self.config.self_conditioning_top_k,
-                    )?
-                };
+                        &mut self.self_conditioning_logits,
+                        &mut self.self_conditioning_indices,
+                    )?;
+                }
                 self.denoise_step += 1;
-                if update.done || self.denoise_step >= self.config.max_denoising_steps {
+                if self.sampler_step.done || self.denoise_step >= self.config.max_denoising_steps {
                     let remaining = self
                         .request
                         .max_tokens
                         .saturating_sub(self.emitted.len() as u32)
                         as usize;
-                    let finalized = update.argmax;
+                    let finalized = std::mem::take(&mut self.sampler_step.argmax);
                     let take = finalized.len().min(remaining);
                     let batch = finalized[..take].to_vec();
                     self.emitted.extend_from_slice(&batch);
@@ -485,26 +518,29 @@ fn sparse_self_conditioning_logits(
     Ok(sparse)
 }
 
-/// Pack the retained self-conditioning candidates as `(token_id, logit)`
-/// pairs.  This is the steady-state representation consumed by the CPU
-/// weighted-embedding kernel; it avoids copying or scanning a dense
-/// `[canvas, vocab]` probability matrix between denoising passes.
-fn sparse_self_conditioning_pairs(
+/// Reuse storage while packing retained `(token_id, logit)` pairs.
+fn sparse_self_conditioning_pairs_into(
     logits: &[f32],
     rows: usize,
     vocab: usize,
     top_k: usize,
-) -> Result<Vec<f32>> {
+    packed: &mut Vec<f32>,
+    indices: &mut Vec<usize>,
+) -> Result<()> {
     if logits.len() != rows.saturating_mul(vocab) || vocab == 0 {
         return Err(FellmError::other("sparse self-conditioning shape mismatch"));
     }
     let keep = top_k.min(vocab);
     if keep == 0 {
-        return Ok(vec![0.0; logits.len()]);
+        packed.clear();
+        packed.resize(logits.len(), 0.0);
+        return Ok(());
     }
-    let mut packed = vec![0.0f32; rows * keep * 2];
+    packed.clear();
+    packed.resize(rows * keep * 2, 0.0);
     for (row, source) in logits.chunks_exact(vocab).enumerate() {
-        let mut indices: Vec<usize> = (0..vocab).collect();
+        indices.clear();
+        indices.extend(0..vocab);
         if keep < vocab {
             indices.select_nth_unstable_by(keep - 1, |&a, &b| {
                 source[b].total_cmp(&source[a]).then(a.cmp(&b))
@@ -516,7 +552,7 @@ fn sparse_self_conditioning_pairs(
             packed[dst + 1] = source[token];
         }
     }
-    Ok(packed)
+    Ok(())
 }
 
 #[cfg(test)]

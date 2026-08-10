@@ -212,6 +212,42 @@ pub mod kernels {
         }
     }
 
+    /// RoPE for independent physical-batch rows with arbitrary positions.
+    #[kernel]
+    pub fn rope_batch(
+        x: &[f32],
+        inv_freqs: &[f32],
+        positions: &[u32],
+        n_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        total: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= total as usize {
+            return;
+        }
+        let d = i % head_dim as usize;
+        let base = i - d;
+        let row = i / (n_heads as usize * head_dim as usize);
+        if d >= rope_dim as usize {
+            unsafe { *out.get_unchecked_mut(i) = x[i] };
+            return;
+        }
+        if d % 2 == 1 {
+            return;
+        }
+        let theta = positions[row] as f32 * inv_freqs[d / 2];
+        let (s, c) = (theta.sin(), theta.cos());
+        let a = x[base + d];
+        let b = x[base + d + 1];
+        unsafe {
+            *out.get_unchecked_mut(base + d) = a * c - b * s;
+            *out.get_unchecked_mut(base + d + 1) = a * s + b * c;
+        }
+    }
+
     #[inline]
     fn dot_q4k(w: &[u8], row_off: usize, x: &[f32], x_base: usize, n_blocks: u32) -> f32 {
         let mut acc = 0.0f32;
@@ -1882,6 +1918,32 @@ pub mod kernels {
         }
     }
 
+    #[kernel]
+    pub fn embedding_q8_0_rows(
+        table: &[u8],
+        ids: &[u32],
+        rows: u32,
+        dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= rows as usize * dim as usize {
+            return;
+        }
+        let row = linear / dim as usize;
+        let column = linear % dim as usize;
+        let row_bytes = n_blocks as usize * Q8_0_BLOCK_BYTES as usize;
+        let block = column / Q8_0_BLOCK_ELEMS as usize;
+        let lane = column % Q8_0_BLOCK_ELEMS as usize;
+        let offset = ids[row] as usize * row_bytes + block * Q8_0_BLOCK_BYTES as usize;
+        let d = f16_to_f32(u16::from_le_bytes([table[offset], table[offset + 1]]));
+        if let Some(value) = out.get_mut(idx) {
+            *value = d * table[offset + 2 + lane] as i8 as f32;
+        }
+    }
+
     /// Tiled Q4_K × f32 GEMV: 32 threads per output row, shared-memory reduce.
     ///
     /// Launch: `grid = (out_dim, 1, 1)`, `block = (32, 1, 1)`.
@@ -2410,6 +2472,74 @@ pub mod kernels {
         }
     }
 
+    #[kernel]
+    pub fn embedding_f32_rows(
+        table: &[f32],
+        ids: &[u32],
+        rows: u32,
+        dim: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let linear = index.get();
+        if linear >= rows as usize * dim as usize {
+            return;
+        }
+        let row = linear / dim as usize;
+        let column = linear % dim as usize;
+        if let Some(value) = out.get_mut(index) {
+            *value = table[ids[row] as usize * dim as usize + column];
+        }
+    }
+
+    /// Batched ShortConv recurrence with independent state per row.
+    #[kernel]
+    pub fn shortconv_mix_rows(
+        bcx: &[f32],
+        conv: &[f32],
+        mut state: DisjointSlice<f32>,
+        n_embd: u32,
+        l_cache: u32,
+        rows: u32,
+        mut y_pre: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= n_embd as usize * rows as usize || l_cache == 0 {
+            return;
+        }
+        let n = n_embd as usize;
+        let row = linear / n;
+        let c = linear % n;
+        let history = l_cache as usize - 1;
+        let projected_base = row * 3 * n;
+        let state_base = row * history * n;
+        let b = bcx[projected_base + c];
+        let gate = bcx[projected_base + n + c];
+        let projected = bcx[projected_base + 2 * n + c];
+        let bx = b * projected;
+        let mut mixed = bx * conv[c * l_cache as usize + history];
+        let mut t = 0usize;
+        while t < history {
+            mixed += unsafe { *state.get_unchecked_mut(state_base + t * n + c) }
+                * conv[c * l_cache as usize + t];
+            t += 1;
+        }
+        if let Some(value) = y_pre.get_mut(idx) {
+            *value = gate * mixed;
+        }
+        t = 0;
+        while t < history {
+            let next = if t + 1 < history {
+                unsafe { *state.get_unchecked_mut(state_base + (t + 1) * n + c) }
+            } else {
+                bx
+            };
+            unsafe { *state.get_unchecked_mut(state_base + t * n + c) = next };
+            t += 1;
+        }
+    }
+
     /// Dequantize one Q4_K embedding row into f32.
     ///
     /// `w` is the full `[vocab, dim]` Q4_K matrix. Launch with `for_num_elems(dim)`.
@@ -2469,6 +2599,45 @@ pub mod kernels {
         };
         if let Some(o) = out.get_mut(idx) {
             *o = d * scale * q - dmin * min_v;
+        }
+    }
+
+    #[kernel]
+    pub fn embedding_q4k_rows(
+        w: &[u8],
+        ids: &[u32],
+        rows: u32,
+        dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= rows as usize * dim as usize {
+            return;
+        }
+        let row = linear / dim as usize;
+        let i = linear % dim as usize;
+        let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
+        let b = i / Q4K_BLOCK_ELEMS as usize;
+        let j = i % Q4K_BLOCK_ELEMS as usize;
+        let blk = ids[row] as usize * row_bytes + b * Q4K_BLOCK_BYTES as usize;
+        let d = f16_to_f32(u16::from_le_bytes([w[blk], w[blk + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([w[blk + 2], w[blk + 3]]));
+        let (scales, mins) = decode_scales_mins(
+            w[blk + 4], w[blk + 5], w[blk + 6], w[blk + 7], w[blk + 8], w[blk + 9],
+            w[blk + 10], w[blk + 11], w[blk + 12], w[blk + 13], w[blk + 14], w[blk + 15],
+        );
+        let group = j / 32;
+        let lane = j % 32;
+        let qbase = blk + 16 + (j / 64) * 32;
+        let q = if j % 64 < 32 {
+            (w[qbase + lane] & 15) as f32
+        } else {
+            (w[qbase + lane] >> 4) as f32
+        };
+        if let Some(value) = out.get_mut(idx) {
+            *value = d * scales[group] as f32 * q - dmin * mins[group] as f32;
         }
     }
 
@@ -2912,6 +3081,142 @@ pub mod kernels {
         unsafe {
             *arena.get_unchecked_mut(off) = lo;
             *arena.get_unchecked_mut(off + 1) = hi;
+        }
+    }
+
+    /// Write independent rows into their sequence-specific paged block tables.
+    #[kernel]
+    pub fn kv_write_batch(
+        rows: &[f32],
+        mut arena: DisjointSlice<u8>,
+        block_table: &[u32],
+        positions: &[u32],
+        batch_size: u32,
+        layer: u32,
+        n_layers: u32,
+        is_v: u32,
+        n_logical: u32,
+        tokens_stride: u32,
+        block_size: u32,
+        block_bytes: u32,
+    ) {
+        let index = thread::index_1d().get() as u32;
+        let total = batch_size * tokens_stride;
+        if index >= total {
+            return;
+        }
+        let batch_row = index / tokens_stride;
+        let element = index % tokens_stride;
+        let position = positions[batch_row as usize];
+        let logical = position / block_size;
+        let slot = position % block_size;
+        let table_idx = ((batch_row * n_layers + layer) * n_logical + logical) as usize;
+        let phys = block_table[table_idx] as usize;
+        let row_bytes = tokens_stride as usize * 2;
+        let v_base = if is_v != 0 { block_size as usize * row_bytes } else { 0 };
+        let base = phys * block_bytes as usize + v_base + slot as usize * row_bytes;
+        let bits = f32_to_f16_bits(rows[index as usize]);
+        let offset = base + element as usize * 2;
+        unsafe {
+            *arena.get_unchecked_mut(offset) = (bits & 0xff) as u8;
+            *arena.get_unchecked_mut(offset + 1) = (bits >> 8) as u8;
+        }
+    }
+
+    /// Correct multi-sequence attention kernel. Dense projections are batched;
+    /// each `(batch row, head)` independently follows its own block table and length.
+    #[kernel]
+    pub fn attention_paged_batch_heads(
+        q: &[f32],
+        arena: &[u8],
+        block_table: &[u32],
+        lengths: &[u32],
+        batch_size: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        layer: u32,
+        n_layers: u32,
+        n_logical: u32,
+        block_size: u32,
+        block_bytes: u32,
+        tokens_stride: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let work = thread::index_1d().get() as u32;
+        if work >= batch_size * n_heads {
+            return;
+        }
+        let batch_row = work / n_heads;
+        let head = work % n_heads;
+        let hd = head_dim as usize;
+        let n_kv = n_kv_heads.max(1);
+        let kv_head = (head / (n_heads / n_kv).max(1)) as usize;
+        let stride = tokens_stride as usize;
+        let bs = block_size as usize;
+        let row_bytes = stride * 2;
+        let v_offset = bs * row_bytes;
+        let q_base = (batch_row as usize * n_heads as usize + head as usize) * hd;
+        let mut d = 0usize;
+        while d < hd {
+            unsafe { *out.get_unchecked_mut(q_base + d) = 0.0 };
+            d += 1;
+        }
+        let mut running_max = 0.0f32;
+        let mut running_sum = 0.0f32;
+        let mut started = false;
+        let mut token = 0usize;
+        while token < lengths[batch_row as usize] as usize {
+            let logical = token / bs;
+            let slot = token % bs;
+            let table_idx = (((batch_row * n_layers + layer) * n_logical) as usize) + logical;
+            let phys = block_table[table_idx] as usize;
+            let k_base = phys * block_bytes as usize + slot * row_bytes + kv_head * hd * 2;
+            let mut score = 0.0f32;
+            d = 0;
+            while d < hd {
+                let bits = arena[k_base + d * 2] as u16
+                    | ((arena[k_base + d * 2 + 1] as u16) << 8);
+                score += q[q_base + d] * f16_to_f32(bits);
+                d += 1;
+            }
+            score *= scale;
+            let (new_max, alpha) = if !started {
+                (score, 0.0)
+            } else if score > running_max {
+                (score, (running_max - score).exp())
+            } else {
+                (running_max, 1.0)
+            };
+            let probability = (score - new_max).exp();
+            running_sum = running_sum * alpha + probability;
+            running_max = new_max;
+            d = 0;
+            while d < hd {
+                let base = phys * block_bytes as usize
+                    + v_offset
+                    + slot * row_bytes
+                    + kv_head * hd * 2;
+                let bits = arena[base + d * 2] as u16
+                    | ((arena[base + d * 2 + 1] as u16) << 8);
+                let value = f16_to_f32(bits);
+                unsafe {
+                    let previous = *out.get_unchecked_mut(q_base + d);
+                    *out.get_unchecked_mut(q_base + d) =
+                        previous * alpha + probability * value;
+                }
+                d += 1;
+            }
+            started = true;
+            token += 1;
+        }
+        if running_sum > 0.0 {
+            d = 0;
+            while d < hd {
+                unsafe { *out.get_unchecked_mut(q_base + d) /= running_sum };
+                d += 1;
+            }
         }
     }
 
