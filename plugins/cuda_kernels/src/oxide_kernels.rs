@@ -2625,8 +2625,18 @@ pub mod kernels {
         let d = f16_to_f32(u16::from_le_bytes([w[blk], w[blk + 1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([w[blk + 2], w[blk + 3]]));
         let (scales, mins) = decode_scales_mins(
-            w[blk + 4], w[blk + 5], w[blk + 6], w[blk + 7], w[blk + 8], w[blk + 9],
-            w[blk + 10], w[blk + 11], w[blk + 12], w[blk + 13], w[blk + 14], w[blk + 15],
+            w[blk + 4],
+            w[blk + 5],
+            w[blk + 6],
+            w[blk + 7],
+            w[blk + 8],
+            w[blk + 9],
+            w[blk + 10],
+            w[blk + 11],
+            w[blk + 12],
+            w[blk + 13],
+            w[blk + 14],
+            w[blk + 15],
         );
         let group = j / 32;
         let lane = j % 32;
@@ -3113,7 +3123,11 @@ pub mod kernels {
         let table_idx = ((batch_row * n_layers + layer) * n_logical + logical) as usize;
         let phys = block_table[table_idx] as usize;
         let row_bytes = tokens_stride as usize * 2;
-        let v_base = if is_v != 0 { block_size as usize * row_bytes } else { 0 };
+        let v_base = if is_v != 0 {
+            block_size as usize * row_bytes
+        } else {
+            0
+        };
         let base = phys * block_bytes as usize + v_base + slot as usize * row_bytes;
         let bits = f32_to_f16_bits(rows[index as usize]);
         let offset = base + element as usize * 2;
@@ -3176,8 +3190,7 @@ pub mod kernels {
             let mut score = 0.0f32;
             d = 0;
             while d < hd {
-                let bits = arena[k_base + d * 2] as u16
-                    | ((arena[k_base + d * 2 + 1] as u16) << 8);
+                let bits = arena[k_base + d * 2] as u16 | ((arena[k_base + d * 2 + 1] as u16) << 8);
                 score += q[q_base + d] * f16_to_f32(bits);
                 d += 1;
             }
@@ -3194,17 +3207,13 @@ pub mod kernels {
             running_max = new_max;
             d = 0;
             while d < hd {
-                let base = phys * block_bytes as usize
-                    + v_offset
-                    + slot * row_bytes
-                    + kv_head * hd * 2;
-                let bits = arena[base + d * 2] as u16
-                    | ((arena[base + d * 2 + 1] as u16) << 8);
+                let base =
+                    phys * block_bytes as usize + v_offset + slot * row_bytes + kv_head * hd * 2;
+                let bits = arena[base + d * 2] as u16 | ((arena[base + d * 2 + 1] as u16) << 8);
                 let value = f16_to_f32(bits);
                 unsafe {
                     let previous = *out.get_unchecked_mut(q_base + d);
-                    *out.get_unchecked_mut(q_base + d) =
-                        previous * alpha + probability * value;
+                    *out.get_unchecked_mut(q_base + d) = previous * alpha + probability * value;
                 }
                 d += 1;
             }
@@ -3728,7 +3737,11 @@ pub mod kernels {
         let row_bytes = (tokens_stride as usize) * 2;
         let v_off0 = bs * row_bytes;
         let q_base = head as usize * hd;
-        let stages = if pipeline_stages < 2 { 2u32 } else { pipeline_stages.min(2) };
+        let stages = if pipeline_stages < 2 {
+            2u32
+        } else {
+            pipeline_stages.min(2)
+        };
         let is_producer = warp == 0;
         let is_consumer = warp >= 1;
 

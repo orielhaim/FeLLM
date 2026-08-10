@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the cuda-oxide *plugin* toolchain in WSL2.
-# This is intentionally separate from the FeLLM host (stable 1.96.1).
+# This is intentionally separate from the FeLLM host (stable 1.97).
 #
 # Requirements (from https://github.com/NVlabs/cuda-oxide):
 #   - Linux (Ubuntu 24.04 tested)
@@ -17,6 +17,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OXIDE_NIGHTLY="nightly-2026-04-03"
+CUDA_OXIDE_REV="84e663efe4afdc60833fde8106fbb2e6afa24d84"
+CARGO_OXIDE_MARKER="${HOME}/.cargo/.fellm-cuda-oxide-rev"
 DO_APT=0
 for arg in "$@"; do
   case "$arg" in
@@ -38,7 +40,7 @@ echo "    host toolchain (untouched): $(cat "$ROOT/rust-toolchain.toml" | tr '\n
 # ---------------------------------------------------------------------------
 echo "==> [1/5] Rust $OXIDE_NIGHTLY + components"
 rustup toolchain install "$OXIDE_NIGHTLY"
-rustup component add rust-src rustc-dev llvm-tools rust-analyzer clippy \
+rustup component add rust-src rustc-dev llvm-tools rustfmt rust-analyzer clippy \
   --toolchain "$OXIDE_NIGHTLY"
 rustup run "$OXIDE_NIGHTLY" rustc --version
 
@@ -46,13 +48,15 @@ rustup run "$OXIDE_NIGHTLY" rustc --version
 # 2) cargo-oxide (no sudo; built with the pinned nightly)
 # ---------------------------------------------------------------------------
 echo "==> [2/5] cargo-oxide"
-if cargo oxide --help >/dev/null 2>&1; then
-  echo "    already on PATH: $(command -v cargo-oxide || true)"
-else
-  cargo +"$OXIDE_NIGHTLY" install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide --locked
+if ! command -v cargo-oxide >/dev/null 2>&1 || \
+  [[ ! -f "$CARGO_OXIDE_MARKER" ]] || \
+  [[ "$(cat "$CARGO_OXIDE_MARKER")" != "$CUDA_OXIDE_REV" ]]; then
+  cargo +"$OXIDE_NIGHTLY" install --git https://github.com/NVlabs/cuda-oxide.git \
+    --rev "$CUDA_OXIDE_REV" cargo-oxide --locked --force
+  mkdir -p "$(dirname "$CARGO_OXIDE_MARKER")"
+  printf '%s\n' "$CUDA_OXIDE_REV" >"$CARGO_OXIDE_MARKER"
 fi
 cargo oxide --help >/dev/null
-echo "    cargo oxide OK"
 
 # ---------------------------------------------------------------------------
 # 3) CUDA toolkit + Clang (user-local by default; --apt uses sudo)
@@ -191,12 +195,14 @@ if command -v nvcc >/dev/null 2>&1; then
   echo "    nvcc: $(command -v nvcc) ($(nvcc --version | tail -1))"
   echo "    CUDA_TOOLKIT_PATH=$CUDA_TOOLKIT_PATH"
 else
-  echo "    WARNING: nvcc not found"
+  echo "    error: nvcc not found" >&2
+  exit 1
 fi
 if command -v clang >/dev/null 2>&1; then
   echo "    clang: $(command -v clang) ($(clang --version | head -1))"
 else
-  echo "    WARNING: clang not found (bindgen needs it)"
+  echo "    error: clang not found (bindgen needs it)" >&2
+  exit 1
 fi
 if command -v llc-21 >/dev/null 2>&1; then
   echo "    llc-21: $(command -v llc-21)"
@@ -210,13 +216,4 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> [5/5] cargo oxide doctor"
 cd "$ROOT/plugins/cuda_kernels"
-if cargo oxide doctor; then
-  echo "==> oxide toolchain ready"
-  echo "    Pipeline B (plugin): bash scripts/wsl-build-plugin.sh"
-  echo "    Pipeline A (host):   bash scripts/wsl-build-host.sh --cuda"
-else
-  echo "==> doctor reported missing pieces (see above)"
-  echo "    Retry: bash scripts/wsl-setup-oxide.sh"
-  echo "    Or system packages: bash scripts/wsl-setup-oxide.sh --apt"
-  exit 1
-fi
+cargo +"$OXIDE_NIGHTLY" oxide doctor

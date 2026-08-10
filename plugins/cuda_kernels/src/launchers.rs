@@ -329,19 +329,20 @@ pub unsafe extern "C" fn launch_rope(
             let p_key = buffers::ensure_u32(&stream, positions)?;
             let pd = buffers::take_u32(p_key)?;
             let result = unsafe {
-                module.rope_batch(
-                    &stream,
-                    cfg_1d(n as u32),
-                    &xd,
-                    &fd,
-                    &pd,
-                    attrs.n_heads,
-                    attrs.head_dim,
-                    attrs.rope_dim,
-                    n as u32,
-                    &mut od,
-                )
-                .map_err(|_| -4)
+                module
+                    .rope_batch(
+                        &stream,
+                        cfg_1d(n as u32),
+                        &xd,
+                        &fd,
+                        &pd,
+                        attrs.n_heads,
+                        attrs.head_dim,
+                        attrs.rope_dim,
+                        n as u32,
+                        &mut od,
+                    )
+                    .map_err(|_| -4)
             };
             buffers::put_u32(p_key, pd)?;
             result
@@ -2315,27 +2316,28 @@ pub unsafe extern "C" fn launch_attention(
                 )
             };
             let result = unsafe {
-                oxide_module().attention_paged_batch_heads(
-                    &stream,
-                    cfg_1d((snap.batch_size * n_heads) as u32),
-                    &qd,
-                    &arena,
-                    &table_device,
-                    &lengths_device,
-                    snap.batch_size as u32,
-                    n_heads as u32,
-                    n_kv as u32,
-                    head_dim as u32,
-                    scale,
-                    attrs.layer_ord,
-                    snap.n_layers as u32,
-                    snap.n_logical_blocks as u32,
-                    snap.block_size as u32,
-                    snap.block_bytes as u32,
-                    snap.tokens_stride as u32,
-                    &mut out_device,
-                )
-                .map_err(|_| -4)
+                oxide_module()
+                    .attention_paged_batch_heads(
+                        &stream,
+                        cfg_1d((snap.batch_size * n_heads) as u32),
+                        &qd,
+                        &arena,
+                        &table_device,
+                        &lengths_device,
+                        snap.batch_size as u32,
+                        n_heads as u32,
+                        n_kv as u32,
+                        head_dim as u32,
+                        scale,
+                        attrs.layer_ord,
+                        snap.n_layers as u32,
+                        snap.n_logical_blocks as u32,
+                        snap.block_size as u32,
+                        snap.block_bytes as u32,
+                        snap.tokens_stride as u32,
+                        &mut out_device,
+                    )
+                    .map_err(|_| -4)
             };
             buffers::release_wrap(arena);
             buffers::put_f32(q_key, qd, true)?;
@@ -2408,9 +2410,7 @@ pub unsafe extern "C" fn launch_attention(
                                 dispatch.pipeline_stages.max(2),
                                 &mut od,
                             ),
-                        fellm_plugin_abi::AttentionKernelPath::Fa2Prefill
-                            if q_len > 1 =>
-                        {
+                        fellm_plugin_abi::AttentionKernelPath::Fa2Prefill if q_len > 1 => {
                             let br = dispatch.q_tile.max(4);
                             let q_tiles = q_len.div_ceil(br);
                             module.attention_fa2_prefill_paged(
@@ -2593,9 +2593,8 @@ pub unsafe extern "C" fn launch_kv_write(
             if row.len() != snap.batch_size * snap.tokens_stride {
                 return Err(-2);
             }
-            let positions = unsafe {
-                std::slice::from_raw_parts(snap.row_positions, snap.batch_size)
-            };
+            let positions =
+                unsafe { std::slice::from_raw_parts(snap.row_positions, snap.batch_size) };
             if snap.device_arena.is_null() || snap.device_arena_len == 0 {
                 for (batch_row, (&position, values)) in positions
                     .iter()
@@ -2604,11 +2603,8 @@ pub unsafe extern "C" fn launch_kv_write(
                 {
                     let logical = position as usize / snap.block_size;
                     let slot = position as usize % snap.block_size;
-                    let phys = snap.physical_for(
-                        batch_row,
-                        attrs.layer_ord as usize,
-                        logical,
-                    ) as usize;
+                    let phys =
+                        snap.physical_for(batch_row, attrs.layer_ord as usize, logical) as usize;
                     let row_bytes = snap.tokens_stride * snap.elem_bytes;
                     let v_base = if is_v { snap.block_size * row_bytes } else { 0 };
                     let base = phys * snap.block_bytes + v_base + slot * row_bytes;
@@ -2629,9 +2625,7 @@ pub unsafe extern "C" fn launch_kv_write(
             }
             let ctx = oxide_ctx();
             let stream = oxide_stream().clone();
-            let table = unsafe {
-                std::slice::from_raw_parts(snap.block_table, snap.n_block_table)
-            };
+            let table = unsafe { std::slice::from_raw_parts(snap.block_table, snap.n_block_table) };
             let row_key = buffers::ensure_f32(&stream, row, false)?;
             let table_key = buffers::ensure_block_table(&stream, table)?;
             let position_key = buffers::ensure_u32(&stream, positions)?;
@@ -2646,23 +2640,24 @@ pub unsafe extern "C" fn launch_kv_write(
                 )
             };
             let result = unsafe {
-                oxide_module().kv_write_batch(
-                    &stream,
-                    cfg_1d(row.len() as u32),
-                    &row_device,
-                    &mut arena,
-                    &table_device,
-                    &position_device,
-                    snap.batch_size as u32,
-                    attrs.layer_ord,
-                    snap.n_layers as u32,
-                    u32::from(is_v),
-                    snap.n_logical_blocks as u32,
-                    snap.tokens_stride as u32,
-                    snap.block_size as u32,
-                    snap.block_bytes as u32,
-                )
-                .map_err(|_| -4)
+                oxide_module()
+                    .kv_write_batch(
+                        &stream,
+                        cfg_1d(row.len() as u32),
+                        &row_device,
+                        &mut arena,
+                        &table_device,
+                        &position_device,
+                        snap.batch_size as u32,
+                        attrs.layer_ord,
+                        snap.n_layers as u32,
+                        u32::from(is_v),
+                        snap.n_logical_blocks as u32,
+                        snap.tokens_stride as u32,
+                        snap.block_size as u32,
+                        snap.block_bytes as u32,
+                    )
+                    .map_err(|_| -4)
             };
             buffers::release_wrap(arena);
             buffers::put_f32(row_key, row_device, true)?;

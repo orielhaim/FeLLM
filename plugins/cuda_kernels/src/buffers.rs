@@ -181,7 +181,8 @@ pub fn ensure_f32(stream: &CudaStream, host: &[f32], force_upload: bool) -> Resu
             return Err(-2);
         }
         if force_upload {
-            let (ptr, _) = external_tensor(key.ptr, len * core::mem::size_of::<f32>())?.ok_or(-31)?;
+            let (ptr, _) =
+                external_tensor(key.ptr, len * core::mem::size_of::<f32>())?.ok_or(-31)?;
             let mut buffer = unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(ptr, len, crate::oxide_ctx().clone())
             };
