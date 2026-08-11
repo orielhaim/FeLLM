@@ -83,6 +83,15 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// Begin capture on the stream used by the active CUDA kernel plugin.
+    pub fn begin_graph_capture(&self) -> Result<crate::CudaGraphCapture> {
+        let stream = self
+            .plugins
+            .device_stream()
+            .ok_or_else(|| FellmError::other("CUDA plugin has no capture-capable device stream"))?;
+        crate::CudaGraphCapture::begin(&self.device, stream)
+    }
+
     /// Update the fixed device control block before enqueueing one decode step.
     pub fn update_step_params(&self, params: &fellm_plugin_abi::DeviceStepParams) -> Result<()> {
         self.plugins.update_step_params(params)
@@ -133,6 +142,7 @@ impl CudaBackend {
         let mode = CudaExecutionMode::from_env()?;
         // Capability flags from compute capability — never product names.
         let (cc_major, cc_minor) = device.compute_capability();
+        let device_caps = device.caps();
         let has_ampere_ada = cc_major >= 8 && cc_major < 9;
         let has_hopper = cc_major >= 9 && cc_major < 10;
         let has_blackwell = cc_major >= 10;
@@ -150,7 +160,7 @@ impl CudaBackend {
             supports_custom_operations: true,
             compute_major: cc_major,
             compute_minor: cc_minor,
-            smem_per_sm: device.smem_per_sm(),
+            smem_per_sm: device_caps.smem_per_sm,
             has_ampere_ada_features: has_ampere_ada || has_hopper || has_blackwell,
             has_hopper_features: has_hopper || has_blackwell,
             has_blackwell_features: has_blackwell,
@@ -162,6 +172,12 @@ impl CudaBackend {
         tracing::info!(
             plugin_ops,
             use_plugins,
+            compute_capability = %format!("{}.{}", device_caps.compute_major, device_caps.compute_minor),
+            sm_count = device_caps.sm_count,
+            smem_per_sm = device_caps.smem_per_sm,
+            l2_bytes = device_caps.l2_bytes,
+            memory_bus_width_bits = device_caps.memory_bus_width_bits,
+            memory_clock_khz = device_caps.memory_clock_khz,
             "CUDA device up (set FELLM_PLUGIN_KERNELS=0 to disable oxide ops)"
         );
         Ok(Self {
@@ -378,10 +394,14 @@ impl Backend for CudaBackend {
         }
         #[cfg(feature = "cuda")]
         {
-            self.device
-                .stream()
-                .synchronize()
-                .map_err(|e| FellmError::other(format!("cuda synchronize: {e}")))?;
+            if let Some(stream) = self.plugins.device_stream() {
+                crate::graph::synchronize_external_stream(&self.device, stream)?;
+            } else {
+                self.device
+                    .stream()
+                    .synchronize()
+                    .map_err(|e| FellmError::other(format!("cuda synchronize: {e}")))?;
+            }
         }
         Ok(())
     }

@@ -50,6 +50,14 @@ pub mod kernels {
         (sign | (half + round)) as u16
     }
 
+    #[inline]
+    fn control_u32(params: &[u8], offset: usize) -> u32 {
+        (params[offset] as u32)
+            | ((params[offset + 1] as u32) << 8)
+            | ((params[offset + 2] as u32) << 16)
+            | ((params[offset + 3] as u32) << 24)
+    }
+
     /// `out[i] = silu(gate[i]) * up[i]`.
     #[kernel]
     pub fn silu_gate(gate: &[f32], up: &[f32], mut out: DisjointSlice<f32>) {
@@ -203,6 +211,44 @@ pub mod kernels {
         }
         let pair = d / 2;
         let theta = (position + row as f32) * inv_freqs[pair];
+        let (s, c) = (theta.sin(), theta.cos());
+        let a = x[base + d];
+        let b = x[base + d + 1];
+        unsafe {
+            *out.get_unchecked_mut(base + d) = a * c - b * s;
+            *out.get_unchecked_mut(base + d + 1) = a * s + b * c;
+        }
+    }
+
+    /// Single-row decode RoPE reading position from the stable device control block.
+    /// `DeviceStepParams.position` occupies bytes 4..8 by the C representation.
+    #[kernel]
+    pub fn rope_controlled(
+        x: &[f32],
+        inv_freqs: &[f32],
+        params: &[u8],
+        n_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        total: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= total as usize {
+            return;
+        }
+        let d = i % head_dim as usize;
+        let base = i - d;
+        let row = i / (n_heads as usize * head_dim as usize);
+        if d >= rope_dim as usize {
+            unsafe { *out.get_unchecked_mut(i) = x[i] };
+            return;
+        }
+        if d % 2 == 1 {
+            return;
+        }
+        let position = control_u32(params, 4);
+        let theta = (position as f32 + row as f32) * inv_freqs[d / 2];
         let (s, c) = (theta.sin(), theta.cos());
         let a = x[base + d];
         let b = x[base + d + 1];
@@ -1904,7 +1950,7 @@ pub mod kernels {
     #[kernel]
     pub fn embedding_q8_0_row(
         table: &[u8],
-        token_id: u32,
+        params: &[u8],
         dim: u32,
         n_blocks: u32,
         mut out: DisjointSlice<f32>,
@@ -1914,6 +1960,7 @@ pub mod kernels {
         if col >= dim as usize {
             return;
         }
+        let token_id = control_u32(params, 0);
         let row_bytes = n_blocks as usize * Q8_0_BLOCK_BYTES as usize;
         let block = col / Q8_0_BLOCK_ELEMS as usize;
         let lane = col % Q8_0_BLOCK_ELEMS as usize;
@@ -2466,12 +2513,18 @@ pub mod kernels {
 
     /// Copy embedding row `token_id` from an f32 `[vocab, dim]` table.
     #[kernel]
-    pub fn embedding_f32(table: &[f32], token_id: u32, dim: u32, mut out: DisjointSlice<f32>) {
+    pub fn embedding_f32(
+        table: &[f32],
+        params: &[u8],
+        dim: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
         let idx = thread::index_1d();
         let i = idx.get();
         if i >= dim as usize {
             return;
         }
+        let token_id = control_u32(params, 0);
         let src = (token_id as usize) * (dim as usize) + i;
         if let Some(o) = out.get_mut(idx) {
             *o = table[src];
@@ -2552,7 +2605,7 @@ pub mod kernels {
     #[kernel]
     pub fn embedding_q4k_row(
         w: &[u8],
-        token_id: u32,
+        params: &[u8],
         dim: u32,
         n_blocks: u32,
         mut out: DisjointSlice<f32>,
@@ -2562,6 +2615,7 @@ pub mod kernels {
         if i >= dim as usize {
             return;
         }
+        let token_id = control_u32(params, 0);
         let row_bytes = (n_blocks * Q4K_BLOCK_BYTES) as usize;
         let row_off = (token_id as usize) * row_bytes;
         let b = i / Q4K_BLOCK_ELEMS as usize;
@@ -2661,7 +2715,7 @@ pub mod kernels {
     #[kernel]
     pub fn embedding_q6k_row(
         w: &[u8],
-        token_id: u32,
+        params: &[u8],
         dim: u32,
         n_blocks: u32,
         mut out: DisjointSlice<f32>,
@@ -2671,6 +2725,7 @@ pub mod kernels {
         if i >= dim as usize {
             return;
         }
+        let token_id = control_u32(params, 0);
         let row_bytes = (n_blocks * Q6K_BLOCK_BYTES) as usize;
         let row_off = (token_id as usize) * row_bytes;
         let b = i / Q6K_BLOCK_ELEMS as usize;
@@ -3066,8 +3121,8 @@ pub mod kernels {
         row: &[f32],
         mut arena: DisjointSlice<u8>,
         block_table: &[u32],
+        params: &[u8],
         layer: u32,
-        position: u32,
         is_v: u32,
         n_logical: u32,
         tokens_stride: u32,
@@ -3079,8 +3134,9 @@ pub mod kernels {
         if i >= row_len {
             return;
         }
-        let logical = position / block_size;
-        let slot = position % block_size;
+        let sequence_length = control_u32(params, 8);
+        let slot = control_u32(params, 20) as usize;
+        let logical = sequence_length.saturating_sub(1) / block_size;
         let table_idx = (layer * n_logical + logical) as usize;
         let phys = block_table[table_idx] as usize;
         let row_bytes = (tokens_stride as usize) * 2;
@@ -3089,7 +3145,7 @@ pub mod kernels {
         } else {
             0
         };
-        let base = phys * (block_bytes as usize) + v_base + (slot as usize) * row_bytes;
+        let base = phys * (block_bytes as usize) + v_base + slot * row_bytes;
         let bits = f32_to_f16_bits(row[i as usize]);
         let lo = (bits & 0xff) as u8;
         let hi = (bits >> 8) as u8;
@@ -3705,10 +3761,10 @@ pub mod kernels {
         q: &[f32],
         arena: &[u8],
         block_table: &[u32],
+        params: &[u8],
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
-        seq: u32,
         scale: f32,
         layer: u32,
         n_logical: u32,
@@ -3766,6 +3822,7 @@ pub mod kernels {
         }
         thread::sync_threads();
 
+        let seq = control_u32(params, 8);
         let n_tiles = (seq + BC - 1) / BC;
         // Pipeline: producer fills stage s while consumers process stage s-1.
         let mut tile = 0u32;
@@ -3924,10 +3981,10 @@ pub mod kernels {
         q: &[f32],
         arena: &[u8],
         block_table: &[u32],
+        params: &[u8],
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
-        seq: u32,
         scale: f32,
         layer: u32,
         n_logical: u32,
@@ -3966,6 +4023,7 @@ pub mod kernels {
         let mut running_sum = 0.0f32;
         let mut started = false;
 
+        let seq = control_u32(params, 8);
         let mut k0 = 0u32;
         while k0 < seq {
             let k1 = if k0 + BC > seq { seq } else { k0 + BC };

@@ -4,9 +4,36 @@ use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::{DeviceHandle, HostContext, StreamHandle};
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaStream, sys::CUdevice_attribute as Attr};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
+
+/// Hardware properties that affect CUDA kernel selection and autotuning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaDeviceCaps {
+    /// Compute capability major version.
+    pub compute_major: u32,
+    /// Compute capability minor version.
+    pub compute_minor: u32,
+    /// Streaming multiprocessor count.
+    pub sm_count: u32,
+    /// Hardware warp width.
+    pub warp_size: u32,
+    /// Maximum shared memory per block in bytes.
+    pub smem_per_block: u32,
+    /// Maximum shared memory per SM in bytes.
+    pub smem_per_sm: u32,
+    /// Register file size per SM.
+    pub registers_per_sm: u32,
+    /// Maximum resident threads per SM.
+    pub max_threads_per_sm: u32,
+    /// L2 cache size in bytes.
+    pub l2_bytes: u64,
+    /// Device-memory bus width in bits.
+    pub memory_bus_width_bits: u32,
+    /// Device-memory clock in kHz.
+    pub memory_clock_khz: u32,
+}
 
 /// Central CUDA device state owned by [`crate::CudaBackend`].
 pub struct CudaDeviceState {
@@ -16,6 +43,8 @@ pub struct CudaDeviceState {
     stream: Arc<CudaStream>,
     #[cfg(feature = "cuda")]
     copy_stream: Arc<CudaStream>,
+    #[cfg(feature = "cuda")]
+    caps: CudaDeviceCaps,
     /// Device ordinal.
     pub ordinal: usize,
 }
@@ -31,10 +60,12 @@ impl CudaDeviceState {
             let copy_stream = context
                 .new_stream()
                 .map_err(|e| FellmError::other(format!("new_stream: {e}")))?;
+            let caps = query_caps(&context)?;
             Ok(Self {
                 context,
                 stream,
                 copy_stream,
+                caps,
                 ordinal,
             })
         }
@@ -112,10 +143,7 @@ impl CudaDeviceState {
     pub fn compute_capability(&self) -> (u32, u32) {
         #[cfg(feature = "cuda")]
         {
-            // Prefer live device query; fall back to Ampere-class defaults so
-            // FA2-style selection remains available without product-name checks.
-            let _ = &self.context;
-            (8, 0)
+            (self.caps.compute_major, self.caps.compute_minor)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -128,13 +156,47 @@ impl CudaDeviceState {
     pub fn smem_per_sm(&self) -> u32 {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.context;
-            // Typical Ampere/Ada SM shared memory; providers treat 0 as unknown.
-            100 * 1024
+            self.caps.smem_per_sm
         }
         #[cfg(not(feature = "cuda"))]
         {
             0
         }
     }
+
+    /// Complete live hardware capability snapshot.
+    #[must_use]
+    pub fn caps(&self) -> CudaDeviceCaps {
+        #[cfg(feature = "cuda")]
+        {
+            self.caps
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            CudaDeviceCaps::default()
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn query_caps(context: &CudaContext) -> Result<CudaDeviceCaps> {
+    let attribute = |attr| {
+        context
+            .attribute(attr)
+            .map(|value| value.max(0) as u32)
+            .map_err(|error| FellmError::other(format!("query CUDA device attribute: {error}")))
+    };
+    Ok(CudaDeviceCaps {
+        compute_major: attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+        compute_minor: attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+        sm_count: attribute(Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        warp_size: attribute(Attr::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
+        smem_per_block: attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
+        smem_per_sm: attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)?,
+        registers_per_sm: attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR)?,
+        max_threads_per_sm: attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
+        l2_bytes: u64::from(attribute(Attr::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?),
+        memory_bus_width_bits: attribute(Attr::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?,
+        memory_clock_khz: attribute(Attr::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?,
+    })
 }

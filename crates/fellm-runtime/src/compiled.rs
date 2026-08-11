@@ -92,8 +92,11 @@ pub struct CompiledStep {
     logits_shape: Shape,
     /// Read-only inputs bound this step, keyed by input name.
     inputs: HashMap<String, BoundInput>,
-    /// Per-step attribute patches keyed by plan index.
-    attr_patches: HashMap<usize, OpAttrs>,
+    /// Per-step attribute patches indexed directly by plan slot.
+    ///
+    /// This is deliberately dense: decode visits every runtime node, so a
+    /// HashMap lookup here multiplied host-side bookkeeping by every layer.
+    attr_patches: Vec<Option<OpAttrs>>,
 }
 
 impl CompiledStep {
@@ -412,7 +415,7 @@ impl CompiledStep {
             logits_dtype,
             logits_shape,
             inputs: HashMap::new(),
-            attr_patches: HashMap::new(),
+            attr_patches: vec![None; plan.order.len()],
         })
     }
 
@@ -424,7 +427,7 @@ impl CompiledStep {
     /// Patch attributes on a specific graph node for the current step.
     pub fn set_attrs(&mut self, node: NodeId, attrs: OpAttrs) {
         if let Some(&idx) = self.index_of.get(&node) {
-            self.attr_patches.insert(idx, attrs);
+            self.attr_patches[idx] = Some(attrs);
         }
     }
 
@@ -435,6 +438,13 @@ impl CompiledStep {
     /// When true, logits are returned by swapping the compiled logits slot buffer
     /// into an owned tensor (no full copy); a fresh zeroed buffer is left in the slot.
     pub fn run(&mut self, backend: &dyn Backend, compute_logits: bool) -> Result<Tensor> {
+        self.enqueue(backend, compute_logits)?;
+        self.materialize_result(backend, compute_logits)
+    }
+
+    /// Enqueue the fixed operation schedule without crossing the logits boundary.
+    /// CUDA uses this once during graph capture; replay bypasses this host loop.
+    pub(crate) fn enqueue(&mut self, backend: &dyn Backend, compute_logits: bool) -> Result<()> {
         let end = if compute_logits {
             self.nodes.len()
         } else {
@@ -452,7 +462,7 @@ impl CompiledStep {
                 input_refs.push(self.tensor_ref(iid)?);
             }
 
-            let attrs = self.attr_patches.get(&i).copied().unwrap_or(rt.attrs);
+            let attrs = self.attr_patches[i].unwrap_or(rt.attrs);
             let out_mut = self.tensor_mut(i)?;
             // Profiling must bracket completed GPU work. Merely timing the host
             // launch attributes all queued work to the eventual D2H boundary.
@@ -523,6 +533,15 @@ impl CompiledStep {
             );
         }
 
+        Ok(())
+    }
+
+    /// Materialize the host-visible result after an ordinary enqueue or graph replay.
+    pub(crate) fn materialize_result(
+        &self,
+        backend: &dyn Backend,
+        compute_logits: bool,
+    ) -> Result<Tensor> {
         if !compute_logits {
             let layout = Layout::contiguous(DType::F32, Shape::new(&[0])?);
             let storage = Arc::new(Storage::Owned(Arc::new(AlignedBuffer::new_zeroed(0, 64))));

@@ -54,6 +54,9 @@ pub(crate) fn host_paged_snapshot() -> Option<PagedKvSnapshot> {
         elem_bytes: 0,
         device_arena: std::ptr::null_mut(),
         device_arena_len: 0,
+        device_block_table: std::ptr::null_mut(),
+        n_device_block_table: 0,
+        device_logical_stride: 0,
         batch_size: 0,
         row_positions: std::ptr::null(),
         row_lengths: std::ptr::null(),
@@ -80,6 +83,22 @@ pub(crate) fn oxide_stream() -> &'static Arc<CudaStream> {
             .new_stream()
             .expect("cuda_kernels: create non-blocking compute stream")
     })
+}
+
+/// Borrow the stable device control allocation while preparing a kernel launch.
+/// CUDA Graph capture records only its device address; replay does not lock.
+pub(crate) fn with_step_params<T>(
+    f: impl FnOnce(&DeviceBuffer<u8>) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let guard = STEP_PARAMS.lock().map_err(|_| -30)?;
+    let params = guard.as_ref().ok_or(-22)?;
+    f(params)
+}
+
+/// Return the non-default stream used by every prepared CUDA kernel.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_device_stream() -> fellm_plugin_abi::StreamHandle {
+    oxide_stream().cu_stream() as usize as fellm_plugin_abi::StreamHandle
 }
 
 /// Upload the only values permitted to vary between decode graph replays.

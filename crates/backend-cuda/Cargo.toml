@@ -27,5 +27,9 @@ backend-cpu.workspace = true
 default = []
 cuda = ["dep:cudarc"]
 
+[[example]]
+name = "graph_smoke"
+required-features = ["cuda"]
+
 [lints]
 workspace = true

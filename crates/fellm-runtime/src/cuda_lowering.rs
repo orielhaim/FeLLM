@@ -111,7 +111,7 @@ fn recognize_macro_ops(
     for &id in &plan.order {
         let node = graph.node(id);
         let label = node.label.as_str();
-        let (kind, input_nodes, output_nodes) = if label == "token_embedding" {
+        let (kind, input_nodes, output_nodes) = if label == "tok_embed" {
             (MacroOpKind::Embedding, graph.inputs_of(id), vec![id])
         } else if label.ends_with(".attn_norm_op") || label.ends_with(".ffn_norm_op") {
             (
@@ -199,7 +199,7 @@ fn recognize_macro_ops(
 
 #[cfg(test)]
 fn macro_kind(label: &str) -> Option<MacroOpKind> {
-    if label == "token_embedding" {
+    if label == "tok_embed" {
         Some(MacroOpKind::Embedding)
     } else if label.ends_with(".attn_norm_op") || label.ends_with(".ffn_norm_op") {
         Some(MacroOpKind::RmsNormQuantizeQ8_1)
@@ -239,6 +239,7 @@ mod tests {
 
     #[test]
     fn recognizes_dense_decode_macro_boundaries() {
+        assert_eq!(macro_kind("tok_embed"), Some(MacroOpKind::Embedding));
         assert_eq!(
             macro_kind("blk.3.attn_norm_op"),
             Some(MacroOpKind::RmsNormQuantizeQ8_1)

@@ -6,9 +6,10 @@ use crate::registry::KernelRegistry;
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
-    HostContext, PluginAbiVersionFn, PluginInitFn, PluginInvalidateF32Fn, PluginManifestJsonFn,
-    PluginRegisterArchitecturesFn, PluginRegisterCapabilitiesFn, PluginRegisterDeviceTensorFn,
-    PluginRegisterKernelsFn, PluginShutdownFn, PluginUpdateStepParamsFn, symbols,
+    HostContext, PluginAbiVersionFn, PluginDeviceStreamFn, PluginInitFn, PluginInvalidateF32Fn,
+    PluginManifestJsonFn, PluginRegisterArchitecturesFn, PluginRegisterCapabilitiesFn,
+    PluginRegisterDeviceTensorFn, PluginRegisterKernelsFn, PluginShutdownFn,
+    PluginUpdateStepParamsFn, symbols,
 };
 use libloading::Library;
 use std::collections::HashSet;
@@ -103,6 +104,7 @@ pub struct LoadedPlugin {
     invalidate_f32: Option<PluginInvalidateF32Fn>,
     update_step_params: Option<PluginUpdateStepParamsFn>,
     register_device_tensor: Option<PluginRegisterDeviceTensorFn>,
+    device_stream: Option<PluginDeviceStreamFn>,
 }
 
 impl Drop for LoadedPlugin {
@@ -233,6 +235,15 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Capture-capable stream exported by the active device plugin.
+    #[must_use]
+    pub fn device_stream(&self) -> Option<fellm_plugin_abi::StreamHandle> {
+        self.plugins
+            .iter()
+            .find_map(|plugin| plugin.device_stream.map(|get| unsafe { get() }))
+            .filter(|stream| *stream != 0)
+    }
+
     /// Discover and activate all plugins in `dir` (or `FELLM_PLUGIN_DIR` if
     /// `dir` is `None`). Discovery completes before the first plugin is
     /// initialized.
@@ -303,6 +314,7 @@ impl PluginHost {
         let update_step_params = unsafe { lib.get(symbols::UPDATE_STEP_PARAMS).ok().map(|s| *s) };
         let register_device_tensor =
             unsafe { lib.get(symbols::REGISTER_DEVICE_TENSOR).ok().map(|s| *s) };
+        let device_stream = unsafe { lib.get(symbols::DEVICE_STREAM).ok().map(|s| *s) };
 
         let result = (|| {
             let rc = unsafe { init(ctx) };
@@ -324,6 +336,7 @@ impl PluginHost {
             invalidate_f32,
             update_step_params,
             register_device_tensor,
+            device_stream,
         });
         Ok(())
     }

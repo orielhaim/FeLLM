@@ -199,6 +199,8 @@ pub type PluginUpdateStepParamsFn =
 /// Optional device-plan entry: bind a host constant to a packed device address.
 pub type PluginRegisterDeviceTensorFn =
     unsafe extern "C" fn(host_ptr: *const u8, nbytes: usize, device_ptr: u64) -> c_int;
+/// Optional device-plan entry: return the plugin's capture-capable CUDA stream.
+pub type PluginDeviceStreamFn = unsafe extern "C" fn() -> crate::StreamHandle;
 
 /// Maximum free-form features listed in a C capability registration.
 pub const PLUGIN_MAX_FEATURES: usize = 32;
@@ -313,4 +315,6 @@ pub mod symbols {
     pub const UPDATE_STEP_PARAMS: &[u8] = b"_fellm_plugin_update_step_params\0";
     /// `_fellm_plugin_register_device_tensor` (optional)
     pub const REGISTER_DEVICE_TENSOR: &[u8] = b"_fellm_plugin_register_device_tensor\0";
+    /// `_fellm_plugin_device_stream` (optional)
+    pub const DEVICE_STREAM: &[u8] = b"_fellm_plugin_device_stream\0";
 }

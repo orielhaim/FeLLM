@@ -36,6 +36,12 @@ pub struct PagedKvSnapshot {
     pub device_arena: *mut u8,
     /// Device arena length in bytes (`0` if host-only).
     pub device_arena_len: usize,
+    /// Persistent device page-table address, or null for host-only execution.
+    pub device_block_table: *mut u32,
+    /// Active entries at [`Self::device_block_table`].
+    pub n_device_block_table: usize,
+    /// Fixed device-table entries reserved per layer.
+    pub device_logical_stride: usize,
     /// Number of independently-addressed sequence rows in this physical batch.
     pub batch_size: usize,
     /// Dense KV write position for each batch row.
@@ -87,6 +93,9 @@ pub unsafe extern "C" fn host_snapshot_paged_kv(out: *mut PagedKvSnapshot) -> c_
             elem_bytes: ctx.elem_bytes,
             device_arena: ctx.device_arena,
             device_arena_len: ctx.device_arena_len,
+            device_block_table: ctx.device_block_table,
+            n_device_block_table: ctx.n_device_block_table,
+            device_logical_stride: ctx.device_logical_stride,
             batch_size: ctx.batch_size(),
             row_positions: ctx.row_positions.as_ptr(),
             row_lengths: ctx.row_lengths.as_ptr(),
@@ -189,6 +198,12 @@ pub struct PagedKvContext {
     pub device_arena: *mut u8,
     /// Device arena byte length.
     pub device_arena_len: usize,
+    /// Persistent device page-table address.
+    pub device_block_table: *mut u32,
+    /// Active persistent page-table entries.
+    pub n_device_block_table: usize,
+    /// Fixed device-table entries reserved per layer.
+    pub device_logical_stride: usize,
     /// Dense KV write position for every row in the physical batch.
     pub row_positions: Arc<[u32]>,
     /// Attention-visible KV length for every row in the physical batch.

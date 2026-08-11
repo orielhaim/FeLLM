@@ -535,6 +535,22 @@ pub unsafe fn wrap_device_bytes(
     unsafe { DeviceBuffer::<u8>::from_raw_parts(ptr as u64, len, ctx) }
 }
 
+/// Wrap a host-owned persistent device u32 allocation without taking ownership.
+///
+/// # Safety
+/// `ptr` must cover `len` u32 values on `ctx` and outlive all queued work.
+pub unsafe fn wrap_device_u32(
+    ptr: *mut u32,
+    len: usize,
+    ctx: Arc<CudaContext>,
+) -> DeviceBuffer<u32> {
+    unsafe { DeviceBuffer::<u32>::from_raw_parts(ptr as u64, len, ctx) }
+}
+
 pub fn release_wrap(buf: DeviceBuffer<u8>) {
+    let _ = buf.into_raw_parts();
+}
+
+pub fn release_wrap_u32(buf: DeviceBuffer<u32>) {
     let _ = buf.into_raw_parts();
 }

@@ -337,8 +337,10 @@ pub struct Engine {
     #[allow(dead_code)]
     gguf: Arc<GgufFile>,
     tokenizer: Box<dyn Tokenizer>,
-    backend: Box<dyn Backend>,
     model: LoadedModel,
+    // Declared after `model` so CUDA graphs/device allocations are destroyed
+    // before the backend unloads their plugin module and context.
+    backend: Box<dyn Backend>,
     architecture: Option<ArchitecturePluginHandle>,
     architecture_program: Option<fellm_plugin_abi::ModelProgram>,
     /// Evaluation / physical batch settings.
@@ -415,8 +417,11 @@ struct CudaDecodePlan {
         std::collections::HashMap<fellm_plugin_abi::PlanTensorId, fellm_plugin_abi::DeviceTensor>,
     _lowered: LoweredDecodeGraph,
     _physical: fellm_plugin_abi::PhysicalPlan,
-    _device: backend_cuda::DecodeDeviceState,
+    device: backend_cuda::DecodeDeviceState,
     _model: backend_cuda::ModelImage,
+    graph: Option<backend_cuda::CudaGraphExec>,
+    full_step_warmed: bool,
+    graph_replay_safe: bool,
 }
 
 impl Engine {
@@ -1576,22 +1581,48 @@ impl LoadedModel {
                 debug_assert_eq!(len, blob.bytes.len());
                 cuda.register_device_tensor(blob.bytes.as_ptr(), blob.bytes.len(), device_ptr)?;
             }
-            let device =
-                backend_cuda::DecodeDeviceState::new(cuda.device_state(), physical.arena_bytes)?;
+            let page_table_capacity = self
+                .cache
+                .n_layers()
+                .saturating_mul(self.max_seq.div_ceil(crate::kv_fabric::BLOCK_SIZE));
+            let device = backend_cuda::DecodeDeviceState::new(
+                cuda.device_state(),
+                physical.arena_bytes,
+                page_table_capacity,
+                self.cache.n_layers(),
+            )?;
             let tensors = device.arena.resolve(&physical, &lowered.tensors)?;
+            let graph_replay_safe = !self.spec.is_hybrid()
+                && lowered
+                    .operations
+                    .iter()
+                    .find(|operation| operation.kind == fellm_plugin_abi::MacroOpKind::Embedding)
+                    .is_some_and(|operation| {
+                        operation.inputs.iter().any(|tensor| {
+                            lowered.tensors.iter().any(|desc| {
+                                desc.id == *tensor
+                                    && desc.storage == fellm_plugin_abi::StorageClass::Model
+                                    && matches!(desc.dtype, DType::Q4K | DType::Q6K)
+                            })
+                        })
+                    });
             tracing::info!(
                 arena_bytes = physical.arena_bytes,
                 tensor_count = lowered.tensors.len(),
                 macro_ops = physical.operations.len(),
                 model_image_bytes = model.byte_len(),
+                graph_replay_safe,
                 "compiled device-native CUDA decode layout"
             );
             self.cuda_decode = Some(CudaDecodePlan {
                 tensors,
                 _lowered: lowered,
                 _physical: physical,
-                _device: device,
+                device,
                 _model: model,
+                graph: None,
+                full_step_warmed: false,
+                graph_replay_safe,
             });
         }
         let mut mutable_inputs: std::collections::HashMap<String, MutableBinding> =
@@ -1840,6 +1871,9 @@ impl LoadedModel {
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
+            device_block_table: std::ptr::null_mut(),
+            n_device_block_table: 0,
+            device_logical_stride: 0,
             row_positions: Arc::from(row_positions),
             row_lengths: Arc::from(row_lengths),
             row_rope_positions: Arc::from(rope_positions),
@@ -1921,6 +1955,9 @@ impl LoadedModel {
             pos
         };
         self.cache.ensure_writable(&mut self.seq, kv_pos)?;
+        // CUDA compilation owns the fixed-capacity device page table used by
+        // the context installed below. The call is idempotent after token one.
+        self.compile_step(backend)?;
         if self.seq.is_compressed() {
             // Track absolute identity of the newly written dense slot.
             if self.seq.original_positions.len() == kv_pos {
@@ -1940,6 +1977,27 @@ impl LoadedModel {
 
         let n_logical = self.seq.layer_map(0).num_pages().max(1);
         let block_table = self.cache.physical_block_table(&self.seq);
+
+        #[cfg(feature = "backend-cuda")]
+        let (device_block_table, n_device_block_table, device_logical_stride) =
+            if let (Some(cuda), Some(decode)) = (
+                backend.as_any().downcast_ref::<backend_cuda::CudaBackend>(),
+                self.cuda_decode.as_mut(),
+            ) {
+                decode.device.sync_page_table(
+                    cuda.device_state(),
+                    &block_table,
+                    self.cache.n_layers(),
+                    n_logical,
+                )?;
+                let (pointer, len) = decode.device.page_table_ptr();
+                (pointer, len, decode.device.page_table_stride())
+            } else {
+                (std::ptr::null_mut(), 0, 0)
+            };
+        #[cfg(not(feature = "backend-cuda"))]
+        let (device_block_table, n_device_block_table, device_logical_stride) =
+            (std::ptr::null_mut(), 0usize, 0usize);
 
         let (device_arena, device_arena_len) = {
             #[cfg(feature = "backend-cuda")]
@@ -1979,6 +2037,9 @@ impl LoadedModel {
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
+            device_block_table,
+            n_device_block_table,
+            device_logical_stride,
             row_positions: std::sync::Arc::from([kv_pos as u32]),
             row_lengths: std::sync::Arc::from([self.seq.len_tokens as u32]),
             row_rope_positions: std::sync::Arc::from([pos as u32]),
@@ -2063,6 +2124,47 @@ impl LoadedModel {
 
         step.bind_input("token_id", scalar_u32_tensor(tok));
 
+        #[cfg(feature = "backend-cuda")]
+        if compute_logits
+            // Per-op profiling synchronizes around every launch. CUDA forbids
+            // those synchronization calls while a stream is being captured,
+            // so profiling deliberately exercises the uncaptured schedule.
+            && std::env::var_os("FELLM_PROFILE_OPS").is_none()
+            && let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>()
+            && let Some(decode) = self.cuda_decode.as_mut()
+            && decode.graph_replay_safe
+        {
+            if let Some(graph) = &decode.graph {
+                let boundary_profile = std::env::var_os("FELLM_PROFILE_CUDA_BOUNDARY").is_some();
+                let launched_at = boundary_profile.then(Instant::now);
+                graph.launch()?;
+                let launch_us = launched_at.map(|started| started.elapsed().as_micros());
+                let materialized_at = boundary_profile.then(Instant::now);
+                let result = step.materialize_result(backend, true);
+                if boundary_profile {
+                    tracing::info!(
+                        launch_us = launch_us.unwrap_or_default(),
+                        materialize_us = materialized_at
+                            .map(|started| started.elapsed().as_micros())
+                            .unwrap_or_default(),
+                        "CUDA decode host boundary profile"
+                    );
+                }
+                return result;
+            }
+            if decode.full_step_warmed {
+                let capture = cuda.begin_graph_capture()?;
+                step.enqueue(backend, true)?;
+                decode.graph = Some(capture.finish()?);
+                tracing::info!(
+                    macro_ops = decode._physical.operations.len(),
+                    "captured stable CUDA decode graph"
+                );
+                return step.materialize_result(backend, true);
+            }
+            decode.full_step_warmed = true;
+        }
+
         step.run(backend, compute_logits)
     }
 
@@ -2112,6 +2214,9 @@ impl LoadedModel {
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
+            device_block_table: std::ptr::null_mut(),
+            n_device_block_table: 0,
+            device_logical_stride: 0,
             row_positions: std::sync::Arc::from([prompt_len as u32]),
             row_lengths: std::sync::Arc::from([prompt_len as u32]),
             row_rope_positions: std::sync::Arc::from([prompt_len as u32]),

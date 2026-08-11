@@ -8,12 +8,14 @@
 
 mod backend;
 mod device;
+mod graph;
 mod pinned_swap;
 mod plan;
 mod vram_pool;
 
 pub use backend::CudaBackend;
-pub use device::CudaDeviceState;
+pub use device::{CudaDeviceCaps, CudaDeviceState};
+pub use graph::{CudaGraphCapture, CudaGraphExec};
 pub use pinned_swap::PinnedSwapArena;
 pub use plan::{CudaStaticArena, DecodeDeviceState, ModelBlob, ModelImage, plan_static_arena};
 pub use vram_pool::DeviceKvArena;

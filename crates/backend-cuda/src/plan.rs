@@ -283,11 +283,23 @@ pub struct DecodeDeviceState {
     /// Device-resident next-token result.
     #[cfg(feature = "cuda")]
     pub next_token: CudaSlice<u32>,
+    /// Fixed-capacity per-request page table used by every replay.
+    #[cfg(feature = "cuda")]
+    pub page_table: CudaSlice<u32>,
+    page_table_capacity: usize,
+    page_table_stride: usize,
+    page_table_upload: Vec<u32>,
+    page_table_shadow: Vec<u32>,
 }
 
 impl DecodeDeviceState {
     /// Allocate all steady-state decode storage. No allocation is needed per token.
-    pub fn new(device: &crate::CudaDeviceState, arena_bytes: usize) -> Result<Self> {
+    pub fn new(
+        device: &crate::CudaDeviceState,
+        arena_bytes: usize,
+        page_table_capacity: usize,
+        page_table_layers: usize,
+    ) -> Result<Self> {
         let arena = CudaStaticArena::new(device, arena_bytes)?;
         #[cfg(feature = "cuda")]
         {
@@ -299,17 +311,96 @@ impl DecodeDeviceState {
                 .stream()
                 .alloc_zeros::<u32>(1)
                 .map_err(|e| FellmError::other(format!("allocate next-token result: {e}")))?;
+            let page_table = device
+                .stream()
+                .alloc_zeros::<u32>(page_table_capacity.max(1))
+                .map_err(|e| FellmError::other(format!("allocate device page table: {e}")))?;
             Ok(Self {
                 arena,
                 params,
                 next_token,
+                page_table,
+                page_table_capacity,
+                page_table_stride: page_table_capacity / page_table_layers.max(1),
+                page_table_upload: vec![u32::MAX; page_table_capacity],
+                page_table_shadow: Vec::new(),
             })
         }
         #[cfg(not(feature = "cuda"))]
         {
             let _ = device;
-            Ok(Self { arena })
+            Ok(Self {
+                arena,
+                page_table_capacity,
+                page_table_stride: page_table_capacity / page_table_layers.max(1),
+                page_table_upload: vec![u32::MAX; page_table_capacity],
+                page_table_shadow: Vec::new(),
+            })
         }
+    }
+
+    /// Upload the page table only when allocation topology changes.
+    pub fn sync_page_table(
+        &mut self,
+        device: &crate::CudaDeviceState,
+        table: &[u32],
+        n_layers: usize,
+        n_logical: usize,
+    ) -> Result<bool> {
+        if table.len() > self.page_table_capacity {
+            return Err(FellmError::other(format!(
+                "device page table capacity exceeded: {} > {}",
+                table.len(),
+                self.page_table_capacity
+            )));
+        }
+        if self.page_table_shadow == table {
+            return Ok(false);
+        }
+        if table.len() != n_layers.saturating_mul(n_logical) || n_logical > self.page_table_stride {
+            return Err(FellmError::other("invalid compact page-table dimensions"));
+        }
+        self.page_table_upload.fill(u32::MAX);
+        for layer in 0..n_layers {
+            let source = &table[layer * n_logical..(layer + 1) * n_logical];
+            let start = layer * self.page_table_stride;
+            self.page_table_upload[start..start + n_logical].copy_from_slice(source);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let mut target = self
+                .page_table
+                .try_slice_mut(..self.page_table_upload.len())
+                .ok_or_else(|| FellmError::other("invalid device page-table range"))?;
+            device
+                .stream()
+                .memcpy_htod(&self.page_table_upload, &mut target)
+                .map_err(|error| FellmError::other(format!("upload device page table: {error}")))?;
+        }
+        self.page_table_shadow.clear();
+        self.page_table_shadow.extend_from_slice(table);
+        Ok(true)
+    }
+
+    /// Stable device page-table address and current logical length.
+    #[must_use]
+    pub fn page_table_ptr(&self) -> (*mut u32, usize) {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::DevicePtr;
+            let (pointer, _guard) = self.page_table.device_ptr(self.page_table.stream());
+            (pointer as *mut u32, self.page_table_capacity)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            (std::ptr::null_mut(), 0)
+        }
+    }
+
+    /// Fixed logical-page stride between adjacent layers.
+    #[must_use]
+    pub fn page_table_stride(&self) -> usize {
+        self.page_table_stride
     }
 }
 
