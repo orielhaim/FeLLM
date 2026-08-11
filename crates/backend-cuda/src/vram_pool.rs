@@ -31,7 +31,6 @@ impl DeviceKvArena {
             }
             let tokens_stride = n_kv_heads.max(1) * head_dim.max(1);
             let block_elems = 2 * BLOCK_SIZE * tokens_stride;
-            // Match CPU PhysicalPool: store f16 (2 bytes/elem), pad to 64 bytes.
             let raw_bytes = block_elems * 2;
             let block_bytes = (raw_bytes + 63) & !63;
             let total = n_blocks

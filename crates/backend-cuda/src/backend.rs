@@ -276,7 +276,7 @@ impl CudaBackend {
         }
     }
 
-    /// Upload host `PhysicalPool` bytes into the VRAM arena (prefix / cold start).
+    /// Upload host fabric arena bytes into the VRAM arena (prefix / cold start).
     pub fn sync_kv_host_to_device(&self, host: &[u8]) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -306,7 +306,7 @@ impl CudaBackend {
         }
     }
 
-    /// Download VRAM arena into host `PhysicalPool` (swap / debug).
+    /// Download VRAM arena into host fabric arena (migrate / debug).
     pub fn sync_kv_device_to_host(&self, host: &mut [u8]) -> Result<()> {
         #[cfg(feature = "cuda")]
         {

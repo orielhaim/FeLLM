@@ -1,5 +1,5 @@
 use fellm_runtime::{
-    BackendPreference, Engine, EngineSettings, GenParams, KvCacheConfig, Scheduler, SequenceEvent,
+    BackendPreference, Engine, EngineSettings, GenParams, KvFabricConfig, Scheduler, SequenceEvent,
 };
 use std::path::Path;
 
@@ -17,9 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ubatch_size(8)
         .backend_preference(preference)
         .allow_cpu_fallback(false)
-        .kv_cache(KvCacheConfig {
-            budget_bytes: Some(256 * 1024 * 1024),
-            ..KvCacheConfig::default()
+        .kv_cache(KvFabricConfig {
+            device_budget: Some(256 * 1024 * 1024),
+            ..KvFabricConfig::default()
         });
     let mut engine = Engine::open_with(Path::new(&model), settings)?;
     let recurrent = engine.spec().is_hybrid();

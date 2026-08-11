@@ -482,8 +482,8 @@ fn u32_shadows() -> &'static Mutex<HashMap<usize, Vec<u32>>> {
 /// present the same table within a token, and a redundant async copy here also
 /// creates an implicit synchronization point on the CUDA stream.
 pub fn ensure_u32(stream: &CudaStream, host: &[u32]) -> Result<usize, i32> {
-    let key = host.as_ptr() as usize;
     let len = host.len();
+    let key = host.as_ptr() as usize;
     let mut guard = u32_cache().lock().map_err(|_| -30)?;
     let mut shadows = u32_shadows().lock().map_err(|_| -30)?;
     if let Some(e) = guard.get_mut(&key) {

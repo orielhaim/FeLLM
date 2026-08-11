@@ -30,7 +30,7 @@ The engine is designed around two promises that usually don't coexist:
 FeLLM is in active early development. Two backends are available today:
 
 - **CPU** - with SIMD acceleration (AVX2, AVX-512, NEON) and full GGUF quantization support.
-- **CUDA** - targeting NVIDIA GPUs from Ampere onward.
+- **CUDA** - targeting NVIDIA GPUs from Ampere onward. (linux only currently)
 
 *Metal, ROCm, and Vulkan backends are planned.*
 
@@ -39,6 +39,10 @@ FeLLM is in active early development. Two backends are available today:
 - **dense attention** - the standard Transformer architecture.
 - **MoE** - mixture-of-experts.
 - **Diffusion** - block-diffusion models. (plugin)
+
+### KV Fabric
+
+Unified KV Fabric that virtualizes and manages KV state across memory tiers, with sharing, paging, residency-aware scheduling, and efficient reuse. It is designed to benefit both high-concurrency servers and individual users running long-context workloads on limited hardware.
 
 ## Building
 

@@ -1,37 +1,27 @@
-//! Contiguous per-layer KV cache (legacy Phase 1).
+//! Graph-binding dummy K/V buffers.
 //!
-//! Prefer [`crate::paged::CacheManager`] for new code. Kept for tests and
-//! as dummy graph-binding buffers.
+//! Paged/fabric kernels ignore these when a KV context is installed; the graph
+//! still needs stable buffer bindings for `k_in_*` / `v_in_*`.
 
 use fellm_core::error::Result;
 use fellm_core::storage::AlignedBuffer;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// One layer of the KV cache.
-pub struct CacheLayer {
-    /// K buffer, `max_seq * n_kv_heads * head_dim` f32.
+pub struct DummyLayer {
     pub k: Rc<RefCell<AlignedBuffer>>,
-    /// V buffer, same shape.
     pub v: Rc<RefCell<AlignedBuffer>>,
 }
 
-/// Contiguous KV cache across all layers.
-pub struct KvCache {
-    /// Per-layer buffers.
-    pub layers: Vec<CacheLayer>,
-    /// Current filled length in tokens.
-    pub len: usize,
-    /// Per-token stride in f32 elements per layer.
+/// Contiguous placeholder buffers for graph binding only.
+pub struct DummyKvBuffers {
+    pub layers: Vec<DummyLayer>,
     pub tokens_stride: usize,
-    /// Maximum sequence length.
     pub max_seq: usize,
-    /// Number of layers.
     pub n_layers: usize,
 }
 
-impl KvCache {
-    /// Allocate a fresh cache.
+impl DummyKvBuffers {
     pub fn new(
         n_layers: usize,
         max_seq: usize,
@@ -42,37 +32,26 @@ impl KvCache {
         let bytes_per_layer = max_seq.max(1) * per_token.max(1) * 4;
         let mut layers = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            layers.push(CacheLayer {
+            layers.push(DummyLayer {
                 k: Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes_per_layer, 64))),
                 v: Rc::new(RefCell::new(AlignedBuffer::new_zeroed(bytes_per_layer, 64))),
             });
         }
         Ok(Self {
             layers,
-            len: 0,
             tokens_stride: per_token,
             max_seq,
             n_layers,
         })
     }
 
-    /// Shared K buffer for a layer.
+    #[must_use]
     pub fn k_buffer(&self, layer: usize) -> Rc<RefCell<AlignedBuffer>> {
         self.layers[layer].k.clone()
     }
 
-    /// Shared V buffer for a layer.
+    #[must_use]
     pub fn v_buffer(&self, layer: usize) -> Rc<RefCell<AlignedBuffer>> {
         self.layers[layer].v.clone()
-    }
-
-    /// Bump the logical length after a step.
-    pub fn advance(&mut self) {
-        self.len += 1;
-    }
-
-    /// Reset.
-    pub fn reset(&mut self) {
-        self.len = 0;
     }
 }

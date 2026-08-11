@@ -64,7 +64,7 @@ pub fn spawn_worker(
                     .absolute(prefix.evicted_tokens);
                 metrics::counter!("fellm_prefix_tokens_saved_total").absolute(prefix.tokens_saved);
                 metrics::gauge!("fellm_prefix_cached_tokens").set(prefix.cached_tokens as f64);
-                metrics::gauge!("fellm_prefix_cache_blocks").set(prefix.occupied_blocks as f64);
+                metrics::gauge!("fellm_prefix_cache_blocks").set(prefix.occupied_pages as f64);
                 metrics::gauge!("fellm_prefix_cache_bytes").set(prefix.occupied_bytes as f64);
                 // Cancellation is an explicit request-lifetime signal shared with
                 // the async HTTP side; response-channel state is not the oracle.

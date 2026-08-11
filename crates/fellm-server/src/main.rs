@@ -55,9 +55,17 @@ struct Args {
     #[arg(long, default_value_t = 0.25)]
     kv_memory_fraction: f64,
 
-    /// Host swap-tier bytes reserved for paged KV.
-    #[arg(long, default_value_t = 0)]
-    kv_swap_bytes: u64,
+    /// Host residency-tier bytes for KV migration / preempt.
+    #[arg(long = "kv-host-budget", alias = "kv-swap-bytes", default_value_t = 0)]
+    kv_host_budget: u64,
+
+    /// KV fabric mode: `auto`, `exact`, or `elastic`.
+    #[arg(long = "kv-mode", default_value = "auto")]
+    kv_mode: String,
+
+    /// KV addressing: `block_table` or `virtual_memory`.
+    #[arg(long = "kv-addressing", default_value = "block_table")]
+    kv_addressing: String,
 
     /// Bytes kept free as a safety reserve.
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
@@ -118,12 +126,14 @@ async fn main() {
         std::process::exit(1);
     });
     let select = BackendSelect::new(preference, !args.no_cpu_fallback);
-    let kv_cache = fellm_runtime::KvCacheConfig {
-        budget_bytes: (args.kv_cache_bytes > 0).then_some(args.kv_cache_bytes),
+    let kv_cache = fellm_runtime::KvFabricConfig {
+        mode: fellm_runtime::KvMode::parse(&args.kv_mode).unwrap_or_default(),
+        device_budget: (args.kv_cache_bytes > 0).then_some(args.kv_cache_bytes),
+        host_budget: Some(args.kv_host_budget),
+        addressing: fellm_runtime::KvAddressing::parse(&args.kv_addressing).unwrap_or_default(),
         memory_fraction: args.kv_memory_fraction,
         safety_reserve_bytes: args.kv_safety_reserve_bytes,
-        swap_bytes: args.kv_swap_bytes,
-        ..fellm_runtime::KvCacheConfig::default()
+        ..fellm_runtime::KvFabricConfig::default()
     };
     let mut settings = EngineSettings::default()
         .batch_size(args.batch_size)

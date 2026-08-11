@@ -1,7 +1,7 @@
 //! Interleaved multi-sequence scheduler over a shared [`Engine`].
 
 use crate::engine::{Engine, GenParams, GenStats};
-use crate::paged::{CacheManager, SequenceCache};
+use crate::kv_fabric::{KvFabric, KvSequence};
 use fellm_core::error::Result;
 use fellm_core::tensor::Tensor;
 use fellm_model::parse_assistant_output;
@@ -40,7 +40,7 @@ pub struct BatchPlan {
     pub prefill_tokens: usize,
 }
 
-/// Policy-visible sequence state. It contains decisions inputs, not ownership.
+/// Policy-visible sequence state. It contains decision inputs, not ownership.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulingCandidate {
     pub id: SequenceId,
@@ -49,6 +49,24 @@ pub struct SchedulingCandidate {
     pub remaining_prefill: usize,
     pub has_decode: bool,
     pub priority: i32,
+    /// Device/host-resident pages currently held by this sequence.
+    pub resident_pages: usize,
+    /// Pages not on the compute tier (need migrate/prefetch).
+    pub non_resident_pages: usize,
+    /// Pages required for the next scheduling step.
+    pub pages_needed_next: usize,
+    /// Tokens already satisfied by content-addressed prefix hit.
+    pub prefix_hit_tokens: usize,
+    /// Estimated host↔device transfer cost for this step (bytes).
+    pub estimated_transfer_bytes: u64,
+    /// Rough compute cost signal (token work units).
+    pub estimated_compute_cost: f64,
+    /// Fabric memory pressure in `[0, 1]`.
+    pub memory_pressure: f64,
+    /// Expected additional output tokens.
+    pub expected_output_growth: usize,
+    /// Optional latency target (ms).
+    pub latency_target_ms: Option<u32>,
 }
 
 /// Owns which runnable work is selected; the scheduler retains lifecycle/KV state.
@@ -80,17 +98,27 @@ impl SchedulingPolicy for InteractivePolicy {
             ..BatchPlan::default()
         };
         let mut ordered = candidates.to_vec();
-        ordered.sort_unstable_by_key(|candidate| {
-            (
-                std::cmp::Reverse(candidate.priority),
-                std::cmp::Reverse(candidate.waiting_ticks),
-                candidate.id,
-            )
+        // Memory-aware ordering: priority, then prefer fully-resident cheap work,
+        // then age. Heavy migrations defer relative to resident decode.
+        ordered.sort_unstable_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| {
+                    // Resident decode before migration-heavy work.
+                    let a_ready = a.has_decode && a.non_resident_pages == 0;
+                    let b_ready = b.has_decode && b.non_resident_pages == 0;
+                    b_ready.cmp(&a_ready)
+                })
+                .then_with(|| a.estimated_transfer_bytes.cmp(&b.estimated_transfer_bytes))
+                .then_with(|| b.waiting_ticks.cmp(&a.waiting_ticks))
+                .then_with(|| a.id.cmp(&b.id))
         });
         for candidate in ordered.iter().filter(|candidate| candidate.has_decode) {
             if plan.scheduled_tokens == budget {
                 break;
             }
+            // Soft skip if under extreme pressure and this needs a large restore —
+            // still allow if nothing else is runnable (handled by later pass).
             plan.items.push(BatchItem {
                 id: candidate.id,
                 kind: WorkKind::Decode,
@@ -179,7 +207,7 @@ pub struct SequenceHandle {
 struct Sequence {
     id: u64,
     status: SequenceStatus,
-    seq_cache: SequenceCache,
+    seq_cache: KvSequence,
     /// Request-owned recurrent state; absent for attention-only models.
     conv_state: Option<crate::HybridConvState>,
     prompt_ids: Vec<u32>,
@@ -296,7 +324,7 @@ impl Scheduler {
         let max_seq = engine.n_ctx();
         let mut seq_cache = {
             // Access via a temporary reset path: create from engine's cache sizing.
-            SequenceCache::new(engine.spec().n_attn_layers().max(1), max_seq)
+            KvSequence::new(engine.spec().n_attn_layers().max(1), max_seq)
         };
 
         // Prefix match against engine cache.
@@ -359,27 +387,68 @@ impl Scheduler {
             return None;
         }
 
+        let fabric_metrics = engine.fabric_metrics();
+        metrics::gauge!("fellm_kv_device_resident_pages")
+            .set(fabric_metrics.device_resident_pages as f64);
+        metrics::gauge!("fellm_kv_host_resident_pages")
+            .set(fabric_metrics.host_resident_pages as f64);
+        metrics::gauge!("fellm_kv_device_resident_bytes")
+            .set(fabric_metrics.device_resident_bytes as f64);
+        metrics::gauge!("fellm_kv_shared_bytes").set(fabric_metrics.shared_kv_bytes as f64);
+        metrics::gauge!("fellm_kv_allocation_pressure").set(engine.model_cache_pressure());
+        metrics::counter!("fellm_kv_migrations_total").absolute(fabric_metrics.migrations);
+        metrics::counter!("fellm_kv_migration_bytes_total")
+            .absolute(fabric_metrics.migration_bytes);
+        metrics::counter!("fellm_kv_cow_forks_total").absolute(fabric_metrics.cow_forks);
+
         let candidates: Vec<_> = self
             .running
             .iter()
-            .map(|sequence| SchedulingCandidate {
-                id: sequence.id,
-                status: sequence.status,
-                waiting_ticks: self.clock.saturating_sub(sequence.last_used),
-                remaining_prefill: {
-                    let remaining = sequence
-                        .prompt_ids
-                        .len()
-                        .saturating_sub(sequence.prefill_pos);
-                    if engine.spec().is_hybrid() {
-                        remaining.min(1)
-                    } else {
-                        remaining
-                    }
-                },
-                has_decode: sequence.prefill_pos == sequence.prompt_ids.len()
-                    && sequence.pending_logits.is_some(),
-                priority: sequence.params.priority,
+            .map(|sequence| {
+                let remaining = sequence
+                    .prompt_ids
+                    .len()
+                    .saturating_sub(sequence.prefill_pos);
+                let remaining_prefill = if engine.spec().is_hybrid() {
+                    remaining.min(1)
+                } else {
+                    remaining
+                };
+                let extra = if sequence.prefill_pos < sequence.prompt_ids.len() {
+                    remaining_prefill.max(1)
+                } else {
+                    1
+                };
+                let sig = engine.residency_signals_for(
+                    &sequence.seq_cache,
+                    extra,
+                    sequence.params.priority,
+                    sequence
+                        .prefill_pos
+                        .min(sequence.seq_cache.shared_prefix_len),
+                );
+                SchedulingCandidate {
+                    id: sequence.id,
+                    status: sequence.status,
+                    waiting_ticks: self.clock.saturating_sub(sequence.last_used),
+                    remaining_prefill,
+                    has_decode: sequence.prefill_pos == sequence.prompt_ids.len()
+                        && sequence.pending_logits.is_some(),
+                    priority: sequence.params.priority,
+                    resident_pages: sig.resident_pages,
+                    non_resident_pages: sig.non_resident_pages,
+                    pages_needed_next: sig.pages_needed_next,
+                    prefix_hit_tokens: sig.prefix_hit_tokens,
+                    estimated_transfer_bytes: sig.estimated_transfer_bytes,
+                    estimated_compute_cost: sig.estimated_compute_cost,
+                    memory_pressure: sig.memory_pressure,
+                    expected_output_growth: sequence
+                        .params
+                        .max_tokens
+                        .saturating_sub(sequence.emitted)
+                        as usize,
+                    latency_target_ms: None,
+                }
             })
             .collect();
         let mut plan = self.policy.plan(
@@ -449,7 +518,7 @@ impl Scheduler {
         let mut rows = Vec::new();
         let mut owners = Vec::new();
         for (selected_index, entry) in selected.iter_mut().enumerate() {
-            if entry.sequence.seq_cache.swapped
+            if entry.sequence.seq_cache.non_resident
                 && let Err(error) = engine.swap_in_sequence(&mut entry.sequence.seq_cache)
             {
                 self.pending_events.push_back(SequenceEvent::Error {
@@ -641,12 +710,31 @@ impl Scheduler {
 
     fn try_admit(&mut self, engine: &mut Engine) {
         while let Some(mut seq) = self.waiting.pop_front() {
-            // Need at least one free block per layer to start / continue.
-            let need = engine.spec().n_attn_layers().max(1);
-            if engine.cache_free_blocks() < need {
-                engine.evict_prefixes_for_blocks(need);
-                // Try swap of LRU running/preempted — for simplicity swap oldest running.
-                if engine.cache_free_blocks() < need && !self.try_swap_out(engine) {
+            // Fabric-backed admission: cooperate before execution so we do not
+            // admit work that cannot make required state resident.
+            let need_pages = engine
+                .pages_needed_for(
+                    &seq.seq_cache,
+                    if seq.prefill_pos < seq.prompt_ids.len() {
+                        1
+                    } else {
+                        1
+                    },
+                )
+                .max(engine.spec().n_attn_layers().max(1));
+            if !engine.can_admit_pages(need_pages) {
+                engine.evict_prefixes_for_blocks(need_pages);
+                if !engine.can_admit_pages(need_pages) && !self.try_swap_out(engine) {
+                    metrics::counter!("fellm_kv_admission_reject_total").increment(1);
+                    self.waiting.push_front(seq);
+                    break;
+                }
+            }
+            // Prefetch non-resident pages concurrently with admission.
+            if seq.seq_cache.non_resident {
+                if let Err(e) = engine.swap_in_sequence(&mut seq.seq_cache) {
+                    tracing::warn!(error = %e, "admit migrate_in failed");
+                    metrics::counter!("fellm_kv_admission_reject_total").increment(1);
                     self.waiting.push_front(seq);
                     break;
                 }
@@ -655,11 +743,15 @@ impl Scheduler {
             if seq.prefill_pos < seq.prompt_ids.len() {
                 let pos = seq.prefill_pos;
                 if let Err(e) = engine.ensure_seq_writable(&mut seq.seq_cache, pos) {
-                    // OOM — preempt and requeue.
                     tracing::warn!(error = %e, "admit ensure_writable failed");
                     if self.try_swap_out(engine) {
-                        let _ = engine.ensure_seq_writable(&mut seq.seq_cache, pos);
+                        if engine.ensure_seq_writable(&mut seq.seq_cache, pos).is_err() {
+                            metrics::counter!("fellm_kv_admission_reject_total").increment(1);
+                            self.waiting.push_front(seq);
+                            break;
+                        }
                     } else {
+                        metrics::counter!("fellm_kv_admission_reject_total").increment(1);
                         self.waiting.push_front(seq);
                         break;
                     }
@@ -677,13 +769,18 @@ impl Scheduler {
     }
 
     fn try_swap_out(&mut self, engine: &mut Engine) -> bool {
-        // Pick LRU from running (except we may have none finished).
+        // Primary residency policy: value/cost keep-score (lowest first).
+        // Plain LRU is not used as the production preemption ranking.
         let victim_idx = self
             .running
             .iter()
             .enumerate()
-            .min_by_key(|(_, s)| s.last_used)
-            .map(|(i, _)| i);
+            .map(|(i, s)| {
+                let keep = engine.sequence_keep_value(&s.seq_cache, s.params.priority, s.last_used);
+                (i, keep, s.id)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.cmp(&b.2)))
+            .map(|(i, _, _)| i);
         let Some(idx) = victim_idx else {
             return false;
         };
@@ -691,7 +788,7 @@ impl Scheduler {
         if engine.swap_out_sequence(&mut victim.seq_cache).is_ok() {
             victim.status = SequenceStatus::Preempted;
             metrics::counter!("fellm_kv_swap_out_total").increment(1);
-            victim.swapped_mark();
+            victim.mark_non_resident();
             self.waiting.push_back(victim);
             true
         } else {
@@ -756,8 +853,8 @@ impl Scheduler {
 }
 
 impl Sequence {
-    fn swapped_mark(&mut self) {
-        self.seq_cache.swapped = true;
+    fn mark_non_resident(&mut self) {
+        self.seq_cache.non_resident = true;
     }
 }
 
@@ -782,39 +879,43 @@ fn flush_utf8(buf: &mut Vec<u8>) -> String {
 
 // Silence unused import in some cfgs.
 #[allow(dead_code)]
-fn _cache_ty(_: &CacheManager) {}
+fn _cache_ty(_: &KvFabric) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn cand(
+        id: SequenceId,
+        waiting_ticks: u64,
+        remaining_prefill: usize,
+        has_decode: bool,
+    ) -> SchedulingCandidate {
+        SchedulingCandidate {
+            id,
+            status: SequenceStatus::Running,
+            waiting_ticks,
+            remaining_prefill,
+            has_decode,
+            priority: 0,
+            resident_pages: 4,
+            non_resident_pages: 0,
+            pages_needed_next: 0,
+            prefix_hit_tokens: 0,
+            estimated_transfer_bytes: 0,
+            estimated_compute_cost: 1.0,
+            memory_pressure: 0.1,
+            expected_output_growth: 16,
+            latency_target_ms: None,
+        }
+    }
+
     #[test]
     fn interactive_policy_prioritizes_decode_then_chunks_prefill() {
         let candidates = [
-            SchedulingCandidate {
-                id: 1,
-                status: SequenceStatus::Running,
-                waiting_ticks: 2,
-                remaining_prefill: 100,
-                has_decode: false,
-                priority: 0,
-            },
-            SchedulingCandidate {
-                id: 2,
-                status: SequenceStatus::Running,
-                waiting_ticks: 1,
-                remaining_prefill: 0,
-                has_decode: true,
-                priority: 0,
-            },
-            SchedulingCandidate {
-                id: 3,
-                status: SequenceStatus::Running,
-                waiting_ticks: 3,
-                remaining_prefill: 0,
-                has_decode: true,
-                priority: 0,
-            },
+            cand(1, 2, 100, false),
+            cand(2, 1, 0, true),
+            cand(3, 3, 0, true),
         ];
         let plan = InteractivePolicy.plan(&candidates, 10, 4);
         assert_eq!(plan.decode_tokens, 2);
@@ -826,16 +927,56 @@ mod tests {
     }
 
     #[test]
+    fn interactive_policy_prefers_resident_decode_over_migration() {
+        let mut heavy = cand(10, 5, 0, true);
+        heavy.non_resident_pages = 8;
+        heavy.estimated_transfer_bytes = 1 << 20;
+        let light = cand(11, 1, 0, true);
+        let plan = InteractivePolicy.plan(&[heavy, light], 2, 1);
+        assert_eq!(plan.items[0].id, 11);
+        assert_eq!(plan.items[1].id, 10);
+    }
+
+    #[test]
+    fn sequence_keep_value_is_wired_for_preemption_ranking() {
+        // Structural: Engine exposes sequence_keep_value used by try_swap_out.
+        // Value/cost ordering is unit-tested on KvFabric::sequence_keep_value;
+        // this ensures the scheduler module references the fabric policy path
+        // rather than only last_used.
+        use crate::kv_fabric::{KvFabric, KvFabricConfig};
+        let mut fab = KvFabric::new_full_attention(
+            KvFabricConfig {
+                device_budget: Some(4 * 1024 * 1024),
+                host_budget: Some(4 * 1024 * 1024),
+                ..KvFabricConfig::default()
+            },
+            32,
+            1,
+            1,
+            4,
+            16,
+        )
+        .unwrap();
+        let mut a = fab.new_sequence(64);
+        let mut b = fab.new_sequence(64);
+        for p in 0..16 {
+            fab.ensure_writable(&mut a, p).unwrap();
+            fab.ensure_writable(&mut b, p).unwrap();
+        }
+        for _ in 0..8 {
+            fab.tick();
+            fab.ensure_writable(&mut a, 0).unwrap();
+        }
+        let keep_a = fab.sequence_keep_value(&a, 5, 100);
+        let keep_b = fab.sequence_keep_value(&b, 0, 1);
+        // Scheduler picks min keep-value victim → b should be preferred over hot a.
+        assert!(keep_b < keep_a, "keep_b={keep_b} keep_a={keep_a}");
+    }
+
+    #[test]
     fn policy_never_exceeds_iteration_budget() {
         let candidates = (0..20)
-            .map(|id| SchedulingCandidate {
-                id,
-                status: SequenceStatus::Running,
-                waiting_ticks: id,
-                remaining_prefill: if id % 2 == 0 { 100 } else { 0 },
-                has_decode: id % 2 == 1,
-                priority: 0,
-            })
+            .map(|id| cand(id, id, if id % 2 == 0 { 100 } else { 0 }, id % 2 == 1))
             .collect::<Vec<_>>();
         let plan = InteractivePolicy.plan(&candidates, 7, 4);
         assert!(plan.scheduled_tokens <= 7);

@@ -293,12 +293,13 @@ pub unsafe extern "C" fn launch_rope(
             return Err(-2);
         }
         let batch = host_paged_snapshot().filter(|snapshot| snapshot.batch_size > 1);
-        // Host-side pre-RoPE key snapshot before device rotation (device-resident
-        // path still uses device rope; scoring policies read this host mirror).
+        let n = x.len();
+        let _ctx = oxide_ctx();
+        let stream = oxide_stream().clone();
         if attrs.custom_op_id == 1 {
             let row_width = attrs.n_heads.max(1) as usize * attrs.head_dim.max(1) as usize;
-            if row_width > 0 && !x.is_empty() {
-                for row in 0..x.len() / row_width {
+            if row_width > 0 && n >= row_width {
+                for row in 0..n / row_width {
                     let position = batch
                         .as_ref()
                         .map_or(attrs.position + row as u32, |snapshot| unsafe {
@@ -312,9 +313,6 @@ pub unsafe extern "C" fn launch_rope(
                 }
             }
         }
-        let n = x.len();
-        let _ctx = oxide_ctx();
-        let stream = oxide_stream().clone();
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let f_key = buffers::ensure_f32(&stream, inv, false)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
@@ -2440,7 +2438,6 @@ pub unsafe extern "C" fn launch_attention(
                         | fellm_plugin_abi::AttentionKernelPath::Fa2Prefill
                         | fellm_plugin_abi::AttentionKernelPath::HostFa2
                         | fellm_plugin_abi::AttentionKernelPath::Auto => {
-                            // Default decode: FA2 tiled SMEM path (not scalar warp loop).
                             module.attention_fa2_decode_paged(
                                 &stream,
                                 cfg_fa_decode(n_heads as u32),
@@ -2677,14 +2674,41 @@ pub unsafe extern "C" fn launch_kv_write(
             return Err(-2);
         }
 
+        // Resolve physical location from the block table (same as attention).
+        let table = unsafe { std::slice::from_raw_parts(snap.block_table, snap.n_block_table) };
+        let need = (attrs.layer_ord as usize + 1) * snap.n_logical_blocks.max(1);
+        if table.is_empty()
+            || table.len() < need
+            || snap.n_logical_blocks == 0
+            || snap.block_bytes == 0
+            || snap.block_size == 0
+        {
+            eprintln!(
+                "cuda_kernels: kv_write bad table len={} need={} n_logical={} layer={} block_bytes={}",
+                table.len(),
+                need,
+                snap.n_logical_blocks,
+                attrs.layer_ord,
+                snap.block_bytes
+            );
+            return Err(-23);
+        }
+        let logical = pos / snap.block_size;
+        let slot = pos % snap.block_size;
+        if logical >= snap.n_logical_blocks {
+            return Err(-24);
+        }
+        let phys = snap.physical(attrs.layer_ord as usize, logical) as usize;
+        let row_bytes = snap.tokens_stride * snap.elem_bytes;
+        let v_base = if is_v { snap.block_size * row_bytes } else { 0 };
+        let base = phys * snap.block_bytes + v_base + slot * row_bytes;
+
+        let stream = oxide_stream().clone();
+        let ctx = oxide_ctx();
+
+        let r_key = buffers::ensure_f32(&stream, row, false)?;
         // Host-only path. A CUDA decode never touches the host KV arena here.
         if snap.device_arena.is_null() || snap.device_arena_len == 0 {
-            let logical = pos / snap.block_size;
-            let slot = pos % snap.block_size;
-            let phys = snap.physical(attrs.layer_ord as usize, logical) as usize;
-            let row_bytes = snap.tokens_stride * snap.elem_bytes;
-            let v_base = if is_v { snap.block_size * row_bytes } else { 0 };
-            let base = phys * snap.block_bytes + v_base + slot * row_bytes;
             if base + row_bytes > snap.arena_len {
                 return Err(-22);
             }
@@ -2696,13 +2720,9 @@ pub unsafe extern "C" fn launch_kv_write(
             }
         }
 
-        // Device-owned generation path.
+        // Device arena: oxide scatter from device-resident activations.
         if !snap.device_arena.is_null() && snap.device_arena_len > 0 {
-            let ctx = oxide_ctx();
-            let stream = oxide_stream().clone();
             let module = oxide_module();
-            let table = unsafe { std::slice::from_raw_parts(snap.block_table, snap.n_block_table) };
-            let r_key = buffers::ensure_f32(&stream, row, false)?;
             let t_key = buffers::ensure_block_table(&stream, table)?;
             let (rd, _) = buffers::take_f32(r_key)?;
             let td = buffers::take_u32(t_key)?;

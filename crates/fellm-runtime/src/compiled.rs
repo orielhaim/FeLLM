@@ -206,7 +206,6 @@ impl CompiledStep {
             plan.memory.arena_bytes,
             64,
         )));
-
         for &id in &plan.order {
             let node = graph.node(id);
             let input_ids = graph.inputs_slice(id);
@@ -540,6 +539,21 @@ impl CompiledStep {
         // SAFETY: tensor_ref describes a live contiguous logits buffer for this step.
         let bytes = unsafe { core::slice::from_raw_parts(source.data, source.byte_len as usize) };
         taken.as_mut_slice().copy_from_slice(&bytes[..bytes_len]);
+        // CUDA outputs are intentionally device-authoritative. The host arena
+        // can therefore still contain zeros here; copying it produced a fresh
+        // tensor with no device-cache identity, and sampling deterministically
+        // selected token 0. Materialize only this final boundary (not every
+        // intermediate activation) before the reusable arena is overwritten.
+        let host_logits = unsafe {
+            TensorMut::from_raw(
+                self.logits_dtype,
+                source.dims_slice(),
+                source.strides_slice(),
+                taken.as_mut_slice().as_mut_ptr(),
+                bytes_len,
+            )
+        };
+        backend.materialize(source, host_logits)?;
         let layout = Layout::contiguous(self.logits_dtype, self.logits_shape.clone());
         let storage = Arc::new(Storage::Owned(Arc::new(taken)));
         Ok(Tensor::from_storage(layout, storage))

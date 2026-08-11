@@ -8,8 +8,9 @@ use crate::compiled::{CompiledStep, MutableBinding};
 #[cfg(feature = "backend-cuda")]
 use crate::cuda_lowering::{LoweredDecodeGraph, compile_cuda_layout, lower_decode_graph};
 use crate::hybrid_state::HybridConvState;
-use crate::kv_cache::KvCache;
-use crate::paged::{CacheManager, KvCacheConfig, KvMemoryPlan, PhysicalPool, SequenceCache};
+use crate::kv_fabric::{
+    DummyKvBuffers, KvFabric, KvFabricConfig, KvMemoryPlan, KvSequence, STANDARD_PAGE_TOKENS,
+};
 use crate::sampling;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
@@ -67,8 +68,8 @@ pub struct EngineSettings {
     pub providers: crate::providers::ProviderSelection,
     /// Optional plugin directory for dynamic capability plugins.
     pub plugin_dir: Option<std::path::PathBuf>,
-    /// Byte-oriented paged-KV allocation policy.
-    pub kv_cache: KvCacheConfig,
+    /// KV fabric configuration (mode, budgets, addressing, policies).
+    pub kv_cache: KvFabricConfig,
 }
 
 impl Default for EngineSettings {
@@ -81,7 +82,7 @@ impl Default for EngineSettings {
             backend: BackendSelect::from_env(),
             providers: crate::providers::ProviderSelection::new(),
             plugin_dir: None,
-            kv_cache: KvCacheConfig::default(),
+            kv_cache: KvFabricConfig::default(),
         }
     }
 }
@@ -153,7 +154,7 @@ impl EngineSettings {
     }
 
     #[must_use]
-    pub fn kv_cache(mut self, config: KvCacheConfig) -> Self {
+    pub fn kv_cache(mut self, config: KvFabricConfig) -> Self {
         self.kv_cache = config;
         self
     }
@@ -354,13 +355,13 @@ pub struct Engine {
 struct LoadedModel {
     spec: ModelSpec,
     architecture_mode: ArchitectureGenerationMode,
-    /// Shared physical KV pool + prefix/swap.
-    cache: CacheManager,
+    /// KV fabric (logical identity + residency + sharing).
+    cache: KvFabric,
     /// Active single-request sequence (CLI / default path).
-    seq: SequenceCache,
+    seq: KvSequence,
     /// Dummy contiguous buffers kept so the graph can bind `k_in_*` / `v_in_*`
     /// (paged kernels ignore their contents when [`PagedKvContext`] is set).
-    dummy_kv: KvCache,
+    dummy_kv: DummyKvBuffers,
     /// Fixed `ShortConv` state for hybrid models.
     conv: Option<HybridConvState>,
     max_seq: usize,
@@ -524,18 +525,18 @@ impl Engine {
             n_ubatch,
         )?;
 
-        // B2: size VRAM KV arena to match the host PhysicalPool.
+        // B2: size VRAM KV arena to match the host fabric arena.
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
-            let pool = &model.cache.pool;
-            let swap_blocks = (pool.n_blocks() / 2).max(1);
+            let n_pages = model.cache.n_pages();
+            let host_pages = (n_pages / 2).max(1);
             if let Err(e) = cuda.init_kv_arena(
-                pool.n_blocks(),
+                n_pages,
                 model.spec.n_kv_heads.max(1),
                 model.spec.head_dim.max(1),
-                swap_blocks,
+                host_pages,
             ) {
-                tracing::warn!(error = %e, "DeviceKvArena init failed; paged ops stay host-only");
+                tracing::warn!(error = %e, "DeviceKvArena init failed; fabric ops stay host-only");
             }
         }
 
@@ -579,12 +580,12 @@ impl Engine {
             .as_any()
             .downcast_ref::<backend_cuda::CudaBackend>()
         {
-            let pool = &eng.model.cache.pool;
+            let n_pages = eng.model.cache.n_pages();
             let _ = cuda.init_kv_arena(
-                pool.n_blocks(),
+                n_pages,
                 eng.model.spec.n_kv_heads.max(1),
                 eng.model.spec.head_dim.max(1),
-                (pool.n_blocks() / 2).max(1),
+                (n_pages / 2).max(1),
             );
         }
         // The step was compiled against the default backend; recompile so kernel
@@ -665,7 +666,7 @@ impl Engine {
         let Some(policy) = self.providers.capabilities().sequence_policy(policy_name) else {
             return Ok(());
         };
-        // Sync live index + views from SequenceCache before scoring.
+        // Sync live index + views from KvSequence before scoring.
         self.sync_seq_attn_from_cache();
         let config = self.settings.providers.config.clone();
         // Pre-RoPE packed in **live private candidate order** only (no ghost abs).
@@ -702,14 +703,14 @@ impl Engine {
         plan.retain_positions.sort_unstable();
         plan.retain_positions.dedup();
 
-        let free_before = self.model.cache.pool.free_count();
+        let free_before = self.model.cache.free_count();
         let dense_before = self.model.seq.len_tokens;
         let live_before = self.seq_attn.live_retained_positions();
         if plan.compact && !plan.retain_positions.is_empty() {
             let reclaimed = self.model.cache.compact_sequence_to_positions(
                 &mut self.model.seq,
                 &plan.retain_positions,
-                crate::paged::BLOCK_SIZE,
+                crate::kv_fabric::BLOCK_SIZE,
             );
             // Refresh densified live index + views; mark host as layout owner.
             self.sync_seq_attn_from_cache();
@@ -724,7 +725,7 @@ impl Engine {
                 dense_before,
                 reclaimed,
                 free_before,
-                free_after = self.model.cache.pool.free_count(),
+                free_after = self.model.cache.free_count(),
                 live_before = live_before.len(),
                 live_after = live_now.len(),
                 policy_retained = stats.retained_count,
@@ -743,7 +744,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Push live SequenceCache state into `seq_attn` (single live-index contract).
+    /// Push live KvSequence state into `seq_attn` (single live-index contract).
     fn sync_seq_attn_from_cache(&mut self) {
         let seq = &self.model.seq;
         self.seq_attn.logical_len = seq.absolute_pos.max(seq.len_tokens) as u32;
@@ -759,18 +760,19 @@ impl Engine {
             self.seq_attn.layer_views.push(Default::default());
         }
         for layer in 0..seq.n_layers() {
-            let table = seq.table(layer);
             let view = &mut self.seq_attn.layer_views[layer];
             view.layer = layer as u32;
-            view.dense_block_table = table.blocks().to_vec();
+            view.dense_block_table = self.model.cache.physical_block_table_layer(seq, layer);
             view.dense_seq_len = seq.len_tokens as u32;
             view.entries.clear();
             if seq.is_compressed() {
                 for (dense_i, &abs) in seq.original_positions.iter().enumerate() {
-                    let (phys, slot) = table.locate(dense_i);
+                    let Ok((phys, slot)) = self.model.cache.locate(seq, layer, dense_i) else {
+                        continue;
+                    };
                     view.entries.push(fellm_plugin_abi::RetainedEntry {
                         logical_pos: abs,
-                        physical_block: phys,
+                        physical_block: phys.0,
                         physical_slot: slot as u16,
                         kv_head: u16::MAX,
                         layer: layer as u16,
@@ -1120,10 +1122,51 @@ impl Engine {
             .step(self.backend.as_ref(), tok, pos, compute_logits)
     }
 
-    /// Free blocks remaining in the physical pool.
+    /// Free pages remaining in the fabric device arena.
     #[must_use]
     pub fn cache_free_blocks(&self) -> usize {
-        self.model.cache.pool.free_count()
+        self.model.cache.free_count()
+    }
+
+    /// Whether the fabric can currently admit `need_pages` of work.
+    #[must_use]
+    pub fn can_admit_pages(&self, need_pages: usize) -> bool {
+        self.model.cache.can_admit(need_pages)
+    }
+
+    /// Pages required for a sequence to absorb `extra_tokens`.
+    #[must_use]
+    pub fn pages_needed_for(&self, seq: &KvSequence, extra_tokens: usize) -> usize {
+        self.model.cache.pages_needed_for(seq, extra_tokens)
+    }
+
+    /// Residency / cost signals for scheduling policy.
+    #[must_use]
+    pub fn residency_signals_for(
+        &self,
+        seq: &KvSequence,
+        extra_tokens: usize,
+        priority: i32,
+        prefix_hit_tokens: usize,
+    ) -> crate::kv_fabric::ResidencySignals {
+        self.model
+            .cache
+            .residency_signals(seq, extra_tokens, priority, prefix_hit_tokens)
+    }
+
+    /// Current fabric memory pressure in `[0, 1]`.
+    #[must_use]
+    pub fn model_cache_pressure(&self) -> f64 {
+        self.model.cache.memory_pressure()
+    }
+
+    /// Value/cost keep-score for a sequence (higher = prefer keep resident).
+    /// Used as the primary preemption ranking input.
+    #[must_use]
+    pub fn sequence_keep_value(&self, seq: &KvSequence, priority: i32, last_used: u64) -> f64 {
+        self.model
+            .cache
+            .sequence_keep_value(seq, priority, last_used)
     }
 
     #[must_use]
@@ -1155,45 +1198,39 @@ impl Engine {
 
     #[must_use]
     pub fn cache_total_blocks(&self) -> usize {
-        self.model.cache.pool.n_blocks()
+        self.model.cache.n_pages()
     }
 
     #[must_use]
     pub fn cache_bytes(&self) -> usize {
         self.model
             .cache
-            .pool
-            .n_blocks()
-            .saturating_mul(self.model.cache.pool.block_bytes())
+            .n_pages()
+            .saturating_mul(self.model.cache.page_bytes())
     }
 
     #[must_use]
-    pub fn prefix_cache_stats(&self) -> crate::paged::PrefixCacheStats {
-        self.model.cache.prefix.stats()
+    pub fn prefix_cache_stats(&self) -> crate::kv_fabric::PrefixCacheStats {
+        self.model.cache.prefix_stats()
+    }
+
+    /// Fabric metrics snapshot (residency, migrations, prefix, pressure).
+    #[must_use]
+    pub fn fabric_metrics(&self) -> crate::kv_fabric::FabricMetrics {
+        self.model.cache.metrics()
     }
 
     /// Reclaim idle cached prefixes, preserving every active sequence reference.
     pub fn evict_prefixes_for_blocks(&mut self, required_free: usize) -> usize {
-        self.model
-            .cache
-            .prefix
-            .evict_until(&mut self.model.cache.pool, required_free)
+        self.model.cache.evict_shared_until(required_free)
     }
 
-    /// Attach radix-prefix blocks for `ids` onto `seq_cache`. Returns matched token count.
+    /// Attach content-addressed prefix for `ids` onto `seq_cache`. Returns matched tokens.
     ///
     /// Matched tokens become **immutable shared prefix** (`shared_prefix_len`);
     /// compression policies must not reclaim them in place.
-    pub fn attach_prefix(&mut self, ids: &[u32], seq_cache: &mut SequenceCache) -> usize {
-        let matched =
-            self.model
-                .cache
-                .prefix
-                .attach_match(&mut self.model.cache.pool, seq_cache, ids);
-        if matched > 0 {
-            seq_cache.shared_prefix_len = matched;
-            seq_cache.len_tokens = seq_cache.len_tokens.max(matched);
-        }
+    pub fn attach_prefix(&mut self, ids: &[u32], seq_cache: &mut KvSequence) -> usize {
+        let matched = self.model.cache.attach_prefix(ids, seq_cache);
         #[cfg(feature = "backend-cuda")]
         if matched > 0 {
             if let Some(cuda) = self
@@ -1201,15 +1238,14 @@ impl Engine {
                 .as_any()
                 .downcast_ref::<backend_cuda::CudaBackend>()
             {
-                // Prefix reuses host-resident physical blocks; mirror once before decode.
                 cuda.mark_kv_host_dirty();
             }
         }
         matched
     }
 
-    /// Insert a completed prompt into the prefix tree.
-    pub fn insert_prefix(&mut self, ids: &[u32], seq_cache: &SequenceCache) -> Result<()> {
+    /// Insert a completed prompt into the content-addressed shared store.
+    pub fn insert_prefix(&mut self, ids: &[u32], seq_cache: &KvSequence) -> Result<()> {
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = self
             .backend
@@ -1217,17 +1253,14 @@ impl Engine {
             .downcast_ref::<backend_cuda::CudaBackend>()
             && cuda.plugins_enabled()
         {
-            cuda.sync_kv_device_to_host(self.model.cache.pool.arena_bytes_mut())?;
+            cuda.sync_kv_device_to_host(self.model.cache.arena_bytes_mut())?;
         }
-        self.model
-            .cache
-            .prefix
-            .insert_prompt(&mut self.model.cache.pool, ids, seq_cache);
+        self.model.cache.insert_prefix(ids, seq_cache);
         Ok(())
     }
 
     /// Ensure `pos` is writable in `seq_cache` (alloc / `CoW`).
-    pub fn ensure_seq_writable(&mut self, seq_cache: &mut SequenceCache, pos: usize) -> Result<()> {
+    pub fn ensure_seq_writable(&mut self, seq_cache: &mut KvSequence, pos: usize) -> Result<()> {
         match self.model.cache.ensure_writable(seq_cache, pos) {
             Ok(()) => Ok(()),
             Err(first) => {
@@ -1241,7 +1274,7 @@ impl Engine {
     }
 
     /// Release physical refs held by a sequence cache.
-    pub fn release_seq_cache(&mut self, seq_cache: &mut SequenceCache) {
+    pub fn release_seq_cache(&mut self, seq_cache: &mut KvSequence) {
         self.model.cache.release_sequence(seq_cache);
     }
 
@@ -1260,8 +1293,8 @@ impl Engine {
             .transpose()
     }
 
-    /// Swap a sequence's blocks to secondary RAM.
-    pub fn swap_out_sequence(&mut self, seq_cache: &mut SequenceCache) -> Result<()> {
+    /// Migrate a sequence's pages to host tier (preempt / residency demotion).
+    pub fn swap_out_sequence(&mut self, seq_cache: &mut KvSequence) -> Result<()> {
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = self
             .backend
@@ -1269,56 +1302,20 @@ impl Engine {
             .downcast_ref::<backend_cuda::CudaBackend>()
             && cuda.plugins_enabled()
         {
-            cuda.sync_kv_device_to_host(self.model.cache.pool.arena_bytes_mut())?;
+            cuda.sync_kv_device_to_host(self.model.cache.arena_bytes_mut())?;
         }
-        let mut buf = vec![0u8; self.model.cache.pool.block_bytes()];
-        for layer in 0..seq_cache.n_layers() {
-            for &phys in seq_cache.table(layer).blocks() {
-                self.model.cache.pool.read_block_bytes(phys, &mut buf);
-                self.model.cache.swap.swap_out(phys, &buf)?;
-                // Keep refcount but free physical slot for reuse: copy to swap then
-                // temporarily zero-ref free — for simplicity we leave physical allocated
-                // until dec_ref; here we free by dec_ref after swap.
-                // Actually: we need the physical id to remain in the table for swap_in.
-                // So we only copy to swap and mark swapped; physical can be freed if we
-                // remapped. Simpler approach: keep physical occupied but mark seq swapped
-                // so scheduler doesn't run it — true free requires remapping.
-                // For LRU free: dec_ref and clear table entries stored in swap map by phys id.
-                let _ = phys;
-            }
-        }
-        // Free physical blocks after copying.
-        for layer in 0..seq_cache.n_layers() {
-            for &phys in seq_cache.table(layer).blocks() {
-                // Drop one ref (sequence's); if only this seq held it, returns to free list.
-                self.model.cache.pool.dec_ref(phys);
-            }
-        }
-        seq_cache.swapped = true;
+        let bytes = self.model.cache.migrate_out(seq_cache)?;
+        metrics::counter!("fellm_kv_migrations_total").increment(1);
+        metrics::counter!("fellm_kv_migration_bytes_total").increment(bytes);
         Ok(())
     }
 
-    /// Restore a swapped sequence's blocks.
-    pub fn swap_in_sequence(&mut self, seq_cache: &mut SequenceCache) -> Result<()> {
+    /// Restore a non-resident sequence's pages to the compute tier.
+    pub fn swap_in_sequence(&mut self, seq_cache: &mut KvSequence) -> Result<()> {
         metrics::counter!("fellm_kv_swap_in_total").increment(1);
-        let mut buf = vec![0u8; self.model.cache.pool.block_bytes()];
-        for layer in 0..seq_cache.n_layers() {
-            let n = seq_cache.table(layer).num_blocks();
-            for logical in 0..n {
-                let old_phys = seq_cache.table(layer).block(logical);
-                let new_phys = self
-                    .model
-                    .cache
-                    .pool
-                    .alloc_block()
-                    .ok_or_else(|| FellmError::other("swap_in: out of blocks"))?;
-                self.model.cache.swap.swap_in(old_phys, &mut buf)?;
-                self.model.cache.pool.write_block_bytes(new_phys, &buf);
-                self.model.cache.pool.inc_ref(new_phys);
-                *seq_cache.table_mut(layer).block_mut(logical) = new_phys;
-            }
-        }
-        seq_cache.swapped = false;
+        let bytes = self.model.cache.migrate_in(seq_cache)?;
+        metrics::counter!("fellm_kv_migrations_total").increment(1);
+        metrics::counter!("fellm_kv_migration_bytes_total").increment(bytes);
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = self
             .backend
@@ -1333,7 +1330,7 @@ impl Engine {
     /// Run one forward step against an arbitrary sequence cache (multi-seq).
     pub fn step_sequence(
         &mut self,
-        seq_cache: &mut SequenceCache,
+        seq_cache: &mut KvSequence,
         tok: u32,
         pos: usize,
         compute_logits: bool,
@@ -1350,7 +1347,7 @@ impl Engine {
     /// Run one forward step with request-owned recurrent state.
     pub fn step_sequence_state(
         &mut self,
-        seq_cache: &mut SequenceCache,
+        seq_cache: &mut KvSequence,
         conv: &mut Option<HybridConvState>,
         tok: u32,
         pos: usize,
@@ -1370,7 +1367,7 @@ impl Engine {
     /// Rows may also refer to the same sequence, enabling chunked prefill.
     pub fn step_batch(
         &mut self,
-        sequences: &mut [&mut SequenceCache],
+        sequences: &mut [&mut KvSequence],
         conv_states: &mut [&mut Option<HybridConvState>],
         rows: &[BatchToken],
     ) -> Result<Vec<Option<Tensor>>> {
@@ -1391,7 +1388,7 @@ impl LoadedModel {
         max_seq: usize,
         model_max_ctx: usize,
         preparation: Option<ArchitecturePreparation>,
-        kv_config: &KvCacheConfig,
+        kv_config: &KvFabricConfig,
         memory_info: Option<fellm_plugin_abi::DeviceMemoryInfo>,
         physical_batch: usize,
     ) -> Result<Self> {
@@ -1455,25 +1452,30 @@ impl LoadedModel {
                     .map_or(0, |buffer| buffer.borrow().len() as u64),
             )
             .saturating_add(batch_activation_reserve as u64);
-        let block_bytes =
-            PhysicalPool::block_bytes_for(spec.n_kv_heads.max(1), spec.head_dim.max(1));
+        let page_bytes = crate::kv_fabric::storage::PageArena::page_bytes_for_dims(
+            spec.n_kv_heads.max(1),
+            spec.head_dim.max(1),
+            STANDARD_PAGE_TOKENS,
+            kv_config.default_encoding,
+        );
         let memory_plan = KvMemoryPlan::resolve(
             kv_config,
             memory_info,
             weights_bytes,
             activation_bytes,
-            block_bytes,
+            page_bytes,
             n_attn,
         )?;
-        let cache = CacheManager::new(
-            memory_plan.blocks,
+        let cache = KvFabric::new_full_attention(
+            kv_config.clone(),
+            memory_plan.device_pages,
             n_attn,
             spec.n_kv_heads.max(1),
             spec.head_dim.max(1),
-            memory_plan.swap_blocks,
+            memory_plan.host_pages,
         )?;
         let seq = cache.new_sequence(max_seq);
-        let dummy_kv = KvCache::new(
+        let dummy_kv = DummyKvBuffers::new(
             n_attn,
             max_seq.max(1),
             spec.n_kv_heads.max(1),
@@ -1491,12 +1493,14 @@ impl LoadedModel {
         tracing::info!(
             weights_bytes = memory_plan.weights_bytes,
             activation_bytes = memory_plan.activation_bytes,
-            kv_block_bytes = memory_plan.block_bytes,
-            kv_blocks = memory_plan.blocks,
+            kv_page_bytes = memory_plan.page_bytes,
+            kv_device_pages = memory_plan.device_pages,
             kv_bytes = memory_plan.kv_bytes,
-            swap_bytes = memory_plan.swap_bytes,
+            host_bytes = memory_plan.host_bytes,
+            mode = ?kv_config.mode,
+            addressing = ?kv_config.addressing,
             remaining_reserve_bytes = ?memory_plan.remaining_reserve_bytes,
-            "resolved runtime memory budget"
+            "resolved KV fabric memory budget"
         );
         tracing::info!(
             nodes = step_graph.node_count(),
@@ -1505,8 +1509,8 @@ impl LoadedModel {
             attention = bindings.attention.len(),
             attn_layers = spec.n_attn_layers(),
             conv_layers = spec.n_conv_layers(),
-            pool_blocks = cache.pool.n_blocks(),
-            "step graph ready (paged KV)"
+            fabric_pages = cache.n_pages(),
+            "step graph ready (KV fabric)"
         );
 
         Ok(Self {
@@ -1561,6 +1565,12 @@ impl LoadedModel {
                 })
                 .collect::<Vec<_>>();
             let model = backend_cuda::ModelImage::upload(cuda.device_state(), &blobs)?;
+            // `ModelImage` is uploaded on the host backend's cudarc stream, while
+            // dynamically loaded cuda-oxide kernels execute on the plugin stream.
+            // Establish ownership before publishing the raw device pointers;
+            // otherwise the plugin can race the asynchronous model upload and
+            // deterministically consume zero/partial weights.
+            cuda.synchronize()?;
             for blob in &blobs {
                 let (device_ptr, len) = model.resolve(blob.tensor)?;
                 debug_assert_eq!(len, blob.bytes.len());
@@ -1732,7 +1742,7 @@ impl LoadedModel {
         &mut self,
         gguf: &GgufFile,
         backend: &dyn Backend,
-        sequences: &mut [&mut SequenceCache],
+        sequences: &mut [&mut KvSequence],
         conv_states: &mut [&mut Option<HybridConvState>],
         rows: &[BatchToken],
     ) -> Result<Vec<Option<Tensor>>> {
@@ -1789,21 +1799,20 @@ impl LoadedModel {
         }
         self.cache.tick();
 
-        let n_logical = sequences[0].table(0).num_blocks().max(1);
-        let mut block_tables =
-            Vec::with_capacity(rows.len() * self.cache.pool.n_layers() * n_logical);
+        let n_logical = sequences[0].layer_map(0).num_pages().max(1);
+        let mut block_tables = Vec::with_capacity(rows.len() * self.cache.n_layers() * n_logical);
         for row in rows {
             let sequence = &sequences[row.sequence];
-            if sequence.table(0).num_blocks().max(1) != n_logical {
+            if sequence.layer_map(0).num_pages().max(1) != n_logical {
                 return Err(FellmError::other("batch block-table widths differ"));
             }
-            block_tables.extend(sequence.flatten_block_tables());
+            block_tables.extend(self.cache.physical_block_table(sequence));
         }
         let (device_arena, device_arena_len) = {
             #[cfg(feature = "backend-cuda")]
             {
                 if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
-                    cuda.sync_kv_if_dirty(self.cache.pool.arena_bytes())?;
+                    cuda.sync_kv_if_dirty(self.cache.arena_bytes())?;
                     if cuda.plugins_enabled() {
                         cuda.device_kv_ptr().unwrap_or((std::ptr::null_mut(), 0))
                     } else {
@@ -1818,16 +1827,16 @@ impl LoadedModel {
                 (std::ptr::null_mut(), 0usize)
             }
         };
-        let (arena, arena_len) = self.cache.pool.arena_ptr_mut();
+        let (arena, arena_len) = self.cache.arena_ptr_mut();
         set_paged_context(Some(PagedKvContext {
             arena,
             arena_len,
             block_table: Arc::from(block_tables),
             n_logical_blocks: n_logical,
-            n_layers: self.cache.pool.n_layers(),
-            tokens_stride: self.cache.pool.tokens_stride(),
-            block_bytes: self.cache.pool.block_bytes(),
-            block_size: crate::paged::BLOCK_SIZE,
+            n_layers: self.cache.n_layers(),
+            tokens_stride: self.cache.tokens_stride(),
+            block_bytes: self.cache.page_bytes(),
+            block_size: crate::kv_fabric::BLOCK_SIZE,
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
@@ -1845,12 +1854,12 @@ impl LoadedModel {
             }
             for &id in &batch.bindings.kv_write {
                 let mut attrs = batch.graph.node(id).attrs;
-                attrs.block_size = crate::paged::BLOCK_SIZE as u32;
+                attrs.block_size = crate::kv_fabric::BLOCK_SIZE as u32;
                 batch.step.set_attrs(id, attrs);
             }
             for &id in &batch.bindings.attention {
                 let mut attrs = batch.graph.node(id).attrs;
-                attrs.block_size = crate::paged::BLOCK_SIZE as u32;
+                attrs.block_size = crate::kv_fabric::BLOCK_SIZE as u32;
                 attrs.query_len = rows.len() as u32;
                 attrs.custom_op_id = fellm_plugin_abi::attention_dispatch().prefill.as_u32();
                 batch.step.set_attrs(id, attrs);
@@ -1929,16 +1938,16 @@ impl LoadedModel {
         }
         self.cache.tick();
 
-        let n_logical = self.seq.table(0).num_blocks().max(1);
-        let block_table = self.seq.flatten_block_tables();
+        let n_logical = self.seq.layer_map(0).num_pages().max(1);
+        let block_table = self.cache.physical_block_table(&self.seq);
 
         let (device_arena, device_arena_len) = {
             #[cfg(feature = "backend-cuda")]
             {
                 if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
                     // One-shot H2D only when host KV was mutated outside GPU KvWrite
-                    // (prefix attach / swap-in). Never re-upload the full arena every token.
-                    let host = self.cache.pool.arena_bytes();
+                    // (prefix attach / migrate-in). Never re-upload the full arena every token.
+                    let host = self.cache.arena_bytes();
                     if let Err(e) = cuda.sync_kv_if_dirty(host) {
                         tracing::warn!(error = %e, "KV H2D sync failed");
                     }
@@ -1957,16 +1966,16 @@ impl LoadedModel {
             }
         };
 
-        let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
+        let (arena_ptr, arena_len) = self.cache.arena_ptr_mut();
         set_paged_context(Some(PagedKvContext {
             arena: arena_ptr,
             arena_len,
             block_table: std::sync::Arc::<[u32]>::from(block_table),
             n_logical_blocks: n_logical,
-            n_layers: self.cache.pool.n_layers(),
-            tokens_stride: self.cache.pool.tokens_stride(),
-            block_bytes: self.cache.pool.block_bytes(),
-            block_size: crate::paged::BLOCK_SIZE,
+            n_layers: self.cache.n_layers(),
+            tokens_stride: self.cache.tokens_stride(),
+            block_bytes: self.cache.page_bytes(),
+            block_size: crate::kv_fabric::BLOCK_SIZE,
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
@@ -1978,13 +1987,13 @@ impl LoadedModel {
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
             // Dense storage index after compress (not absolute generation pos).
-            let (kv_write_block, kv_write_slot) = self.seq.table(0).locate(kv_pos);
+            let (phys, kv_write_slot) = self.cache.locate(&self.seq, 0, kv_pos)?;
             cuda.update_step_params(&fellm_plugin_abi::DeviceStepParams {
                 token_id: tok,
                 position: pos as u32,
                 sequence_length: self.seq.len_tokens as u32,
                 active_batch: 1,
-                kv_write_block,
+                kv_write_block: phys.0,
                 kv_write_slot: kv_write_slot as u32,
                 ..Default::default()
             })?;
@@ -2068,13 +2077,13 @@ impl LoadedModel {
         let Some(graph) = &self.canvas_graph else {
             return Err(FellmError::other("canvas graph is not available"));
         };
-        let n_logical = self.seq.table(0).num_blocks().max(1);
-        let block_table = self.seq.flatten_block_tables();
+        let n_logical = self.seq.layer_map(0).num_pages().max(1);
+        let block_table = self.cache.physical_block_table(&self.seq);
         let (device_arena, device_arena_len) = {
             #[cfg(feature = "backend-cuda")]
             {
                 if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
-                    let host = self.cache.pool.arena_bytes();
+                    let host = self.cache.arena_bytes();
                     cuda.sync_kv_if_dirty(host)?;
                     if cuda.plugins_enabled() {
                         cuda.device_kv_ptr().unwrap_or((std::ptr::null_mut(), 0))
@@ -2090,16 +2099,16 @@ impl LoadedModel {
                 (std::ptr::null_mut(), 0usize)
             }
         };
-        let (arena_ptr, arena_len) = self.cache.pool.arena_ptr_mut();
+        let (arena_ptr, arena_len) = self.cache.arena_ptr_mut();
         set_paged_context(Some(PagedKvContext {
             arena: arena_ptr,
             arena_len,
             block_table: std::sync::Arc::<[u32]>::from(block_table),
             n_logical_blocks: n_logical,
-            n_layers: self.cache.pool.n_layers(),
-            tokens_stride: self.cache.pool.tokens_stride(),
-            block_bytes: self.cache.pool.block_bytes(),
-            block_size: crate::paged::BLOCK_SIZE,
+            n_layers: self.cache.n_layers(),
+            tokens_stride: self.cache.tokens_stride(),
+            block_bytes: self.cache.page_bytes(),
+            block_size: crate::kv_fabric::BLOCK_SIZE,
             elem_bytes: fellm_plugin_abi::PAGED_KV_ELEM_BYTES,
             device_arena,
             device_arena_len,
@@ -2232,42 +2241,13 @@ impl Iterator for TokenStream<'_> {
             return Some(Ok(tok));
         }
         let logits_tensor = self.pending_logits.take()?;
-        let mut logits_owned = logits_tensor;
-        let device_greedy = self.params.temperature <= 0.0
-            && (self.params.repetition_penalty <= 1.0 || self.generated_tokens.is_empty());
-        let device_token = if device_greedy {
-            match tensor_f32_ffi_views(&mut logits_owned).and_then(|(input, _)| {
-                self.engine.backend.sample_device(
-                    input,
-                    &fellm_plugin_abi::OpAttrs {
-                        temperature: self.params.temperature,
-                        top_k: self.params.top_k,
-                        top_p: self.params.top_p,
-                        seed: self.params.seed.wrapping_add(u64::from(self.emitted)),
-                        ..Default::default()
-                    },
-                )
-            }) {
-                Ok(token) => token,
-                Err(error) => {
-                    self.finished = true;
-                    return Some(Err(error));
-                }
-            }
-        } else {
-            None
-        };
-        if device_token.is_none()
-            && let Ok((input, output)) = tensor_f32_ffi_views(&mut logits_owned)
-            && let Err(error) = self.engine.backend.materialize(input, output)
-        {
-            self.finished = true;
-            return Some(Err(error));
-        }
-        let tok = if let Some(token) = device_token {
-            token
-        } else {
-            let logits = match logits_owned.as_slice::<f32>() {
+        // CompiledStep returns an owned, host-authoritative logits tensor.  It
+        // has already crossed the device boundary exactly once.  Re-running
+        // `materialize` here gives the detached allocation a cache identity
+        // based only on a recyclable host address and can overwrite fresh
+        // logits with a stale device mirror from an earlier token.
+        let tok = {
+            let logits = match logits_tensor.as_slice::<f32>() {
                 Ok(logits) => logits,
                 Err(error) => {
                     self.finished = true;
@@ -2372,31 +2352,6 @@ fn install_attention_dispatch(providers: &crate::providers::ProviderManager, bac
         provider_id = d.provider_id,
         "attention dispatch installed"
     );
-}
-
-fn tensor_f32_ffi_views(
-    tensor: &mut Tensor,
-) -> Result<(fellm_plugin_abi::TensorRef, fellm_plugin_abi::TensorMut)> {
-    if tensor.dtype() != DType::F32 {
-        return Err(FellmError::other("device sampling requires f32 logits"));
-    }
-    let dims = tensor.shape().dims().to_vec();
-    let strides = tensor.shape().row_major_strides().as_slice().to_vec();
-    let values = tensor.as_mut_slice::<f32>()?;
-    let ptr = values.as_mut_ptr();
-    let bytes = core::mem::size_of_val(values);
-    Ok(unsafe {
-        (
-            fellm_plugin_abi::TensorRef::from_raw(
-                DType::F32,
-                &dims,
-                &strides,
-                ptr.cast_const().cast(),
-                bytes,
-            ),
-            fellm_plugin_abi::TensorMut::from_raw(DType::F32, &dims, &strides, ptr.cast(), bytes),
-        )
-    })
 }
 
 fn duration_ms(d: Duration) -> f64 {

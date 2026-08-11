@@ -747,7 +747,13 @@ pub mod kernels {
         }
         let scale = unsafe { MAXABS[0] } / 127.0;
         let quant = if scale > 0.0 {
-            (input[index] / scale).round().clamp(-127.0, 127.0) as i8
+            let scaled = (input[index] / scale).clamp(-127.0, 127.0);
+            let rounded = if scaled >= 0.0 {
+                (scaled + 0.5) as i32
+            } else {
+                (scaled - 0.5) as i32
+            };
+            rounded.clamp(-127, 127) as i8
         } else {
             0
         };
