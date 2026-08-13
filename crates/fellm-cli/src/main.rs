@@ -138,6 +138,18 @@ struct RunArgs {
     storage_bytes_per_second: Option<u64>,
     #[arg(long)]
     storage_latency_micros: Option<u64>,
+    /// Storage provider: auto, page-cache, mmap-copy, buffered, direct, io-uring, or gds.
+    #[arg(long)]
+    storage_provider: Option<String>,
+    /// Resident CPU weight-cache bytes. Zero is valid for storage-native execution.
+    #[arg(long)]
+    host_weight_cache: Option<u64>,
+    /// Enable predictive CPU storage reads while the current group computes.
+    #[arg(long)]
+    storage_overlap: Option<bool>,
+    /// Maximum router decisions retained independently for offline cache simulation.
+    #[arg(long)]
+    router_trace_capacity: Option<usize>,
     #[arg(long)]
     disable_cpu_partitions: Option<bool>,
 }
@@ -275,6 +287,11 @@ fn resolve_run(
     } else {
         cli.plugin_config
     };
+    let storage_provider = cli
+        .storage_provider
+        .or(memory.storage_provider)
+        .unwrap_or_else(|| "auto".into())
+        .parse()?;
     Ok(ResolvedRunArgs {
         model,
         prompt,
@@ -318,6 +335,19 @@ fn resolve_run(
                 .storage_bytes_per_second
                 .or(memory.storage_bytes_per_second),
             storage_latency_micros: cli.storage_latency_micros.or(memory.storage_latency_micros),
+            storage_provider,
+            host_weight_cache: cli
+                .host_weight_cache
+                .or(memory.host_weight_cache)
+                .unwrap_or(0),
+            storage_overlap: cli
+                .storage_overlap
+                .or(memory.storage_overlap)
+                .unwrap_or(true),
+            router_trace_capacity: cli
+                .router_trace_capacity
+                .or(memory.router_trace_capacity)
+                .unwrap_or(65_536),
             disable_cpu_partitions: cli
                 .disable_cpu_partitions
                 .or(memory.disable_cpu_partitions)
@@ -365,6 +395,10 @@ mod config_precedence_tests {
             h2d_bytes_per_second: None,
             storage_bytes_per_second: None,
             storage_latency_micros: None,
+            storage_provider: None,
+            host_weight_cache: None,
+            storage_overlap: None,
+            router_trace_capacity: None,
             disable_cpu_partitions: None,
         }
     }
@@ -544,7 +578,9 @@ fn run(args: ResolvedRunArgs) -> fellm_core::error::Result<()> {
     eprintln!("total: {:.2}ms", stats.total_ms);
     drop(stream);
     engine.publish_memory_fabric_metrics();
-    engine.log_memory_fabric_runtime();
+    engine.log_memory_fabric_runtime(u64::from(
+        stats.prompt_tokens.saturating_add(stats.predicted_tokens),
+    ));
 
     Ok(())
 }

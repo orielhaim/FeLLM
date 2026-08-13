@@ -21,6 +21,10 @@ pub struct MemoryConfig {
     pub h2d_bytes_per_second: Option<u64>,
     pub storage_bytes_per_second: Option<u64>,
     pub storage_latency_micros: Option<u64>,
+    pub storage_provider: Option<String>,
+    pub host_weight_cache: Option<u64>,
+    pub storage_overlap: Option<bool>,
+    pub router_trace_capacity: Option<usize>,
     pub disable_cpu_partitions: Option<bool>,
 }
 

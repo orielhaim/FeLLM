@@ -10,6 +10,7 @@ use fellm_core::tensor::Tensor;
 use memmap2::Mmap;
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,8 +33,9 @@ pub struct TensorInfo {
 ///
 /// The file is memory-mapped; tensor accesses are zero-copy views.
 pub struct GgufFile {
-    mmap: Arc<Mmap>,
+    mmap: Option<Arc<Mmap>>,
     source_path: Option<std::path::PathBuf>,
+    metadata_only: bool,
     /// Absolute offset within the file where tensor payloads start.
     tensor_data_offset: u64,
     /// Alignment (bytes) required for tensor payloads.
@@ -49,18 +51,64 @@ pub struct GgufFile {
 impl GgufFile {
     /// Open a GGUF file from disk.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+            && path.as_ref().starts_with("/mnt/")
+        {
+            tracing::warn!(
+                path = %path.as_ref().display(),
+                "WSL model is on a Windows-mounted filesystem; use the Linux filesystem for substantially faster model paging"
+            );
+        }
         let file = File::open(path.as_ref())?;
         // SAFETY: the file remains open for the lifetime of the mapping,
         // and we treat the bytes as immutable throughout.
         let mmap = unsafe { Mmap::map(&file)? };
+        #[cfg(target_os = "linux")]
+        {
+            // Dense CPU decode cyclically scans a very large, immutable mapping. Ask Linux to
+            // collapse page-table coverage where supported; this is only a hint and preserves
+            // the bounded, file-backed storage model when file THP is unavailable.
+            let _ = mmap.advise(memmap2::Advice::HugePage);
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+        }
         let mut gguf = Self::from_mmap(Arc::new(mmap))?;
         gguf.source_path = Some(path.as_ref().to_path_buf());
         Ok(gguf)
     }
 
+    /// Open only the bounded GGUF metadata/index. Weight payloads remain file extents and no
+    /// model-wide virtual mapping is created.
+    pub fn open_storage_native<P: AsRef<Path>>(path: P) -> Result<Self> {
+        const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
+        let mut file = File::open(path.as_ref())?;
+        let file_len = file.metadata()?.len();
+        let header_len = file_len.min(MAX_HEADER_BYTES) as usize;
+        let mut header = vec![0u8; header_len];
+        file.read_exact(&mut header)?;
+        let mut gguf = Self::from_bytes(&header, None)?;
+        if gguf.tensor_data_offset > MAX_HEADER_BYTES {
+            return Err(FellmError::other(format!(
+                "GGUF metadata/index exceeds bounded {} MiB header reader",
+                MAX_HEADER_BYTES >> 20
+            )));
+        }
+        gguf.source_path = Some(path.as_ref().to_path_buf());
+        gguf.metadata_only = true;
+        tracing::info!(
+            metadata_bytes = gguf.tensor_data_offset,
+            "opened storage-native GGUF index without mapping weight payloads"
+        );
+        Ok(gguf)
+    }
+
     /// Construct from an existing memory map.
     pub fn from_mmap(mmap: Arc<Mmap>) -> Result<Self> {
-        let bytes: &[u8] = &mmap;
+        Self::from_bytes(&mmap, Some(Arc::clone(&mmap)))
+    }
+
+    fn from_bytes(bytes: &[u8], mmap: Option<Arc<Mmap>>) -> Result<Self> {
         let mut r = Reader::new(bytes);
 
         let magic = r.u32()?;
@@ -143,6 +191,7 @@ impl GgufFile {
         Ok(Self {
             mmap,
             source_path: None,
+            metadata_only: false,
             tensor_data_offset,
             alignment,
             metadata,
@@ -153,8 +202,8 @@ impl GgufFile {
 
     /// Get a shared handle to the underlying mmap.
     #[must_use]
-    pub fn mmap(&self) -> &Arc<Mmap> {
-        &self.mmap
+    pub fn mmap(&self) -> Option<&Arc<Mmap>> {
+        self.mmap.as_ref()
     }
 
     /// Original backing-store path, when opened from a file.
@@ -198,11 +247,22 @@ impl GgufFile {
             strides: ti.shape.row_major_strides(),
             offset_bytes: 0,
         };
-        let storage = Storage::Mmap {
-            mmap: Arc::clone(&self.mmap),
-            offset: absolute as usize,
-            len: byte_size,
-        };
+        let storage =
+            if let Some(mmap) = &self.mmap {
+                Storage::Mmap {
+                    mmap: Arc::clone(mmap),
+                    offset: absolute as usize,
+                    len: byte_size,
+                }
+            } else {
+                Storage::FileExtent {
+                    path: Arc::new(self.source_path.clone().ok_or_else(|| {
+                        FellmError::other("storage-native GGUF has no source path")
+                    })?),
+                    offset: absolute,
+                    len: byte_size,
+                }
+            };
         Ok(Tensor::from_storage(layout, Arc::new(storage)))
     }
 

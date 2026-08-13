@@ -5,6 +5,14 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WeightId(pub u64);
 
+/// Stable identity for one physical, coalesced storage transfer object.
+///
+/// Storage objects, rather than individual tensors, are the unit submitted to storage
+/// providers. An object may contain padding and unrelated gap bytes when doing so reduces I/O
+/// operations without exceeding the planner's read-amplification bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageObjectId(pub u64);
+
 /// Stable identity for one disposable resident replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReplicaId(pub u64);
@@ -27,6 +35,39 @@ pub struct StorageExtent {
     pub offset: u64,
     pub len: u64,
     pub alignment: u64,
+}
+
+/// One weight's byte view inside a coalesced storage object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageObjectMember {
+    pub weight: WeightId,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Physical storage unit consumed together by an execution schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageObject {
+    pub id: StorageObjectId,
+    pub extent: StorageExtent,
+    pub members: Vec<StorageObjectMember>,
+    /// Sum of useful member bytes. `extent.len - useful_bytes` is read amplification.
+    pub useful_bytes: u64,
+}
+
+/// Explicit lifecycle of a bounded staging slot.
+///
+/// Keeping this typed prevents an in-flight read from being accidentally exposed as resident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageSlotState {
+    Empty,
+    ReadQueued(StorageObjectId),
+    Reading(StorageObjectId),
+    HostReady(StorageObjectId),
+    H2dQueued(StorageObjectId),
+    DeviceReady(StorageObjectId),
+    InUse(StorageObjectId),
+    Evictable(StorageObjectId),
 }
 
 /// A currently materialized replica. Backing remains present when replicas are evicted.
@@ -102,6 +143,14 @@ pub struct ExpertPlacement {
     pub residency: ResidencyClass,
 }
 
+/// One router decision captured independently from cache state and placement behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertRouteTrace {
+    pub request_step: u64,
+    pub operation: u64,
+    pub experts: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WeightPlacement {
     pub group: u32,
@@ -161,6 +210,8 @@ pub struct FabricPlan {
     pub device_buffer_bytes: u64,
     pub host_buffer_count: u8,
     pub host_buffer_bytes: u64,
+    /// Maximum simultaneously submitted storage objects. Independent of GPU slots.
+    pub storage_queue_depth: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,4 +236,16 @@ pub struct FabricMetrics {
     pub prefetch_misses: u64,
     pub evictions: u64,
     pub replans: u64,
+    pub physical_reads: u64,
+    pub coalesced_reads: u64,
+    pub useful_storage_bytes: u64,
+    pub buffered_storage_bytes: u64,
+    pub direct_storage_bytes: u64,
+    pub gds_storage_bytes: u64,
+    pub prefetch_reads: u64,
+    pub prefetch_useful_bytes: u64,
+    pub prefetch_wasted_bytes: u64,
+    pub buffer_wait_time: Duration,
+    pub h2d_wait_time: Duration,
+    pub gpu_weight_wait_time: Duration,
 }

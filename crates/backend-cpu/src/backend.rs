@@ -21,6 +21,7 @@ use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use thread_local::ThreadLocal;
 
 /// The CPU backend.
@@ -35,6 +36,43 @@ pub struct CpuBackend {
     launches: CachePadded<AtomicU64>,
     /// Per-worker launch counters for diagnosing scheduler imbalance.
     worker_launches: ThreadLocal<AtomicU64>,
+    weight_storage: Mutex<Option<CpuWeightStorage>>,
+    storage_wait_nanos: AtomicU64,
+    mmap_execution_bytes: AtomicU64,
+}
+
+struct CpuWeightStorage {
+    provider: Arc<dyn fellm_memory::TransferProvider>,
+    slot_bytes: usize,
+    objects: std::collections::HashMap<u64, fellm_memory::StorageObject>,
+    weight_objects: std::collections::HashMap<u64, u64>,
+    pending: std::collections::HashMap<u64, std::thread::JoinHandle<Result<CpuRead>>>,
+    resident: Vec<Option<CpuRead>>,
+    available: Vec<fellm_core::storage::AlignedBuffer>,
+    physical_reads: u64,
+    physical_bytes: u64,
+    overlap: bool,
+    provider_kind: fellm_memory::StorageProviderKind,
+    read_nanos: u64,
+}
+
+struct CpuRead {
+    object: u64,
+    buffer: fellm_core::storage::AlignedBuffer,
+    valid_len: usize,
+    read_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuStorageMetrics {
+    pub physical_reads: u64,
+    pub physical_bytes: u64,
+    pub storage_stall_nanos: u64,
+    pub staging_bytes: u64,
+    pub mmap_execution_bytes: u64,
+    pub buffered_storage_bytes: u64,
+    pub direct_storage_bytes: u64,
+    pub io_compute_overlap_percent: f64,
 }
 
 impl CpuBackend {
@@ -51,7 +89,26 @@ impl CpuBackend {
                     value => value.parse::<usize>().ok().filter(|&n| n > 0),
                 }
             });
-        let threads = requested_threads.unwrap_or(physical).clamp(1, logical);
+        let automatic_threads = if cfg!(target_os = "linux")
+            && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+        {
+            // WSL currently hides hybrid-core classes and presents every vCPU as an identical
+            // physical core. Bandwidth-bound quantized projections regress when all 24 virtual
+            // cores contend for guest memory on Arrow Lake; leave one third idle unless the user
+            // supplied an explicit topology choice.
+            physical.saturating_mul(2).div_ceil(3).max(1)
+        } else {
+            physical
+        };
+        let threads = requested_threads
+            .unwrap_or(automatic_threads)
+            .clamp(1, logical);
+        tracing::info!(
+            cpu_threads = threads,
+            automatic = requested_threads.is_none(),
+            "selected CPU execution pool"
+        );
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("fellm-matmul-{i}"))
@@ -96,6 +153,142 @@ impl CpuBackend {
             pool,
             launches: CachePadded::new(AtomicU64::new(0)),
             worker_launches: ThreadLocal::new(),
+            weight_storage: Mutex::new(None),
+            storage_wait_nanos: AtomicU64::new(0),
+            mmap_execution_bytes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn configure_weight_storage(
+        &self,
+        weights: &[fellm_memory::WeightDescriptor],
+        objects: &fellm_memory::StorageObjectIndex,
+        provider_kind: fellm_memory::StorageProviderKind,
+        buffer_count: usize,
+        buffer_bytes: usize,
+        overlap: bool,
+    ) -> Result<()> {
+        let path = weights
+            .first()
+            .map(|weight| weight.home.path.clone())
+            .ok_or_else(|| FellmError::other("CPU storage weight catalog is empty"))?;
+        let provider: Arc<dyn fellm_memory::TransferProvider> = match provider_kind {
+            fellm_memory::StorageProviderKind::Mmap => {
+                let file = std::fs::File::open(&path).map_err(FellmError::Io)?;
+                Arc::new(fellm_memory::MmapProvider::open(&file)?)
+            }
+            fellm_memory::StorageProviderKind::PageCache
+            | fellm_memory::StorageProviderKind::Buffered => {
+                Arc::new(fellm_memory::FileProvider::open(&path)?)
+            }
+            fellm_memory::StorageProviderKind::Direct => {
+                #[cfg(any(target_os = "linux", windows))]
+                {
+                    Arc::new(fellm_memory::DirectFileProvider::open(&path)?)
+                }
+                #[cfg(not(any(target_os = "linux", windows)))]
+                {
+                    return Err(FellmError::other("native direct I/O unavailable"));
+                }
+            }
+            fellm_memory::StorageProviderKind::IoUring => {
+                return Err(FellmError::other("io_uring provider is not operational"));
+            }
+            fellm_memory::StorageProviderKind::Gds => {
+                return Err(FellmError::other("GDS cannot feed CPU execution"));
+            }
+        };
+        let object_map = objects
+            .objects()
+            .iter()
+            .cloned()
+            .map(|object| (object.id.0, object))
+            .collect::<std::collections::HashMap<_, _>>();
+        let weight_objects = objects
+            .objects()
+            .iter()
+            .flat_map(|object| {
+                object
+                    .members
+                    .iter()
+                    .map(move |member| (member.weight.0, object.id.0))
+            })
+            .collect();
+        let maximum = object_map
+            .values()
+            .map(|object| object.extent.len)
+            .max()
+            .unwrap_or(1) as usize;
+        let slot_bytes = buffer_bytes.max(maximum).next_multiple_of(4096);
+        let slots = buffer_count.max(2);
+        *self.weight_storage.lock().expect("CPU weight storage lock") = Some(CpuWeightStorage {
+            provider,
+            slot_bytes,
+            objects: object_map,
+            weight_objects,
+            pending: std::collections::HashMap::new(),
+            resident: (0..slots).map(|_| None).collect(),
+            available: (0..slots)
+                .map(|_| fellm_core::storage::AlignedBuffer::new_zeroed(slot_bytes, 4096))
+                .collect(),
+            physical_reads: 0,
+            physical_bytes: 0,
+            overlap,
+            provider_kind,
+            read_nanos: 0,
+        });
+        tracing::info!(
+            storage_provider = provider_kind.name(),
+            storage_queue_depth = slots,
+            storage_staging_bytes = slots.saturating_mul(slot_bytes),
+            host_weight_cache_bytes = 0,
+            "configured bounded CPU storage-native weight ring"
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn storage_metrics(&self) -> CpuStorageMetrics {
+        let guard = self.weight_storage.lock().expect("CPU weight storage lock");
+        let Some(state) = guard.as_ref() else {
+            return CpuStorageMetrics {
+                mmap_execution_bytes: self.mmap_execution_bytes.load(Ordering::Relaxed),
+                ..CpuStorageMetrics::default()
+            };
+        };
+        CpuStorageMetrics {
+            physical_reads: state.physical_reads,
+            physical_bytes: state.physical_bytes,
+            storage_stall_nanos: self.storage_wait_nanos.load(Ordering::Relaxed),
+            staging_bytes: (state.resident.len() * state.slot_bytes) as u64,
+            mmap_execution_bytes: self.mmap_execution_bytes.load(Ordering::Relaxed),
+            buffered_storage_bytes: if matches!(
+                state.provider_kind,
+                fellm_memory::StorageProviderKind::PageCache
+                    | fellm_memory::StorageProviderKind::Buffered
+                    | fellm_memory::StorageProviderKind::Mmap
+            ) {
+                state.physical_bytes
+            } else {
+                0
+            },
+            direct_storage_bytes: if state.provider_kind
+                == fellm_memory::StorageProviderKind::Direct
+            {
+                state.physical_bytes
+            } else {
+                0
+            },
+            io_compute_overlap_percent: if state.read_nanos == 0 {
+                0.0
+            } else {
+                100.0
+                    * state
+                        .read_nanos
+                        .saturating_sub(self.storage_wait_nanos.load(Ordering::Relaxed))
+                        as f64
+                    / state.read_nanos as f64
+            },
         }
     }
 
@@ -276,6 +469,49 @@ impl Backend for CpuBackend {
             .get_or(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
         let op = decode_handle(handle)?;
+        let storage = self.weight_storage.lock().expect("CPU weight storage lock");
+        if storage.is_none() {
+            let mapped = inputs
+                .iter()
+                .filter(|input| input.logical_id != 0)
+                .fold(0u64, |total, input| total.saturating_add(input.byte_len));
+            self.mmap_execution_bytes
+                .fetch_add(mapped, Ordering::Relaxed);
+        }
+        let mut prepared = smallvec::SmallVec::<[TensorRef; 8]>::new();
+        for input in inputs {
+            let mut view = *input;
+            if let Some(state) = storage.as_ref()
+                && let Some(&object_id) = state.weight_objects.get(&input.logical_id)
+            {
+                let object = state
+                    .objects
+                    .get(&object_id)
+                    .ok_or_else(|| FellmError::other("CPU storage object missing"))?;
+                let member = object
+                    .members
+                    .iter()
+                    .find(|member| member.weight.0 == input.logical_id)
+                    .ok_or_else(|| FellmError::other("CPU storage object member missing"))?;
+                let read = state
+                    .resident
+                    .iter()
+                    .find_map(|slot| match slot {
+                        Some(read) if read.object == object_id => Some(read),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        FellmError::other(format!(
+                            "CPU weight {} was not published before kernel launch",
+                            input.logical_id
+                        ))
+                    })?;
+                view.data = unsafe { read.buffer.as_slice().as_ptr().add(member.offset as usize) };
+                view.byte_len = member.len;
+            }
+            prepared.push(view);
+        }
+        let inputs = prepared.as_slice();
         match op {
             OpKind::MatMul => launch_matmul(attrs, inputs, outputs),
             OpKind::GateUpSwiGlu => launch_gate_up_swiglu(inputs, outputs),
@@ -299,6 +535,133 @@ impl Backend for CpuBackend {
                 "custom operation is not implemented by CPU backend",
             )),
         }
+    }
+
+    fn prefetch_weight_group(
+        &self,
+        _group_id: u64,
+        weights: &[TensorRef],
+        required: bool,
+    ) -> Result<()> {
+        let mut guard = self.weight_storage.lock().expect("CPU weight storage lock");
+        let Some(state) = guard.as_mut() else {
+            return Ok(());
+        };
+        if !required && !state.overlap {
+            return Ok(());
+        }
+        let mut objects = Vec::new();
+        for weight in weights {
+            if let Some(&object) = state.weight_objects.get(&weight.logical_id)
+                && !objects.contains(&object)
+            {
+                objects.push(object);
+            }
+        }
+        if required && !objects.is_empty() {
+            // Reserve the complete execution bundle before loading any member. Every constant
+            // remains published until the single kernel consuming the bundle has returned.
+            for resident in &mut state.resident {
+                if let Some(read) = resident.take() {
+                    state.available.push(read.buffer);
+                }
+            }
+        }
+        for object_id in objects {
+            if state
+                .resident
+                .iter()
+                .any(|slot| matches!(slot, Some(read) if read.object == object_id))
+            {
+                continue;
+            }
+            if !state.pending.contains_key(&object_id) {
+                let extent = state
+                    .objects
+                    .get(&object_id)
+                    .ok_or_else(|| FellmError::other("CPU prefetch object missing"))?
+                    .extent
+                    .clone();
+                if required
+                    && state.available.is_empty()
+                    && let Some(stale_id) = state.pending.keys().copied().next()
+                {
+                    let stale = state.pending.remove(&stale_id).expect("pending key exists");
+                    let stale = stale.join().map_err(|_| {
+                        FellmError::other("CPU speculative storage reader panicked")
+                    })??;
+                    state.physical_reads = state.physical_reads.saturating_add(1);
+                    state.physical_bytes =
+                        state.physical_bytes.saturating_add(stale.valid_len as u64);
+                    state.read_nanos = state.read_nanos.saturating_add(stale.read_nanos);
+                    state.available.push(stale.buffer);
+                }
+                if let Some(mut buffer) = state.available.pop() {
+                    let provider = Arc::clone(&state.provider);
+                    let valid_len = extent.len as usize;
+                    let handle = std::thread::Builder::new()
+                        .name(format!("fellm-cpu-storage-{}", object_id))
+                        .spawn(move || {
+                            let started = std::time::Instant::now();
+                            provider
+                                .read_at(extent.offset, &mut buffer.as_mut_slice()[..valid_len])
+                                .map_err(|error| {
+                                    FellmError::other(format!(
+                                        "storage object {object_id} offset={} len={}: {error}",
+                                        extent.offset, extent.len
+                                    ))
+                                })?;
+                            Ok(CpuRead {
+                                object: object_id,
+                                buffer,
+                                valid_len,
+                                read_nanos: started
+                                    .elapsed()
+                                    .as_nanos()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                            })
+                        })
+                        .map_err(|error| {
+                            FellmError::other(format!("spawn CPU storage reader: {error}"))
+                        })?;
+                    state.pending.insert(object_id, handle);
+                } else if required {
+                    return Err(FellmError::other("CPU storage ring has no demand slot"));
+                }
+            }
+            if required {
+                let reader = state
+                    .pending
+                    .remove(&object_id)
+                    .ok_or_else(|| FellmError::other("CPU required prefetch missing"))?;
+                let started = std::time::Instant::now();
+                let read = reader.join().map_err(|_| {
+                    FellmError::other(format!(
+                        "CPU storage reader panicked for object {object_id}"
+                    ))
+                })??;
+                self.storage_wait_nanos.fetch_add(
+                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
+                state.physical_reads = state.physical_reads.saturating_add(1);
+                state.physical_bytes = state.physical_bytes.saturating_add(read.valid_len as u64);
+                state.read_nanos = state.read_nanos.saturating_add(read.read_nanos);
+                let slot = state
+                    .resident
+                    .iter()
+                    .position(Option::is_none)
+                    .ok_or_else(|| {
+                        FellmError::other(format!(
+                            "CPU execution bundle exceeds {} fixed storage slots",
+                            state.resident.len()
+                        ))
+                    })?;
+                state.resident[slot] = Some(read);
+            }
+        }
+        Ok(())
     }
 
     fn begin_step(&self) {

@@ -36,7 +36,9 @@ impl FabricPlanner {
             return Err(PlanningError::NoDeviceWorkingSet);
         }
 
-        let device_buffer_count = if hardware.device_total == 0 {
+        let all_device_resident =
+            hardware.device_total > 0 && model.weight_bytes <= weight_device_capacity;
+        let device_buffer_count = if hardware.device_total == 0 || all_device_resident {
             0
         } else if weight_device_capacity >= largest_group.saturating_mul(3) {
             3
@@ -50,15 +52,37 @@ impl FabricPlanner {
         } else {
             largest_group
         };
-        let permanent_capacity = weight_device_capacity
-            .saturating_sub(device_buffer_bytes.saturating_mul(u64::from(device_buffer_count)));
+        let permanent_capacity = if all_device_resident {
+            weight_device_capacity
+        } else {
+            weight_device_capacity
+                .saturating_sub(device_buffer_bytes.saturating_mul(u64::from(device_buffer_count)))
+        };
 
         let host_staging_each = largest_group.max(4 << 20).min(256 << 20);
-        let host_buffer_count = 2u8;
-        let host_staging = host_staging_each.saturating_mul(u64::from(host_buffer_count));
-        if largest_group > 0 && host_usable < host_staging_each {
+        let needs_storage_pipeline = hardware.device_total > 0 && !all_device_resident;
+        let max_host_buffers = if needs_storage_pipeline {
+            host_usable / host_staging_each.max(1)
+        } else {
+            0
+        };
+        if needs_storage_pipeline && largest_group > 0 && max_host_buffers < 2 {
             return Err(PlanningError::NoHostStaging);
         }
+        let desired_queue_depth = if hardware.transfers.io_uring {
+            8
+        } else if hardware.transfers.async_file {
+            4
+        } else {
+            2
+        };
+        let host_buffer_count = if needs_storage_pipeline {
+            u8::try_from(max_host_buffers.min(desired_queue_depth))
+                .unwrap_or(desired_queue_depth as u8)
+        } else {
+            0
+        };
+        let host_staging = host_staging_each.saturating_mul(u64::from(host_buffer_count));
         let kv_host = model
             .kv_bytes
             .saturating_sub(kv_device)
@@ -75,8 +99,20 @@ impl FabricPlanner {
         });
         let mut device_used = 0u64;
         let mut host_used = 0u64;
+        let mut accounted_weights = std::collections::HashSet::new();
         let mut placements = Vec::with_capacity(candidates.len());
         for group in candidates {
+            let accounting_bytes = if !group.weights.is_empty()
+                && group
+                    .weights
+                    .iter()
+                    .all(|weight| accounted_weights.contains(weight))
+            {
+                0
+            } else {
+                accounted_weights.extend(group.weights.iter().copied());
+                group.byte_len
+            };
             let h2d = transfer_time(
                 group.byte_len,
                 hardware.h2d_bytes_per_second,
@@ -87,15 +123,15 @@ impl FabricPlanner {
                 hardware.storage_bytes_per_second,
                 hardware.storage_latency,
             );
-            let host_fits = host_used.saturating_add(group.byte_len) <= host_weight_capacity;
+            let host_fits = host_used.saturating_add(accounting_bytes) <= host_weight_capacity;
             let (class, transfer) =
-                if device_used.saturating_add(group.byte_len) <= permanent_capacity {
-                    device_used += group.byte_len;
+                if device_used.saturating_add(accounting_bytes) <= permanent_capacity {
+                    device_used += accounting_bytes;
                     (ResidencyClass::PermanentDevice, Duration::ZERO)
                 } else if host_fits && group.cpu_compute_time.is_some_and(|cpu| cpu < h2d) {
                     (ResidencyClass::CpuCompute, Duration::ZERO)
                 } else if host_fits {
-                    host_used += group.byte_len;
+                    host_used += accounting_bytes;
                     (ResidencyClass::HostResident, h2d)
                 } else if group
                     .cpu_compute_time
@@ -132,6 +168,7 @@ impl FabricPlanner {
             device_buffer_bytes,
             host_buffer_count,
             host_buffer_bytes: host_staging_each,
+            storage_queue_depth: u16::from(host_buffer_count),
         })
     }
 }
@@ -218,5 +255,41 @@ mod tests {
             FabricPlanner::plan(&hw, &model),
             Err(PlanningError::NoDeviceWorkingSet)
         ));
+    }
+
+    #[test]
+    fn resident_and_cpu_modes_do_not_reserve_unused_streaming_buffers() {
+        let mut hw = HardwareProfile {
+            device_total: 8 << 30,
+            device_available: 7 << 30,
+            host_total: 32 << 30,
+            host_available: 24 << 30,
+            h2d_bytes_per_second: 24 << 30,
+            storage_bytes_per_second: 3 << 30,
+            storage_latency: Duration::from_micros(100),
+            cpu_score: 1.0,
+            transfers: TransferCapabilities {
+                mmap: true,
+                async_file: true,
+                ..Default::default()
+            },
+        };
+        let model = ModelProfile {
+            weight_bytes: 512 << 20,
+            kv_bytes: 256 << 20,
+            activation_bytes: 256 << 20,
+            groups: vec![group(0, 512 << 20, 1)],
+        };
+        let resident = FabricPlanner::plan(&hw, &model).unwrap();
+        assert_eq!(resident.budget.device_staging, 0);
+        assert_eq!(resident.budget.host_staging, 0);
+        assert_eq!(resident.storage_queue_depth, 0);
+
+        hw.device_total = 0;
+        hw.device_available = 0;
+        let cpu = FabricPlanner::plan(&hw, &model).unwrap();
+        assert_eq!(cpu.budget.device_staging, 0);
+        assert_eq!(cpu.budget.host_staging, 0);
+        assert_eq!(cpu.storage_queue_depth, 0);
     }
 }

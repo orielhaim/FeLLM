@@ -458,15 +458,14 @@ impl CompiledStep {
             let Some(rt) = &node.runtime else { continue };
             fellm_plugin_abi::set_current_execution_op(i as u64);
 
-            // Architecture-neutral predictive window: constants required by this operation and
-            // the next runtime operation. Device backends can overlap the future group transfer.
-            for (group_index, required) in [
-                Some((i, true)),
-                self.next_runtime_index(i + 1, end)
-                    .map(|index| (index, false)),
-            ]
-            .into_iter()
-            .flatten()
+            // Architecture-neutral predictive window: demand the current object while queueing
+            // storage for N+1 and N+2. Backends must not publish future device residency before
+            // I/O completion or overwrite the slot used by the current operation.
+            let next = self.next_weighted_runtime_index(i + 1, end);
+            let next_next = next.and_then(|index| self.next_weighted_runtime_index(index + 1, end));
+            for (group_index, required) in std::iter::once((i, true))
+                .chain(next.map(|index| (index, false)))
+                .chain(next_next.map(|index| (index, false)))
             {
                 let mut prefetch: SmallVec<[TensorRef; 8]> = SmallVec::new();
                 for &input in &self.nodes[group_index].inputs {
@@ -613,6 +612,19 @@ impl CompiledStep {
         let node = &self.nodes[idx];
         match &node.kind {
             SlotKind::Constant(t) => {
+                if let Some((_, offset, len)) = t.file_extent() {
+                    static STORAGE_SENTINEL: u8 = 0;
+                    return Ok(unsafe {
+                        TensorRef::from_raw(
+                            t.dtype(),
+                            &node.dims,
+                            &node.strides,
+                            &STORAGE_SENTINEL,
+                            len,
+                        )
+                        .with_logical_id(offset.saturating_add(1))
+                    });
+                }
                 let bytes = t.as_bytes();
                 // SAFETY: bytes valid for the tensor's lifetime (Arc-shared).
                 Ok(unsafe {
@@ -669,8 +681,14 @@ impl CompiledStep {
         }
     }
 
-    fn next_runtime_index(&self, start: usize, end: usize) -> Option<usize> {
-        (start..end).find(|&index| self.nodes[index].runtime.is_some())
+    fn next_weighted_runtime_index(&self, start: usize, end: usize) -> Option<usize> {
+        (start..end).find(|&index| {
+            self.nodes[index].runtime.is_some()
+                && self.nodes[index]
+                    .inputs
+                    .iter()
+                    .any(|&input| matches!(self.nodes[input].kind, SlotKind::Constant(_)))
+        })
     }
 
     /// Build a writable tensor view for slot `idx`.

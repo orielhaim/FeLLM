@@ -252,6 +252,7 @@ dependencies = [
  "divan",
  "dyn-stack",
  "fellm-core",
+ "fellm-memory",
  "fellm-plugin-abi",
  "gemm",
  "half",
@@ -262,6 +263,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "raw-cpuid",
  "rayon",
+ "smallvec",
  "sysinfo",
  "thread_local",
  "tracing",
@@ -889,6 +891,7 @@ dependencies = [
  "fellm-core",
  "memmap2",
  "tracing",
+ "windows-sys",
 ]
 
 [[package]]
@@ -952,6 +955,7 @@ dependencies = [
  "smallvec",
  "sysinfo",
  "tracing",
+ "windows-sys",
 ]
 
 [[package]]

@@ -448,7 +448,20 @@ impl Engine {
         settings: EngineSettings,
         architecture: Option<ArchitecturePluginHandle>,
     ) -> Result<Self> {
-        let gguf = Arc::new(GgufFile::open(path)?);
+        let backend = settings.backend.resolve()?;
+        let storage_native_cpu = backend.id() == "cpu"
+            && matches!(
+                settings.memory_fabric.storage_provider,
+                fellm_memory::StorageProviderRequest::Buffered
+                    | fellm_memory::StorageProviderRequest::Direct
+                    | fellm_memory::StorageProviderRequest::Mmap
+                    | fellm_memory::StorageProviderRequest::IoUring
+            );
+        let gguf = Arc::new(if storage_native_cpu {
+            GgufFile::open_storage_native(path)?
+        } else {
+            GgufFile::open(path)?
+        });
         let tokenizer = load_tokenizer(&gguf)?;
 
         let spec = ModelSpec::from_gguf(&gguf)?;
@@ -472,8 +485,6 @@ impl Engine {
             n_ubatch,
             "context / batch settings"
         );
-
-        let backend = settings.backend.resolve()?;
 
         // Discover dynamic plugins and prepare attention / KV-policy providers.
         let mut providers = crate::providers::ProviderManager::new(settings.providers.clone());
@@ -546,9 +557,6 @@ impl Engine {
                 model.memory_fabric.cpu_compute_weights(),
                 model.memory_fabric.cpu_compute_ops(),
             );
-            let (storage_weights, host_buffers, host_buffer_bytes) =
-                model.memory_fabric.storage_stream_configuration();
-            cuda.configure_weight_storage(&storage_weights, host_buffers, host_buffer_bytes)?;
             let n_pages = model.cache.n_pages();
             let host_pages = (n_pages / 2).max(1);
             if let Err(e) = cuda.init_kv_arena(
@@ -1205,6 +1213,19 @@ impl Engine {
     /// Publish live cross-tier weight and transfer-provider telemetry.
     pub fn publish_memory_fabric_metrics(&self) {
         self.model.memory_fabric.publish_metrics();
+        if let Some(cpu) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cpu::CpuBackend>()
+        {
+            let snapshot = cpu.storage_metrics();
+            metrics::counter!("fellm_memory_transfer_bytes_total", "path" => "storage_to_host_weights")
+                .absolute(snapshot.physical_bytes);
+            metrics::counter!("fellm_memory_mmap_execution_bytes_total")
+                .absolute(snapshot.mmap_execution_bytes);
+            metrics::gauge!("fellm_memory_stall_seconds", "provider" => "cpu_storage")
+                .set(snapshot.storage_stall_nanos as f64 / 1_000_000_000.0);
+        }
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = self
             .backend
@@ -1236,7 +1257,41 @@ impl Engine {
     }
 
     /// Emit the concrete residency and transfer counters used by the completed run.
-    pub fn log_memory_fabric_runtime(&self) {
+    pub fn log_memory_fabric_runtime(&self, _evaluated_tokens: u64) {
+        if let Some(cpu) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cpu::CpuBackend>()
+        {
+            let snapshot = cpu.storage_metrics();
+            let mut system = sysinfo::System::new_with_specifics(
+                sysinfo::RefreshKind::nothing()
+                    .with_processes(sysinfo::ProcessRefreshKind::nothing().with_memory()),
+            );
+            let resident_set_bytes = sysinfo::get_current_pid()
+                .ok()
+                .and_then(|pid| {
+                    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                    system.process(pid).map(sysinfo::Process::memory)
+                })
+                .unwrap_or(0);
+            tracing::info!(
+                storage_read_bytes = snapshot.physical_bytes,
+                buffered_storage_bytes = snapshot.buffered_storage_bytes,
+                direct_storage_bytes = snapshot.direct_storage_bytes,
+                storage_physical_reads = snapshot.physical_reads,
+                storage_bytes_per_token =
+                    snapshot.physical_bytes as f64 / _evaluated_tokens.max(1) as f64,
+                mmap_execution_bytes = snapshot.mmap_execution_bytes,
+                storage_wait_nanos = snapshot.storage_stall_nanos,
+                io_compute_overlap_percent = snapshot.io_compute_overlap_percent,
+                storage_staging_bytes = snapshot.staging_bytes,
+                resident_set_bytes,
+                peak_rss_bytes = process_peak_rss_bytes(),
+                zero_mmap_weight_execution = snapshot.mmap_execution_bytes == 0,
+                "CPU Memory Fabric runtime counters"
+            );
+        }
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = self
             .backend
@@ -1245,15 +1300,42 @@ impl Engine {
         {
             let snapshot = cuda.metrics();
             tracing::info!(
-                device_weight_resident_bytes = snapshot.weight_resident_bytes,
+                device_weight_resident_bytes = self
+                    .model
+                    .memory_fabric
+                    .snapshot()
+                    .plan
+                    .budget
+                    .weights_device
+                    .saturating_add(snapshot.weight_resident_bytes),
                 weight_h2d_bytes = snapshot.weight_h2d_bytes,
                 weight_prefetch_hits = snapshot.weight_prefetch_hits,
                 weight_prefetch_misses = snapshot.weight_prefetch_misses,
                 weight_evictions = snapshot.weight_evictions,
                 storage_read_bytes = snapshot.storage_read_bytes,
+                storage_useful_bytes = snapshot.storage_useful_bytes,
+                storage_physical_reads = snapshot.storage_physical_reads,
+                storage_failed_reads = snapshot.storage_failed_reads,
+                storage_read_latency_p50_nanos = snapshot.storage_latency_p50_nanos,
+                storage_read_latency_p95_nanos = snapshot.storage_latency_p95_nanos,
+                storage_read_amplification = snapshot.storage_read_bytes as f64
+                    / snapshot.storage_useful_bytes.max(1) as f64,
+                storage_bytes_per_token =
+                    snapshot.storage_read_bytes as f64 / _evaluated_tokens.max(1) as f64,
+                weight_h2d_bytes_per_token =
+                    snapshot.weight_h2d_bytes as f64 / _evaluated_tokens.max(1) as f64,
                 storage_wait_nanos = snapshot.storage_wait_nanos,
                 storage_prefetch_hits = snapshot.storage_prefetch_hits,
                 storage_prefetch_misses = snapshot.storage_prefetch_misses,
+                storage_resident_hits = snapshot.storage_resident_hits,
+                storage_required_requests = snapshot.storage_required_requests,
+                storage_true_resident_hit_rate = snapshot.storage_resident_hits as f64
+                    / snapshot.storage_required_requests.max(1) as f64,
+                storage_prefetch_precision = snapshot.storage_prefetch_hits as f64
+                    / snapshot
+                        .storage_prefetch_hits
+                        .saturating_add(snapshot.storage_prefetch_misses)
+                        .max(1) as f64,
                 cpu_partition_ops = snapshot.cpu_partition_count,
                 "Memory Fabric runtime counters"
             );
@@ -1467,6 +1549,27 @@ impl Engine {
     }
 }
 
+#[cfg(windows)]
+fn process_peak_rss_bytes() -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if ok == 0 {
+        0
+    } else {
+        counters.PeakWorkingSetSize
+    }
+}
+
+#[cfg(not(windows))]
+fn process_peak_rss_bytes() -> usize {
+    0
+}
+
 impl LoadedModel {
     fn new(
         gguf: &GgufFile,
@@ -1642,6 +1745,7 @@ impl LoadedModel {
                 .count(),
             device_buffers = fabric_snapshot.plan.device_buffer_count,
             host_buffers = fabric_snapshot.plan.host_buffer_count,
+            storage_queue_depth = fabric_snapshot.plan.storage_queue_depth,
             "selected automatic Memory Fabric plan"
         );
         memory_fabric.publish_metrics();
@@ -1725,7 +1829,33 @@ impl LoadedModel {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            let storage_tensor_refs = blobs
+                .iter()
+                .map(|blob| {
+                    // SAFETY: model storage owns every blob for the engine lifetime.
+                    unsafe {
+                        fellm_plugin_abi::TensorRef::from_raw(
+                            DType::U8,
+                            &[blob.bytes.len() as u64],
+                            &[1],
+                            blob.bytes.as_ptr(),
+                            blob.bytes.len(),
+                        )
+                    }
+                    .with_logical_id(blob.id.0)
+                })
+                .collect::<Vec<_>>();
             let fabric_plan = self.memory_fabric.snapshot().plan;
+            let (storage_weights, host_buffers, host_buffer_bytes) =
+                self.memory_fabric.storage_stream_configuration();
+            cuda.configure_weight_storage(
+                &storage_weights,
+                self.memory_fabric.storage_objects(),
+                &storage_tensor_refs,
+                self.memory_fabric.select_storage_provider(true)?,
+                host_buffers,
+                host_buffer_bytes,
+            )?;
             cuda.set_weight_cache_budget(
                 fabric_plan.budget.device_staging.max(1),
                 u32::from(fabric_plan.device_buffer_count.max(1)),
@@ -1892,6 +2022,20 @@ impl LoadedModel {
         let compiled =
             CompiledStep::compile(&self.step_graph, &self.step_plan, backend, &mutable_inputs)?;
         self.compiled = Some(compiled);
+        if let Some(cpu) = backend.as_any().downcast_ref::<backend_cpu::CpuBackend>() {
+            let (storage_weights, host_buffers, host_buffer_bytes) =
+                self.memory_fabric.storage_stream_configuration();
+            if !storage_weights.is_empty() {
+                cpu.configure_weight_storage(
+                    &storage_weights,
+                    self.memory_fabric.storage_objects(),
+                    self.memory_fabric.select_storage_provider(false)?,
+                    host_buffers,
+                    host_buffer_bytes,
+                    self.memory_fabric.storage_overlap_enabled(),
+                )?;
+            }
+        }
         #[cfg(feature = "backend-cuda")]
         if let (Some(cuda), Some(plan), Some(compiled)) = (
             backend.as_any().downcast_ref::<backend_cuda::CudaBackend>(),

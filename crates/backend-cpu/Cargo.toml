@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 fellm-core.workspace = true
 fellm-plugin-abi.workspace = true
+fellm-memory.workspace = true
 gemm.workspace = true
 pulp.workspace = true
 dyn-stack.workspace = true
@@ -25,6 +26,7 @@ tracing.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 raw-cpuid = "11.6.0"
+smallvec.workspace = true
 
 [dev-dependencies]
 divan.workspace = true

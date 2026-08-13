@@ -34,5 +34,8 @@ smallvec.workspace = true
 metrics.workspace = true
 sysinfo.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [lints]
 workspace = true

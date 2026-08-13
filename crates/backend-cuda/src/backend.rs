@@ -20,9 +20,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 
 struct WeightStorageState {
-    pool: fellm_memory::BoundedTransferPool,
-    extents: std::collections::HashMap<u64, fellm_memory::StorageExtent>,
+    weights: std::collections::HashMap<u64, StorageWeight>,
+    objects: std::collections::HashMap<u64, fellm_memory::StorageObject>,
+    tensors: std::collections::HashMap<u64, TensorRef>,
     pending: std::collections::HashMap<u64, Vec<Receiver<Result<fellm_memory::PrefetchedRead>>>>,
+    resident_slots: Vec<Option<u64>>,
+    states: std::collections::HashMap<u64, fellm_memory::StorageSlotState>,
+    // Must drop after `pending`: completed leases return staging before worker shutdown joins.
+    pool: fellm_memory::BoundedTransferPool,
+}
+
+#[derive(Clone, Copy)]
+struct StorageWeight {
+    object: u64,
 }
 
 /// Bit set on handles that route to the embedded CPU backend.
@@ -80,9 +90,16 @@ pub struct CudaExecutionMetrics {
     pub weight_prefetch_misses: u64,
     pub weight_evictions: u64,
     pub storage_read_bytes: u64,
+    pub storage_useful_bytes: u64,
+    pub storage_physical_reads: u64,
+    pub storage_failed_reads: u64,
+    pub storage_latency_p50_nanos: u64,
+    pub storage_latency_p95_nanos: u64,
     pub storage_wait_nanos: u64,
     pub storage_prefetch_hits: u64,
     pub storage_prefetch_misses: u64,
+    pub storage_resident_hits: u64,
+    pub storage_required_requests: u64,
     pub cpu_partition_count: u64,
 }
 
@@ -107,10 +124,12 @@ pub struct CudaBackend {
     cpu_fallback_count: AtomicU64,
     weight_streaming_enabled: AtomicBool,
     weight_storage: Mutex<Option<WeightStorageState>>,
-    storage_read_bytes: AtomicU64,
+    storage_useful_bytes: AtomicU64,
     storage_wait_nanos: AtomicU64,
     storage_prefetch_hits: AtomicU64,
     storage_prefetch_misses: AtomicU64,
+    storage_resident_hits: AtomicU64,
+    storage_required_requests: AtomicU64,
     cpu_partition_count: AtomicU64,
     cpu_weight_ids: RwLock<std::collections::HashSet<u64>>,
     cpu_execution_ops: RwLock<std::collections::HashSet<u64>>,
@@ -159,6 +178,9 @@ impl CudaBackend {
     pub fn configure_weight_storage(
         &self,
         weights: &[fellm_memory::WeightDescriptor],
+        objects: &fellm_memory::StorageObjectIndex,
+        tensors: &[TensorRef],
+        provider_kind: fellm_memory::StorageProviderKind,
         buffer_count: usize,
         buffer_bytes: usize,
     ) -> Result<()> {
@@ -170,21 +192,104 @@ impl CudaBackend {
             .first()
             .map(|weight| weight.home.path.clone())
             .ok_or_else(|| FellmError::other("storage weight catalog is empty"))?;
-        let provider = std::sync::Arc::new(fellm_memory::FileProvider::open(&path)?);
+        let provider: std::sync::Arc<dyn fellm_memory::TransferProvider> = match provider_kind {
+            fellm_memory::StorageProviderKind::PageCache => {
+                std::sync::Arc::new(fellm_memory::FileProvider::open(&path)?)
+            }
+            fellm_memory::StorageProviderKind::Mmap => {
+                let file = std::fs::File::open(&path).map_err(FellmError::Io)?;
+                std::sync::Arc::new(fellm_memory::MmapProvider::open(&file)?)
+            }
+            fellm_memory::StorageProviderKind::Buffered => {
+                std::sync::Arc::new(fellm_memory::FileProvider::open(&path)?)
+            }
+            fellm_memory::StorageProviderKind::Direct => {
+                #[cfg(target_os = "linux")]
+                {
+                    std::sync::Arc::new(fellm_memory::DirectFileProvider::open(&path)?)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(FellmError::other("direct I/O provider requires Linux"));
+                }
+            }
+            fellm_memory::StorageProviderKind::IoUring => {
+                return Err(FellmError::other(
+                    "io_uring was selected without an operational provider",
+                ));
+            }
+            fellm_memory::StorageProviderKind::Gds => {
+                return Err(FellmError::other(
+                    "GDS was selected without an operational provider",
+                ));
+            }
+        };
         let pool = fellm_memory::BoundedTransferPool::new(
             provider,
             buffer_count.max(1),
             buffer_bytes.max(1),
         )?;
-        let extents = weights
+        let selected = weights
             .iter()
-            .map(|weight| (weight.id.0, weight.home.clone()))
+            .map(|weight| weight.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut object_map = std::collections::HashMap::new();
+        let mut weight_map = std::collections::HashMap::new();
+        for object in objects.objects() {
+            if !object
+                .members
+                .iter()
+                .any(|member| selected.contains(&member.weight))
+            {
+                continue;
+            }
+            if object.extent.len > buffer_bytes as u64 {
+                return Err(FellmError::other(format!(
+                    "storage object {} exceeds bounded staging slot: {} > {}",
+                    object.id.0, object.extent.len, buffer_bytes
+                )));
+            }
+            object_map.insert(object.id.0, object.clone());
+            for member in &object.members {
+                if selected.contains(&member.weight) {
+                    weight_map.insert(
+                        member.weight.0,
+                        StorageWeight {
+                            object: object.id.0,
+                        },
+                    );
+                }
+            }
+        }
+        let tensors = tensors
+            .iter()
+            .map(|tensor| (tensor.logical_id, *tensor))
+            .collect();
+        let states = object_map
+            .keys()
+            .map(|&id| (id, fellm_memory::StorageSlotState::Empty))
             .collect();
         *self.weight_storage.lock().expect("weight storage lock") = Some(WeightStorageState {
             pool,
-            extents,
+            weights: weight_map,
+            objects: object_map,
+            tensors,
             pending: std::collections::HashMap::new(),
+            resident_slots: vec![None; buffer_count.max(1)],
+            states,
         });
+        tracing::info!(
+            storage_objects = objects.objects().len(),
+            storage_provider = provider_kind.name(),
+            storage_object_physical_bytes = objects.physical_bytes(),
+            storage_object_useful_bytes = objects.useful_bytes(),
+            storage_object_metadata_bytes = objects.metadata_bytes(),
+            storage_read_amplification =
+                objects.physical_bytes() as f64 / objects.useful_bytes().max(1) as f64,
+            storage_queue_depth = buffer_count.max(1),
+            storage_staging_bytes = buffer_count.max(1).saturating_mul(buffer_bytes.max(1)),
+            "configured bounded storage-object scheduler"
+        );
         Ok(())
     }
 
@@ -287,10 +392,12 @@ impl CudaBackend {
             cpu_fallback_count: AtomicU64::new(0),
             weight_streaming_enabled: AtomicBool::new(false),
             weight_storage: Mutex::new(None),
-            storage_read_bytes: AtomicU64::new(0),
+            storage_useful_bytes: AtomicU64::new(0),
             storage_wait_nanos: AtomicU64::new(0),
             storage_prefetch_hits: AtomicU64::new(0),
             storage_prefetch_misses: AtomicU64::new(0),
+            storage_resident_hits: AtomicU64::new(0),
+            storage_required_requests: AtomicU64::new(0),
             cpu_partition_count: AtomicU64::new(0),
             cpu_weight_ids: RwLock::new(std::collections::HashSet::new()),
             cpu_execution_ops: RwLock::new(std::collections::HashSet::new()),
@@ -324,6 +431,14 @@ impl CudaBackend {
     #[must_use]
     pub fn metrics(&self) -> CudaExecutionMetrics {
         let weights = self.plugins.weight_cache_metrics();
+        let storage = self
+            .weight_storage
+            .lock()
+            .expect("weight storage lock")
+            .as_ref()
+            .map_or_else(fellm_memory::TransferPoolMetrics::default, |state| {
+                state.pool.metrics()
+            });
         CudaExecutionMetrics {
             h2d_bytes: self.h2d_bytes.load(Ordering::Relaxed),
             d2h_bytes: self.d2h_bytes.load(Ordering::Relaxed),
@@ -333,10 +448,17 @@ impl CudaBackend {
             weight_prefetch_hits: weights.prefetch_hits,
             weight_prefetch_misses: weights.prefetch_misses,
             weight_evictions: weights.evictions,
-            storage_read_bytes: self.storage_read_bytes.load(Ordering::Relaxed),
+            storage_read_bytes: storage.physical_bytes,
+            storage_useful_bytes: self.storage_useful_bytes.load(Ordering::Relaxed),
+            storage_physical_reads: storage.physical_reads,
+            storage_failed_reads: storage.failed_reads,
+            storage_latency_p50_nanos: storage.latency_p50_nanos,
+            storage_latency_p95_nanos: storage.latency_p95_nanos,
             storage_wait_nanos: self.storage_wait_nanos.load(Ordering::Relaxed),
             storage_prefetch_hits: self.storage_prefetch_hits.load(Ordering::Relaxed),
             storage_prefetch_misses: self.storage_prefetch_misses.load(Ordering::Relaxed),
+            storage_resident_hits: self.storage_resident_hits.load(Ordering::Relaxed),
+            storage_required_requests: self.storage_required_requests.load(Ordering::Relaxed),
             cpu_partition_count: self.cpu_partition_count.load(Ordering::Relaxed),
         }
     }
@@ -522,39 +644,66 @@ impl Backend for CudaBackend {
         }
         let mut direct = Vec::with_capacity(weights.len());
         let mut storage = self.weight_storage.lock().expect("weight storage lock");
-        let mut storage_weights = Vec::new();
+        let mut storage_objects = Vec::new();
         for weight in weights {
             let Some(state) = storage.as_mut() else {
                 direct.push(*weight);
                 continue;
             };
-            let Some(extent) = state.extents.get(&weight.logical_id).cloned() else {
+            let Some(storage_weight) = state.weights.get(&weight.logical_id).copied() else {
                 direct.push(*weight);
                 continue;
             };
-            storage_weights.push((*weight, extent));
+            if !storage_objects.contains(&storage_weight.object) {
+                storage_objects.push(storage_weight.object);
+            }
         }
-        if !storage_weights.is_empty() {
+        for object_id in storage_objects {
             let state = storage
                 .as_mut()
                 .expect("storage weights require configured storage state");
-            let was_pending = state.pending.contains_key(&group_id);
-            if !was_pending {
-                let extents = storage_weights
-                    .iter()
-                    .map(|(_, extent)| extent.clone())
-                    .collect::<Vec<_>>();
-                let reads = fellm_memory::coalesce_extents(
-                    &extents,
-                    64 * 1024,
-                    state.pool.buffer_bytes() as u64,
+            let slot = object_id as usize % state.resident_slots.len();
+            let published = matches!(
+                state.states.get(&object_id),
+                Some(
+                    fellm_memory::StorageSlotState::DeviceReady(_)
+                        | fellm_memory::StorageSlotState::InUse(_)
+                        | fellm_memory::StorageSlotState::Evictable(_)
                 )
-                .into_iter()
-                .map(|extent| state.pool.prefetch(extent))
-                .collect::<Result<Vec<_>>>()?;
-                state.pending.insert(group_id, reads);
+            );
+            if state.resident_slots[slot] == Some(object_id) && published {
+                if required {
+                    self.storage_required_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.storage_resident_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                if !direct.is_empty() {
+                    self.plugins.prefetch_weight_group(object_id, &direct)?;
+                    direct.clear();
+                }
+                continue;
+            }
+            let was_pending = state.pending.contains_key(&object_id);
+            if !was_pending {
+                let extent = state
+                    .objects
+                    .get(&object_id)
+                    .ok_or_else(|| FellmError::other("storage object missing from catalog"))?
+                    .extent
+                    .clone();
+                state
+                    .pending
+                    .insert(object_id, vec![state.pool.prefetch(extent)?]);
+                state.states.insert(
+                    object_id,
+                    fellm_memory::StorageSlotState::ReadQueued(fellm_memory::StorageObjectId(
+                        object_id,
+                    )),
+                );
             }
             if required {
+                self.storage_required_requests
+                    .fetch_add(1, Ordering::Relaxed);
                 if was_pending {
                     self.storage_prefetch_hits.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -562,8 +711,14 @@ impl Backend for CudaBackend {
                 }
                 let receivers = state
                     .pending
-                    .remove(&group_id)
-                    .ok_or_else(|| FellmError::other("missing pending storage group"))?;
+                    .remove(&object_id)
+                    .ok_or_else(|| FellmError::other("missing pending storage object"))?;
+                state.states.insert(
+                    object_id,
+                    fellm_memory::StorageSlotState::Reading(fellm_memory::StorageObjectId(
+                        object_id,
+                    )),
+                );
                 for receiver in receivers {
                     let wait_started = std::time::Instant::now();
                     let read = receiver.recv().map_err(|_| {
@@ -573,29 +728,78 @@ impl Backend for CudaBackend {
                         wait_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                         Ordering::Relaxed,
                     );
-                    let read_start = read.extent().offset;
-                    let read_end = read_start.saturating_add(read.extent().len);
+                    let object = state
+                        .objects
+                        .get(&object_id)
+                        .ok_or_else(|| FellmError::other("completed storage object missing"))?;
+                    state.states.insert(
+                        object_id,
+                        fellm_memory::StorageSlotState::HostReady(fellm_memory::StorageObjectId(
+                            object_id,
+                        )),
+                    );
                     let mut staged = Vec::new();
-                    for (weight, extent) in &storage_weights {
-                        let extent_end = extent.offset.saturating_add(extent.len);
-                        if extent.offset >= read_start && extent_end <= read_end {
-                            let mut weight = *weight;
-                            let delta = usize::try_from(extent.offset - read_start)
-                                .map_err(|_| FellmError::other("staged extent offset overflow"))?;
-                            weight.data = unsafe { read.staging_address().add(delta) };
-                            weight.byte_len = extent.len;
-                            staged.push(weight);
-                        }
+                    for member in &object.members {
+                        let Some(template) = state.tensors.get(&member.weight.0).copied() else {
+                            continue;
+                        };
+                        let mut tensor = template;
+                        let delta = usize::try_from(member.offset)
+                            .map_err(|_| FellmError::other("staged member offset overflow"))?;
+                        tensor.data = unsafe { read.staging_address().add(delta) };
+                        tensor.byte_len = member.len;
+                        staged.push(tensor);
                     }
-                    self.storage_read_bytes
-                        .fetch_add(read.bytes().len() as u64, Ordering::Relaxed);
-                    self.plugins.prefetch_weight_group(group_id, &staged)?;
+                    self.storage_useful_bytes
+                        .fetch_add(object.useful_bytes, Ordering::Relaxed);
+                    // One execution bundle must publish atomically under one slot identity.
+                    // Submitting RAM-backed companions under the operation id afterwards can
+                    // select the same physical slot and evict these storage members before the
+                    // kernel launch.
+                    if !direct.is_empty() {
+                        staged.append(&mut direct);
+                    }
+                    state.states.insert(
+                        object_id,
+                        fellm_memory::StorageSlotState::H2dQueued(fellm_memory::StorageObjectId(
+                            object_id,
+                        )),
+                    );
+                    self.plugins.prefetch_weight_group(object_id, &staged)?;
+                    if let Some(victim) = state.resident_slots[slot].replace(object_id)
+                        && victim != object_id
+                    {
+                        state
+                            .states
+                            .insert(victim, fellm_memory::StorageSlotState::Empty);
+                    }
+                    state.states.insert(
+                        object_id,
+                        fellm_memory::StorageSlotState::InUse(fellm_memory::StorageObjectId(
+                            object_id,
+                        )),
+                    );
                     drop(read);
                 }
             }
         }
         drop(storage);
-        self.plugins.prefetch_weight_group(group_id, &direct)?;
+        if required && !direct.is_empty() {
+            self.plugins.prefetch_weight_group(group_id, &direct)?;
+            if let Some(state) = self
+                .weight_storage
+                .lock()
+                .expect("weight storage lock")
+                .as_mut()
+            {
+                let slot = group_id as usize % state.resident_slots.len();
+                if let Some(victim) = state.resident_slots[slot].take() {
+                    state
+                        .states
+                        .insert(victim, fellm_memory::StorageSlotState::Empty);
+                }
+            }
+        }
         Ok(())
     }
 

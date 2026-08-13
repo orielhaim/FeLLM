@@ -2,8 +2,8 @@ use crate::StorageExtent;
 use fellm_core::error::{FellmError, Result};
 use fellm_core::storage::AlignedBuffer;
 use memmap2::Mmap;
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -51,13 +51,17 @@ impl TransferProvider for MmapProvider {
 
 /// Explicit bounded file reads. Multiple provider instances can be used as an async read pool.
 pub struct FileProvider {
-    file: Mutex<File>,
+    file: File,
 }
 
-/// Linux O_DIRECT provider for aligned `.fellm-pack` extents.
-#[cfg(target_os = "linux")]
+/// Native unbuffered provider for sector-aligned storage objects.
+#[cfg(any(target_os = "linux", windows))]
 pub struct DirectFileProvider {
     file: File,
+    #[cfg(windows)]
+    file_len: u64,
+    #[cfg(windows)]
+    fallback: FileProvider,
 }
 
 #[cfg(target_os = "linux")]
@@ -68,9 +72,30 @@ impl DirectFileProvider {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(0o40000)
-            .open(path)
+            .open(path.as_ref())
             .map_err(FellmError::Io)?;
         Ok(Self { file })
+    }
+}
+
+#[cfg(windows)]
+impl DirectFileProvider {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+        const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED)
+            .open(path.as_ref())
+            .map_err(FellmError::Io)?;
+        let file_len = file.metadata().map_err(FellmError::Io)?.len();
+        Ok(Self {
+            file,
+            file_len,
+            fallback: FileProvider::open(path.as_ref())?,
+        })
     }
 }
 
@@ -97,7 +122,93 @@ impl TransferProvider for DirectFileProvider {
                 .read_at(&mut target[read..], offset.saturating_add(read as u64))
                 .map_err(FellmError::Io)?;
             if count == 0 {
+                if read > 0 {
+                    target[read..].fill(0);
+                    return Ok(());
+                }
                 return Err(FellmError::other("unexpected EOF in O_DIRECT read"));
+            }
+            read += count;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl TransferProvider for DirectFileProvider {
+    fn name(&self) -> &'static str {
+        "windows-unbuffered-io"
+    }
+
+    fn read_at(&self, offset: u64, target: &mut [u8]) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, GetLastError, HANDLE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0_0};
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        if !offset.is_multiple_of(4096)
+            || !target.len().is_multiple_of(4096)
+            || !(target.as_ptr() as usize).is_multiple_of(4096)
+        {
+            return Err(FellmError::other(
+                "Windows unbuffered read requires 4096-byte aligned offset, length, and staging buffer",
+            ));
+        }
+        if offset.saturating_add(target.len() as u64) > self.file_len {
+            return self.fallback.read_at(offset, target);
+        }
+        let mut read = 0usize;
+        while read < target.len() {
+            let position = offset.saturating_add(read as u64);
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                return Err(FellmError::Io(std::io::Error::last_os_error()));
+            }
+            let mut overlapped = OVERLAPPED::default();
+            overlapped.hEvent = event;
+            overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
+                Offset: position as u32,
+                OffsetHigh: (position >> 32) as u32,
+            };
+            let chunk = (target.len() - read).min(u32::MAX as usize) as u32;
+            let handle = self.file.as_raw_handle() as HANDLE;
+            let submitted = unsafe {
+                ReadFile(
+                    handle,
+                    target[read..].as_mut_ptr(),
+                    chunk,
+                    std::ptr::null_mut(),
+                    &mut overlapped,
+                )
+            };
+            if submitted == 0 {
+                let error = unsafe { GetLastError() };
+                if error != ERROR_IO_PENDING {
+                    unsafe { CloseHandle(event) };
+                    if error == ERROR_HANDLE_EOF && read > 0 {
+                        target[read..].fill(0);
+                        return Ok(());
+                    }
+                    return Err(FellmError::Io(std::io::Error::from_raw_os_error(
+                        error as i32,
+                    )));
+                }
+            }
+            let mut count = 0u32;
+            let completed = unsafe { GetOverlappedResult(handle, &overlapped, &mut count, 1) };
+            unsafe { CloseHandle(event) };
+            if completed == 0 {
+                return Err(FellmError::Io(std::io::Error::last_os_error()));
+            }
+            let count = count as usize;
+            if count == 0 {
+                if read > 0 {
+                    target[read..].fill(0);
+                    return Ok(());
+                }
+                return Err(FellmError::other("unexpected EOF in unbuffered read"));
             }
             read += count;
         }
@@ -108,7 +219,7 @@ impl TransferProvider for DirectFileProvider {
 impl FileProvider {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self {
-            file: Mutex::new(File::open(path).map_err(FellmError::Io)?),
+            file: File::open(path).map_err(FellmError::Io)?,
         })
     }
 }
@@ -118,12 +229,38 @@ impl TransferProvider for FileProvider {
         "buffered-file"
     }
     fn read_at(&self, offset: u64, target: &mut [u8]) -> Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| FellmError::other("file provider lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset)).map_err(FellmError::Io)?;
-        file.read_exact(target).map_err(FellmError::Io)
+        let mut read = 0usize;
+        while read < target.len() {
+            #[cfg(unix)]
+            let count = {
+                use std::os::unix::fs::FileExt;
+                self.file
+                    .read_at(&mut target[read..], offset.saturating_add(read as u64))
+                    .map_err(FellmError::Io)?
+            };
+            #[cfg(windows)]
+            let count = {
+                use std::os::windows::fs::FileExt;
+                self.file
+                    .seek_read(&mut target[read..], offset.saturating_add(read as u64))
+                    .map_err(FellmError::Io)?
+            };
+            #[cfg(not(any(unix, windows)))]
+            let count = return Err(FellmError::other(
+                "positional file reads are unsupported on this platform",
+            ));
+            if count == 0 {
+                if read > 0 {
+                    target[read..].fill(0);
+                    return Ok(());
+                }
+                return Err(FellmError::other(
+                    "unexpected EOF in buffered positional read",
+                ));
+            }
+            read += count;
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +345,24 @@ pub struct BoundedTransferPool {
     submit: Option<SyncSender<ReadCommand>>,
     workers: Vec<JoinHandle<()>>,
     buffer_bytes: usize,
+    metrics: Arc<TransferPoolMetricsState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferPoolMetrics {
+    pub physical_reads: u64,
+    pub physical_bytes: u64,
+    pub failed_reads: u64,
+    pub latency_p50_nanos: u64,
+    pub latency_p95_nanos: u64,
+}
+
+#[derive(Default)]
+struct TransferPoolMetricsState {
+    physical_reads: std::sync::atomic::AtomicU64,
+    physical_bytes: std::sync::atomic::AtomicU64,
+    failed_reads: std::sync::atomic::AtomicU64,
+    latencies: Mutex<VecDeque<u64>>,
 }
 
 impl BoundedTransferPool {
@@ -230,16 +385,20 @@ impl BoundedTransferPool {
         let available_rx = Arc::new(Mutex::new(available_rx));
         let (submit, commands) = mpsc::sync_channel::<ReadCommand>(buffer_count);
         let commands = Arc::new(Mutex::new(commands));
+        let metrics = Arc::new(TransferPoolMetricsState::default());
         let mut workers = Vec::with_capacity(buffer_count);
         for index in 0..buffer_count {
             let provider = Arc::clone(&provider);
             let commands = Arc::clone(&commands);
             let available_rx = Arc::clone(&available_rx);
             let available_tx = available_tx.clone();
+            let metrics = Arc::clone(&metrics);
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("fellm-storage-prefetch-{index}"))
-                    .spawn(move || worker_loop(provider, commands, available_rx, available_tx))
+                    .spawn(move || {
+                        worker_loop(provider, commands, available_rx, available_tx, metrics);
+                    })
                     .map_err(|error| {
                         FellmError::other(format!("spawn storage prefetch worker: {error}"))
                     })?,
@@ -249,6 +408,7 @@ impl BoundedTransferPool {
             submit: Some(submit),
             workers,
             buffer_bytes,
+            metrics,
         })
     }
 
@@ -271,9 +431,63 @@ impl BoundedTransferPool {
         Ok(receive)
     }
 
+    /// Attempt speculative read-ahead without ever blocking the execution thread behind a full
+    /// submission queue. Demand reads use [`Self::prefetch`] after reserving a ring slot.
+    pub fn try_prefetch(
+        &self,
+        extent: StorageExtent,
+    ) -> Result<Option<Receiver<Result<PrefetchedRead>>>> {
+        let len = usize::try_from(extent.len)
+            .map_err(|_| FellmError::other("prefetch extent length overflow"))?;
+        if len > self.buffer_bytes {
+            return Err(FellmError::other("prefetch extent exceeds staging buffer"));
+        }
+        let (result, receive) = mpsc::sync_channel(1);
+        match self
+            .submit
+            .as_ref()
+            .ok_or_else(|| FellmError::other("transfer pool stopped"))?
+            .try_send(ReadCommand { extent, result })
+        {
+            Ok(()) => Ok(Some(receive)),
+            Err(mpsc::TrySendError::Full(_)) => Ok(None),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(FellmError::other("storage prefetch workers stopped"))
+            }
+        }
+    }
+
     #[must_use]
     pub const fn buffer_bytes(&self) -> usize {
         self.buffer_bytes
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> TransferPoolMetrics {
+        use std::sync::atomic::Ordering;
+        let mut latencies = self
+            .metrics
+            .latencies
+            .lock()
+            .expect("transfer latency metrics lock")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        latencies.sort_unstable();
+        let percentile = |percent: usize| {
+            if latencies.is_empty() {
+                0
+            } else {
+                latencies[(latencies.len() - 1) * percent / 100]
+            }
+        };
+        TransferPoolMetrics {
+            physical_reads: self.metrics.physical_reads.load(Ordering::Relaxed),
+            physical_bytes: self.metrics.physical_bytes.load(Ordering::Relaxed),
+            failed_reads: self.metrics.failed_reads.load(Ordering::Relaxed),
+            latency_p50_nanos: percentile(50),
+            latency_p95_nanos: percentile(95),
+        }
     }
 }
 
@@ -291,6 +505,7 @@ fn worker_loop(
     commands: Arc<Mutex<Receiver<ReadCommand>>>,
     available: Arc<Mutex<Receiver<AlignedBuffer>>>,
     available_tx: SyncSender<AlignedBuffer>,
+    metrics: Arc<TransferPoolMetricsState>,
 ) {
     loop {
         let command = {
@@ -308,7 +523,26 @@ fn worker_loop(
         };
         let Ok(mut buffer) = buffer else { return };
         let len = command.extent.len as usize;
+        let started = std::time::Instant::now();
         let read = provider.read_at(command.extent.offset, &mut buffer.as_mut_slice()[..len]);
+        let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        metrics
+            .physical_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .physical_bytes
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        if read.is_err() {
+            metrics
+                .failed_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Ok(mut latencies) = metrics.latencies.lock() {
+            if latencies.len() == 4096 {
+                latencies.pop_front();
+            }
+            latencies.push_back(elapsed);
+        }
         let result = match read {
             Ok(()) => Ok(PrefetchedRead {
                 extent: command.extent,
@@ -328,6 +562,7 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[test]
     fn coalesces_adjacent_weight_ranges() {
         let e = |offset, len| StorageExtent {
@@ -380,5 +615,49 @@ mod tests {
             observed.push(read.staging_address());
         }
         assert!(observed.contains(&first_address));
+    }
+
+    struct ConcurrencyProvider {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+
+    impl TransferProvider for ConcurrencyProvider {
+        fn name(&self) -> &'static str {
+            "concurrency-test"
+        }
+
+        fn read_at(&self, _offset: u64, _target: &mut [u8]) -> Result<()> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_pool_reaches_real_queue_depth() {
+        let provider = Arc::new(ConcurrencyProvider {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let pool = BoundedTransferPool::new(provider.clone(), 4, 4096).unwrap();
+        let receivers = (0..4)
+            .map(|offset| {
+                pool.prefetch(StorageExtent {
+                    provider: "test".into(),
+                    path: "none".into(),
+                    offset,
+                    len: 4096,
+                    alignment: 4096,
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for receiver in receivers {
+            receiver.recv().unwrap().unwrap();
+        }
+        assert_eq!(provider.maximum.load(Ordering::SeqCst), 4);
     }
 }

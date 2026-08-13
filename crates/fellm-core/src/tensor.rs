@@ -78,6 +78,18 @@ impl Tensor {
         })
     }
 
+    /// Stable payload extent in a source file when the model was opened metadata-only.
+    #[must_use]
+    pub fn file_extent(&self) -> Option<(&std::path::PathBuf, u64, usize)> {
+        self.storage.file_extent().map(|(path, base, _)| {
+            (
+                path,
+                base.saturating_add(self.layout.offset_bytes as u64),
+                self.layout.byte_size(),
+            )
+        })
+    }
+
     /// Interpret the payload as `&[T]` if the dtype matches size-wise and the
     /// tensor is contiguous.
     ///

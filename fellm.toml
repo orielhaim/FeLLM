@@ -30,6 +30,10 @@ kv_prefetch = true
 h2d_bytes_per_second = 25769803776
 storage_bytes_per_second = 3221225472
 storage_latency_micros = 100
+storage_provider = "auto"
+host_weight_cache = 0
+storage_overlap = true
+router_trace_capacity = 65536
 disable_cpu_partitions = false
 
 [plugins]

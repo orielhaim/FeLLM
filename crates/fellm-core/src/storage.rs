@@ -2,6 +2,7 @@
 
 use memmap2::Mmap;
 use std::alloc::{Layout as StdLayout, alloc, dealloc};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -15,6 +16,16 @@ pub enum Storage {
         /// Offset in bytes from the start of the mapping.
         offset: usize,
         /// Length in bytes.
+        len: usize,
+    },
+    /// An immutable payload that remains only in its source file until a storage scheduler
+    /// prepares it. This variant deliberately cannot be dereferenced directly.
+    FileExtent {
+        /// Source file.
+        path: Arc<PathBuf>,
+        /// Absolute file offset.
+        offset: u64,
+        /// Payload length.
         len: usize,
     },
     /// Owned, aligned heap buffer.
@@ -36,6 +47,9 @@ impl Storage {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Mmap { mmap, offset, len } => &mmap[*offset..*offset + *len],
+            Self::FileExtent { .. } => {
+                panic!("file-backed tensor must be prepared by the Memory Fabric before execution")
+            }
             Self::Owned(buf) => buf.as_slice(),
             Self::View {
                 parent,
@@ -51,7 +65,10 @@ impl Storage {
     /// Byte length.
     #[must_use]
     pub fn len_bytes(&self) -> usize {
-        self.as_bytes().len()
+        match self {
+            Self::FileExtent { len, .. } => *len,
+            _ => self.as_bytes().len(),
+        }
     }
 
     /// Stable byte extent in an mmap backing store, if this storage ultimately has one.
@@ -68,6 +85,23 @@ impl Storage {
                 .mmap_extent()
                 .map(|(base, _)| (base.saturating_add(*offset), *len)),
             Self::Owned(_) => None,
+            Self::FileExtent { .. } => None,
+        }
+    }
+
+    /// Stable payload extent in a non-mapped source file.
+    #[must_use]
+    pub fn file_extent(&self) -> Option<(&PathBuf, u64, usize)> {
+        match self {
+            Self::FileExtent { path, offset, len } => Some((path, *offset, *len)),
+            Self::View {
+                parent,
+                offset,
+                len,
+            } => parent
+                .file_extent()
+                .map(|(path, base, _)| (path, base.saturating_add(*offset as u64), *len)),
+            _ => None,
         }
     }
 }
@@ -76,6 +110,11 @@ impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Mmap { len, .. } => f.debug_struct("Mmap").field("len", len).finish(),
+            Self::FileExtent { offset, len, .. } => f
+                .debug_struct("FileExtent")
+                .field("offset", offset)
+                .field("len", len)
+                .finish(),
             Self::Owned(b) => f.debug_struct("Owned").field("len", &b.len()).finish(),
             Self::View { len, .. } => f.debug_struct("View").field("len", len).finish(),
         }

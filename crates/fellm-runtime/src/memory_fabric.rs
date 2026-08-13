@@ -10,13 +10,13 @@ use fellm_memory::{
 use fellm_plugin_abi::DeviceMemoryInfo;
 use fellm_plugin_abi::op::OpKind;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 const DEFAULT_H2D_BPS: u64 = 24 * 1024 * 1024 * 1024;
 const DEFAULT_SSD_BPS: u64 = 3 * 1024 * 1024 * 1024;
-const TARGET_GROUP_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryFabricConfig {
@@ -25,6 +25,10 @@ pub struct MemoryFabricConfig {
     pub h2d_bytes_per_second: Option<u64>,
     pub storage_bytes_per_second: Option<u64>,
     pub storage_latency_micros: Option<u64>,
+    pub storage_provider: fellm_memory::StorageProviderRequest,
+    pub host_weight_cache: u64,
+    pub storage_overlap: bool,
+    pub router_trace_capacity: usize,
     pub disable_cpu_partitions: bool,
 }
 
@@ -36,16 +40,24 @@ pub struct MemoryFabricSnapshot {
 
 /// One model's joint plan. Allocation failures update pressure and produce a smaller plan.
 pub struct MemoryFabric {
+    config: MemoryFabricConfig,
     hardware: HardwareProfile,
     model: ModelProfile,
     weights: Arc<[WeightDescriptor]>,
+    storage_objects: Arc<fellm_memory::StorageObjectIndex>,
     schedule_ops: Arc<[Option<OpKind>]>,
     expert_tracker: Arc<Mutex<fellm_memory::ExpertAccessTracker>>,
     expert_placements: Arc<RwLock<Vec<fellm_memory::ExpertPlacement>>>,
+    expert_route_step: AtomicU64,
+    expert_routes: Arc<Mutex<std::collections::VecDeque<fellm_memory::ExpertRouteTrace>>>,
     state: Arc<RwLock<MemoryFabricSnapshot>>,
 }
 
 impl MemoryFabric {
+    #[must_use]
+    pub const fn storage_overlap_enabled(&self) -> bool {
+        self.config.storage_overlap
+    }
     pub fn inspect_and_plan(
         gguf: &GgufFile,
         graph: &Graph,
@@ -82,7 +94,7 @@ impl MemoryFabric {
             transfers: TransferCapabilities {
                 mmap: true,
                 async_file: true,
-                direct_io: cfg!(target_os = "linux"),
+                direct_io: cfg!(any(target_os = "linux", windows)),
                 // Capability means an operational provider, not merely OS/library potential.
                 io_uring: false,
                 gds: false,
@@ -97,7 +109,43 @@ impl MemoryFabric {
             hardware.cpu_score,
             config.disable_cpu_partitions,
         );
-        let plan = FabricPlanner::plan(&hardware, &model)?;
+        let mut plan = FabricPlanner::plan(&hardware, &model)?;
+        let cpu_storage_native = hardware.device_total == 0
+            && matches!(
+                config.storage_provider,
+                fellm_memory::StorageProviderRequest::Buffered
+                    | fellm_memory::StorageProviderRequest::Direct
+                    | fellm_memory::StorageProviderRequest::Mmap
+                    | fellm_memory::StorageProviderRequest::IoUring
+            );
+        if cpu_storage_native {
+            let slot_bytes = model
+                .groups
+                .iter()
+                .map(|group| group.byte_len)
+                .max()
+                .unwrap_or(4 << 20)
+                .saturating_add(128 << 10)
+                .next_multiple_of(4096);
+            // Two physical slots are required for multi-weight atomic bundles even when
+            // predictive overlap is disabled. Queue depth still describes I/O concurrency.
+            let slots = 2;
+            plan.budget.weights_host = config.host_weight_cache.min(model.weight_bytes);
+            plan.budget.host_staging = slot_bytes.saturating_mul(slots);
+            plan.host_buffer_count = slots as u8;
+            plan.host_buffer_bytes = slot_bytes;
+            plan.storage_queue_depth = if config.storage_overlap { 2 } else { 1 };
+            for placement in &mut plan.placements {
+                placement.class = fellm_memory::ResidencyClass::StorageStream;
+            }
+        }
+        let storage_objects = fellm_memory::StorageObjectIndex::from_execution_groups(
+            &weights,
+            &model.groups,
+            64 * 1024,
+            plan.host_buffer_bytes.max(1),
+        )
+        .map_err(|_| fellm_memory::PlanningError::NoHostStaging)?;
         let metrics = FabricMetrics {
             backing_storage_bytes: model.weight_bytes,
             resident_device_bytes: plan.budget.weights_device,
@@ -136,9 +184,11 @@ impl MemoryFabric {
             }
         }
         Ok(Self {
+            config: config.clone(),
             hardware,
             model,
             weights: weights.into(),
+            storage_objects: Arc::new(storage_objects),
             schedule_ops: execution
                 .order
                 .iter()
@@ -146,6 +196,10 @@ impl MemoryFabric {
                 .collect(),
             expert_tracker: Arc::new(Mutex::new(expert_tracker)),
             expert_placements: Arc::new(RwLock::new(Vec::new())),
+            expert_route_step: AtomicU64::new(0),
+            expert_routes: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                config.router_trace_capacity.min(65_536),
+            ))),
             state: Arc::new(RwLock::new(MemoryFabricSnapshot { plan, metrics })),
         })
     }
@@ -164,6 +218,20 @@ impl MemoryFabric {
     pub fn observe_expert_route_batch(&self, routes: &[(u64, Vec<u32>)]) {
         if routes.is_empty() {
             return;
+        }
+        let request_step = self.expert_route_step.fetch_add(1, Ordering::Relaxed);
+        if self.config.router_trace_capacity > 0 {
+            let mut trace = self.expert_routes.lock().expect("expert route trace lock");
+            for (operation, experts) in routes {
+                while trace.len() >= self.config.router_trace_capacity {
+                    trace.pop_front();
+                }
+                trace.push_back(fellm_memory::ExpertRouteTrace {
+                    request_step,
+                    operation: *operation,
+                    experts: experts.clone(),
+                });
+            }
         }
         let mut tracker = self.expert_tracker.lock().expect("expert tracker lock");
         for (operation, experts) in routes {
@@ -245,19 +313,107 @@ impl MemoryFabric {
             .clone()
     }
 
+    #[must_use]
+    pub fn expert_route_trace(&self) -> Vec<fellm_memory::ExpertRouteTrace> {
+        self.expert_routes
+            .lock()
+            .expect("expert route trace lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn simulate_expert_cache(
+        &self,
+        capacity_bytes: u64,
+        policy: fellm_memory::ExpertCachePolicy,
+    ) -> fellm_memory::CacheSimulation {
+        let sizes = self
+            .expert_tracker
+            .lock()
+            .expect("expert tracker lock")
+            .snapshot()
+            .into_iter()
+            .map(|access| (access.id, access.byte_len))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut events = Vec::new();
+        for route in self.expert_route_trace() {
+            for expert in route.experts {
+                let id = fellm_memory::ExpertId {
+                    operation: route.operation,
+                    expert,
+                };
+                events.push(fellm_memory::ExpertTraceEvent {
+                    expert: id,
+                    bytes: sizes.get(&id).copied().unwrap_or(1),
+                    load_cost_nanos: 1,
+                });
+            }
+        }
+        fellm_memory::simulate_expert_cache(&events, capacity_bytes, policy)
+    }
+
     /// Immutable logical weight catalog. Replica locations may change independently.
     #[must_use]
     pub fn weights(&self) -> &[WeightDescriptor] {
         &self.weights
     }
 
+    /// Graph-ordered physical storage objects and their O(1) weight lookup.
+    #[must_use]
+    pub fn storage_objects(&self) -> &fellm_memory::StorageObjectIndex {
+        &self.storage_objects
+    }
+
+    pub fn select_storage_provider(
+        &self,
+        device_consumer: bool,
+    ) -> fellm_core::error::Result<fellm_memory::StorageProviderKind> {
+        let plan = self.snapshot().plan;
+        let direct_io_aligned = self.storage_objects.objects().iter().all(|object| {
+            object.extent.offset.is_multiple_of(4096)
+                && object.extent.len.is_multiple_of(4096)
+                && object.extent.alignment >= 4096
+        });
+        let committed = self
+            .hardware
+            .host_total
+            .saturating_sub(self.hardware.host_available)
+            .saturating_add(plan.budget.weights_host)
+            .saturating_add(plan.budget.host_staging)
+            .saturating_add(plan.budget.kv_host)
+            .saturating_add(plan.budget.host_reserve);
+        let host_pressure = committed as f64 / self.hardware.host_total.max(1) as f64;
+        let reuse_count = self
+            .model
+            .groups
+            .iter()
+            .map(|group| group.reuse_count)
+            .max()
+            .unwrap_or(1);
+        fellm_memory::select_storage_provider(
+            self.config.storage_provider,
+            self.hardware.transfers,
+            fellm_memory::StorageWorkload {
+                reuse_count,
+                host_pressure,
+                direct_io_aligned,
+                device_consumer,
+            },
+        )
+    }
+
     /// Resolve an execution tensor to its stable GGUF weight identity by storage extent.
     #[must_use]
     pub fn weight_id_for_tensor(&self, tensor: &fellm_core::tensor::Tensor) -> Option<WeightId> {
-        let (offset, len) = tensor.mmap_extent()?;
+        let (offset, len) = tensor
+            .mmap_extent()
+            .map(|(offset, len)| (offset as u64, len))
+            .or_else(|| tensor.file_extent().map(|(_, offset, len)| (offset, len)))?;
         self.weights
             .iter()
-            .find(|weight| weight.home.offset == offset as u64 && weight.byte_len == len as u64)
+            .find(|weight| weight.home.offset == offset && weight.byte_len == len as u64)
             .map(|weight| weight.id)
     }
 
@@ -456,62 +612,62 @@ fn profile_model(
             )
         })
         .collect::<std::collections::HashMap<_, _>>();
-    let mut scheduled = std::collections::HashMap::<WeightId, (u64, u32, u32, u32)>::new();
+    let sizes = weights
+        .iter()
+        .map(|weight| (weight.id, weight.byte_len))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut groups = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (position, &node_id) in execution.order.iter().enumerate() {
+        let mut consumed = Vec::new();
         for &input in graph.inputs_slice(node_id) {
             let OpValue::Constant(tensor) = &graph.node(input).value else {
                 continue;
             };
-            let Some(extent) = tensor.mmap_extent() else {
+            let Some(extent) = tensor
+                .mmap_extent()
+                .map(|(offset, len)| (offset as u64, len))
+                .or_else(|| tensor.file_extent().map(|(_, offset, len)| (offset, len)))
+            else {
                 continue;
             };
-            let Some(&id) = by_extent.get(&extent) else {
+            let Some(&id) = by_extent.get(&(extent.0 as usize, extent.1)) else {
                 continue;
             };
-            let entry = scheduled.entry(id).or_insert((
-                extent.1 as u64,
-                position as u32,
-                position as u32,
-                0,
-            ));
-            entry.2 = position as u32;
-            entry.3 = entry.3.saturating_add(1);
+            if !consumed.contains(&id) {
+                consumed.push(id);
+                seen.insert(id);
+            }
+        }
+        if !consumed.is_empty() {
+            let bytes = consumed.iter().fold(0u64, |total, id| {
+                total.saturating_add(sizes.get(id).copied().unwrap_or(0))
+            });
+            groups.push(ExecutionGroup {
+                id: groups.len() as u32,
+                weights: consumed,
+                byte_len: bytes,
+                first_op: position as u32,
+                last_op: position as u32,
+                reuse_count: 1,
+                cpu_compute_time: Some(Duration::ZERO),
+            });
         }
     }
     // Any catalog weight absent from the primary step graph remains a cold storage group. This
     // covers optional architecture paths without pretending it belongs to the dense schedule.
     for weight in &weights {
-        scheduled
-            .entry(weight.id)
-            .or_insert((weight.byte_len, u32::MAX, u32::MAX, 0));
-    }
-    let mut scheduled = scheduled.into_iter().collect::<Vec<_>>();
-    scheduled.sort_by_key(|(id, (_, first, _, _))| (*first, *id));
-    let mut groups = Vec::new();
-    let mut current: Option<ExecutionGroup> = None;
-    for (weight, (bytes, first, last, reuse)) in scheduled {
-        if current.as_ref().is_some_and(|group| {
-            group.byte_len > 0 && group.byte_len.saturating_add(bytes) > TARGET_GROUP_BYTES
-        }) {
-            groups.push(current.take().expect("checked execution group"));
+        if !seen.contains(&weight.id) {
+            groups.push(ExecutionGroup {
+                id: groups.len() as u32,
+                weights: vec![weight.id],
+                byte_len: weight.byte_len,
+                first_op: u32::MAX,
+                last_op: u32::MAX,
+                reuse_count: 0,
+                cpu_compute_time: Some(Duration::ZERO),
+            });
         }
-        let group = current.get_or_insert_with(|| ExecutionGroup {
-            id: groups.len() as u32,
-            weights: Vec::new(),
-            byte_len: 0,
-            first_op: first,
-            last_op: last,
-            reuse_count: 0,
-            cpu_compute_time: Some(Duration::ZERO),
-        });
-        group.weights.push(weight);
-        group.byte_len = group.byte_len.saturating_add(bytes);
-        group.first_op = group.first_op.min(first);
-        group.last_op = group.last_op.max(last);
-        group.reuse_count = group.reuse_count.saturating_add(reuse.max(1));
-    }
-    if let Some(group) = current {
-        groups.push(group);
     }
     let cpu_weight_bandwidth =
         (cpu_score.max(1.0) * 1024.0 * 1024.0 * 1024.0).min(80.0 * 1024.0 * 1024.0 * 1024.0);
