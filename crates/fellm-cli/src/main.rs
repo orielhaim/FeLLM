@@ -1,5 +1,7 @@
 //! `fellm` CLI.
 
+mod config;
+
 use clap::{Parser, Subcommand};
 use fellm_architecture_diffusion_gemma::DiffusionGemmaPlugin;
 use fellm_gguf::GgufFile;
@@ -14,8 +16,12 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(name = "fellm", version, about = "FeLLM inference engine")]
 struct Cli {
-    #[arg(long, default_value = "info", global = true)]
-    log: String,
+    /// Configuration file. Defaults to `fellm.toml` in the current directory.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    #[arg(long, global = true)]
+    log: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -34,80 +40,75 @@ enum Cmd {
 #[derive(clap::Args, Debug)]
 struct RunArgs {
     /// Path to a GGUF file.
-    #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
     /// Prompt / user message string.
     #[arg(long)]
-    prompt: String,
+    prompt: Option<String>,
     /// Optional system message (chat mode only).
     #[arg(long)]
     system: Option<String>,
     /// Force raw completion (skip chat template even if the model has one).
-    #[arg(long, default_value_t = false)]
-    completion: bool,
+    #[arg(long)]
+    completion: Option<bool>,
     /// Max tokens to generate.
-    #[arg(long, default_value_t = 128)]
-    max_tokens: u32,
+    #[arg(long)]
+    max_tokens: Option<u32>,
     /// Sampling temperature.
-    #[arg(long, default_value_t = 0.2)]
-    temperature: f32,
+    #[arg(long)]
+    temperature: Option<f32>,
     /// top-k (0 disables).
-    #[arg(long, default_value_t = 80)]
-    top_k: u32,
+    #[arg(long)]
+    top_k: Option<u32>,
     /// top-p (>= 1.0 disables).
-    #[arg(long, default_value_t = 1.0)]
-    top_p: f32,
+    #[arg(long)]
+    top_p: Option<f32>,
     /// RNG seed.
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
+    #[arg(long)]
+    seed: Option<u64>,
     /// Repetition penalty (1.0 disables).
-    #[arg(long, default_value_t = 1.05)]
-    repetition_penalty: f32,
+    #[arg(long)]
+    repetition_penalty: Option<f32>,
     /// Context size (`n_ctx`). Default 8192, clamped to the model maximum.
     /// Pass `0` to use the model's GGUF-reported maximum context length.
-    #[arg(long = "ctx-size", short = 'c', default_value_t = 8192)]
-    ctx_size: usize,
+    #[arg(long = "ctx-size", short = 'c')]
+    ctx_size: Option<usize>,
     /// Evaluation batch size (`n_batch`).
-    #[arg(long = "batch-size", short = 'b', default_value_t = 2048)]
-    batch_size: usize,
+    #[arg(long = "batch-size", short = 'b')]
+    batch_size: Option<usize>,
     /// Physical batch size (`n_ubatch`).
-    #[arg(long = "ubatch-size", default_value_t = 512)]
-    ubatch_size: usize,
+    #[arg(long = "ubatch-size")]
+    ubatch_size: Option<usize>,
     /// Exact device KV arena bytes (0 selects automatic device/system budgeting).
-    #[arg(
-        long = "kv-device-budget",
-        alias = "kv-cache-bytes",
-        default_value_t = 0
-    )]
-    kv_device_budget: u64,
+    #[arg(long = "kv-device-budget", alias = "kv-cache-bytes")]
+    kv_device_budget: Option<u64>,
     /// Fraction of available memory considered by automatic KV budgeting.
-    #[arg(long, default_value_t = 0.25)]
-    kv_memory_fraction: f64,
+    #[arg(long)]
+    kv_memory_fraction: Option<f64>,
     /// Host residency-tier bytes for KV migration / preempt.
-    #[arg(long = "kv-host-budget", alias = "kv-swap-bytes", default_value_t = 0)]
-    kv_host_budget: u64,
+    #[arg(long = "kv-host-budget", alias = "kv-swap-bytes")]
+    kv_host_budget: Option<u64>,
     /// Bytes kept free as a safety reserve.
-    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
-    kv_safety_reserve_bytes: u64,
+    #[arg(long)]
+    kv_safety_reserve_bytes: Option<u64>,
     /// KV fabric mode: `auto`, `exact`, or `elastic`.
-    #[arg(long = "kv-mode", default_value = "auto")]
-    kv_mode: String,
+    #[arg(long = "kv-mode")]
+    kv_mode: Option<String>,
     /// KV addressing strategy: `block_table` or `virtual_memory`.
-    #[arg(long = "kv-addressing", default_value = "block_table")]
-    kv_addressing: String,
-    /// Disable content-addressed prefix sharing.
-    #[arg(long = "no-kv-prefix-sharing", default_value_t = false)]
-    no_kv_prefix_sharing: bool,
-    /// Disable fabric prefetch of non-resident pages.
-    #[arg(long = "no-kv-prefetch", default_value_t = false)]
-    no_kv_prefetch: bool,
+    #[arg(long = "kv-addressing")]
+    kv_addressing: Option<String>,
+    /// Enable or disable content-addressed prefix sharing.
+    #[arg(long)]
+    kv_prefix_sharing: Option<bool>,
+    /// Enable or disable fabric prefetch of non-resident pages.
+    #[arg(long)]
+    kv_prefetch: Option<bool>,
     /// Optional max sequence length override (alias of `--ctx-size`).
     #[arg(long, hide = true)]
     max_seq: Option<usize>,
     /// Compute backend provider preference: `auto`, `cpu`, or `cuda`.
     /// Also set via `FELLM_BACKEND`.
-    #[arg(long, default_value = "auto")]
-    backend: String,
+    #[arg(long)]
+    backend: Option<String>,
     /// Explicit attention provider name (e.g. `attention.host_tiled`).
     /// Fails if missing or unsupported — never silently substitutes.
     #[arg(long)]
@@ -122,9 +123,23 @@ struct RunArgs {
     /// Directory of dynamic plugins (default: `plugins/` or `FELLM_PLUGIN_DIR`).
     #[arg(long = "plugin-dir")]
     plugin_dir: Option<PathBuf>,
-    /// Disable CPU fallback when CUDA is requested/auto but unavailable.
-    #[arg(long, default_value_t = false)]
-    no_cpu_fallback: bool,
+    /// Enable or disable CPU fallback when CUDA is unavailable.
+    #[arg(long)]
+    cpu_fallback: Option<bool>,
+    /// Override detected available VRAM for planning.
+    #[arg(long)]
+    device_memory_limit: Option<u64>,
+    /// Override detected available system RAM for planning.
+    #[arg(long)]
+    host_memory_limit: Option<u64>,
+    #[arg(long)]
+    h2d_bytes_per_second: Option<u64>,
+    #[arg(long)]
+    storage_bytes_per_second: Option<u64>,
+    #[arg(long)]
+    storage_latency_micros: Option<u64>,
+    #[arg(long)]
+    disable_cpu_partitions: Option<bool>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -161,18 +176,218 @@ enum PluginsAction {
     },
 }
 
+impl PluginsCmd {
+    fn apply_config(&mut self, config: config::PluginsConfig) {
+        let configured = config.plugin_dir;
+        match &mut self.action {
+            PluginsAction::List { plugin_dir, .. } | PluginsAction::Inspect { plugin_dir, .. } => {
+                if plugin_dir.is_none() {
+                    *plugin_dir = configured;
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
-    init_tracing(&cli.log);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("fellm.toml"));
+    let config = match config::FellmConfig::load(&config_path, cli.config.is_some()) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    init_tracing(
+        cli.log
+            .as_deref()
+            .or(config.log.as_deref())
+            .unwrap_or("info"),
+    );
 
     let result = match cli.cmd {
-        Cmd::Run(a) => run(a),
+        Cmd::Run(a) => resolve_run(a, config.run, config.memory).and_then(run),
         Cmd::Inspect(a) => inspect(a),
-        Cmd::Plugins(p) => plugins_cmd(p),
+        Cmd::Plugins(mut p) => {
+            p.apply_config(config.plugins);
+            plugins_cmd(p)
+        }
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+struct ResolvedRunArgs {
+    model: PathBuf,
+    prompt: String,
+    system: Option<String>,
+    completion: bool,
+    max_tokens: u32,
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    seed: u64,
+    repetition_penalty: f32,
+    ctx_size: usize,
+    batch_size: usize,
+    ubatch_size: usize,
+    kv_device_budget: u64,
+    kv_memory_fraction: f64,
+    kv_host_budget: u64,
+    kv_safety_reserve_bytes: u64,
+    kv_mode: String,
+    kv_addressing: String,
+    kv_prefix_sharing: bool,
+    kv_prefetch: bool,
+    backend: String,
+    attention: Option<String>,
+    kv_policy: Option<String>,
+    plugin_config: Vec<String>,
+    plugin_dir: Option<PathBuf>,
+    cpu_fallback: bool,
+    memory_fabric: fellm_runtime::MemoryFabricConfig,
+}
+
+fn resolve_run(
+    cli: RunArgs,
+    file: config::RunConfig,
+    memory: config::MemoryConfig,
+) -> fellm_core::error::Result<ResolvedRunArgs> {
+    macro_rules! value {
+        ($field:ident, $default:expr) => {
+            cli.$field.or(file.$field).unwrap_or($default)
+        };
+    }
+    let model = cli.model.or(file.model).ok_or_else(|| {
+        fellm_core::error::FellmError::other("model must be set in [run].model or on the CLI")
+    })?;
+    let prompt = cli.prompt.or(file.prompt).ok_or_else(|| {
+        fellm_core::error::FellmError::other("prompt must be set in [run].prompt or with --prompt")
+    })?;
+    let plugin_config = if cli.plugin_config.is_empty() {
+        file.plugin_config.unwrap_or_default()
+    } else {
+        cli.plugin_config
+    };
+    Ok(ResolvedRunArgs {
+        model,
+        prompt,
+        system: cli.system.or(file.system),
+        completion: value!(completion, false),
+        max_tokens: value!(max_tokens, 128),
+        temperature: value!(temperature, 0.2),
+        top_k: value!(top_k, 80),
+        top_p: value!(top_p, 1.0),
+        seed: value!(seed, 0),
+        repetition_penalty: value!(repetition_penalty, 1.05),
+        ctx_size: cli
+            .max_seq
+            .or(cli.ctx_size)
+            .or(file.ctx_size)
+            .unwrap_or(8192),
+        batch_size: value!(batch_size, 2048),
+        ubatch_size: value!(ubatch_size, 512),
+        kv_device_budget: value!(kv_device_budget, 0),
+        kv_memory_fraction: value!(kv_memory_fraction, 0.25),
+        kv_host_budget: value!(kv_host_budget, 0),
+        kv_safety_reserve_bytes: value!(kv_safety_reserve_bytes, 2 * 1024 * 1024 * 1024),
+        kv_mode: value!(kv_mode, String::from("auto")),
+        kv_addressing: value!(kv_addressing, String::from("block_table")),
+        kv_prefix_sharing: cli
+            .kv_prefix_sharing
+            .or(file.kv_prefix_sharing)
+            .unwrap_or(true),
+        kv_prefetch: cli.kv_prefetch.or(file.kv_prefetch).unwrap_or(true),
+        backend: value!(backend, String::from("auto")),
+        attention: cli.attention.or(file.attention),
+        kv_policy: cli.kv_policy.or(file.kv_policy),
+        plugin_config,
+        plugin_dir: cli.plugin_dir.or(file.plugin_dir),
+        cpu_fallback: cli.cpu_fallback.or(file.cpu_fallback).unwrap_or(true),
+        memory_fabric: fellm_runtime::MemoryFabricConfig {
+            device_memory_limit: cli.device_memory_limit.or(memory.device_memory_limit),
+            host_memory_limit: cli.host_memory_limit.or(memory.host_memory_limit),
+            h2d_bytes_per_second: cli.h2d_bytes_per_second.or(memory.h2d_bytes_per_second),
+            storage_bytes_per_second: cli
+                .storage_bytes_per_second
+                .or(memory.storage_bytes_per_second),
+            storage_latency_micros: cli.storage_latency_micros.or(memory.storage_latency_micros),
+            disable_cpu_partitions: cli
+                .disable_cpu_partitions
+                .or(memory.disable_cpu_partitions)
+                .unwrap_or(false),
+        },
+    })
+}
+
+#[cfg(test)]
+mod config_precedence_tests {
+    use super::*;
+
+    fn empty_cli() -> RunArgs {
+        RunArgs {
+            model: None,
+            prompt: None,
+            system: None,
+            completion: None,
+            max_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            seed: None,
+            repetition_penalty: None,
+            ctx_size: None,
+            batch_size: None,
+            ubatch_size: None,
+            kv_device_budget: None,
+            kv_memory_fraction: None,
+            kv_host_budget: None,
+            kv_safety_reserve_bytes: None,
+            kv_mode: None,
+            kv_addressing: None,
+            kv_prefix_sharing: None,
+            kv_prefetch: None,
+            max_seq: None,
+            backend: None,
+            attention: None,
+            kv_policy: None,
+            plugin_config: Vec::new(),
+            plugin_dir: None,
+            cpu_fallback: None,
+            device_memory_limit: None,
+            host_memory_limit: None,
+            h2d_bytes_per_second: None,
+            storage_bytes_per_second: None,
+            storage_latency_micros: None,
+            disable_cpu_partitions: None,
+        }
+    }
+
+    #[test]
+    fn cli_overrides_file_and_file_overrides_builtin_fallback() {
+        let mut cli = empty_cli();
+        cli.model = Some("cli.gguf".into());
+        cli.prompt = Some("cli prompt".into());
+        cli.backend = Some("cuda".into());
+        let file = config::RunConfig {
+            model: Some("file.gguf".into()),
+            prompt: Some("file prompt".into()),
+            backend: Some("cpu".into()),
+            max_tokens: Some(7),
+            ..config::RunConfig::default()
+        };
+        let resolved = resolve_run(cli, file, config::MemoryConfig::default()).unwrap();
+        assert_eq!(resolved.model, PathBuf::from("cli.gguf"));
+        assert_eq!(resolved.prompt, "cli prompt");
+        assert_eq!(resolved.backend, "cuda");
+        assert_eq!(resolved.max_tokens, 7);
+        assert_eq!(resolved.ctx_size, 8192);
     }
 }
 
@@ -194,7 +409,7 @@ fn init_tracing(filter: &str) {
     fmt().with_env_filter(filter).with_target(false).init();
 }
 
-fn build_selection(args: &RunArgs) -> fellm_core::error::Result<ProviderSelection> {
+fn build_selection(args: &ResolvedRunArgs) -> fellm_core::error::Result<ProviderSelection> {
     let mut sel = ProviderSelection::new();
     if let Some(a) = &args.attention {
         sel.attention = Some(a.clone());
@@ -209,17 +424,17 @@ fn build_selection(args: &RunArgs) -> fellm_core::error::Result<ProviderSelectio
     Ok(sel)
 }
 
-fn run(args: RunArgs) -> fellm_core::error::Result<()> {
+fn run(args: ResolvedRunArgs) -> fellm_core::error::Result<()> {
     let preference = BackendPreference::parse(&args.backend)?;
-    let select = BackendSelect::new(preference, !args.no_cpu_fallback);
+    let select = BackendSelect::new(preference, args.cpu_fallback);
     let providers = build_selection(&args)?;
     let kv_cache = fellm_runtime::KvFabricConfig {
         mode: fellm_runtime::KvMode::parse(&args.kv_mode).unwrap_or_default(),
         device_budget: (args.kv_device_budget > 0).then_some(args.kv_device_budget),
         host_budget: Some(args.kv_host_budget),
         addressing: fellm_runtime::KvAddressing::parse(&args.kv_addressing).unwrap_or_default(),
-        prefix_sharing: !args.no_kv_prefix_sharing,
-        prefetch: !args.no_kv_prefetch,
+        prefix_sharing: args.kv_prefix_sharing,
+        prefetch: args.kv_prefetch,
         memory_fraction: args.kv_memory_fraction,
         safety_reserve_bytes: args.kv_safety_reserve_bytes,
         ..fellm_runtime::KvFabricConfig::default()
@@ -230,12 +445,13 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
         .backend_select(select)
         .providers(providers)
         .kv_cache(kv_cache);
+    settings.memory_fabric = args.memory_fabric;
 
     if let Some(dir) = &args.plugin_dir {
         settings = settings.plugin_dir(dir.clone());
     }
 
-    let ctx = args.max_seq.unwrap_or(args.ctx_size);
+    let ctx = args.ctx_size;
     settings = if ctx == 0 {
         settings.ctx_from_model()
     } else {
@@ -326,6 +542,9 @@ fn run(args: RunArgs) -> fellm_core::error::Result<()> {
     );
     eprintln!("TTFT: {:.2}ms", stats.time_to_first_token_ms);
     eprintln!("total: {:.2}ms", stats.total_ms);
+    drop(stream);
+    engine.publish_memory_fabric_metrics();
+    engine.log_memory_fabric_runtime();
 
     Ok(())
 }

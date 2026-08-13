@@ -2,6 +2,7 @@ pub mod attention_dispatch;
 pub mod attention_provider;
 pub mod c_abi;
 pub mod capability;
+pub mod expert_routes;
 pub mod op;
 pub mod paged_ctx;
 pub mod physical_plan;
@@ -30,6 +31,7 @@ pub use capability::{
     PreparedProviderId, ProviderDescriptor, ProviderSelection, ProviderVersion,
     negotiate_attention_and_kv_policy, negotiate_provider,
 };
+pub use expert_routes::{record_expert_route, set_current_execution_op, take_expert_routes};
 pub use op::{OpAttrs, OpKind};
 pub use paged_ctx::{
     HostSnapshotPagedFn, PAGED_KV_ELEM_BYTES, PagedKvContext, PagedKvSnapshot, has_paged_context,

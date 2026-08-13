@@ -388,6 +388,7 @@ impl Scheduler {
         }
 
         let fabric_metrics = engine.fabric_metrics();
+        engine.publish_memory_fabric_metrics();
         metrics::gauge!("fellm_kv_device_resident_pages")
             .set(fabric_metrics.device_resident_pages as f64);
         metrics::gauge!("fellm_kv_host_resident_pages")

@@ -7,9 +7,10 @@ use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::ABI_VERSION;
 use fellm_plugin_abi::c_abi::{
     HostContext, PluginAbiVersionFn, PluginDeviceStreamFn, PluginInitFn, PluginInvalidateF32Fn,
-    PluginManifestJsonFn, PluginRegisterArchitecturesFn, PluginRegisterCapabilitiesFn,
-    PluginRegisterDeviceTensorFn, PluginRegisterKernelsFn, PluginShutdownFn,
-    PluginUpdateStepParamsFn, symbols,
+    PluginManifestJsonFn, PluginPrefetchWeightsFn, PluginRegisterArchitecturesFn,
+    PluginRegisterCapabilitiesFn, PluginRegisterDeviceTensorFn, PluginRegisterKernelsFn,
+    PluginSetWeightCacheBudgetFn, PluginShutdownFn, PluginUpdateStepParamsFn,
+    PluginWeightCacheMetrics, PluginWeightCacheMetricsFn, symbols,
 };
 use libloading::Library;
 use std::collections::HashSet;
@@ -104,6 +105,9 @@ pub struct LoadedPlugin {
     invalidate_f32: Option<PluginInvalidateF32Fn>,
     update_step_params: Option<PluginUpdateStepParamsFn>,
     register_device_tensor: Option<PluginRegisterDeviceTensorFn>,
+    set_weight_cache_budget: Option<PluginSetWeightCacheBudgetFn>,
+    prefetch_weights: Option<PluginPrefetchWeightsFn>,
+    weight_cache_metrics: Option<PluginWeightCacheMetricsFn>,
     device_stream: Option<PluginDeviceStreamFn>,
 }
 
@@ -215,7 +219,7 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Bind a host constant to its stable address in the packed CUDA model image.
+    /// Publish a host view's resident device replica to device plugins.
     pub fn register_device_tensor(
         &self,
         host_ptr: *const u8,
@@ -233,6 +237,69 @@ impl PluginHost {
             }
         }
         Ok(())
+    }
+
+    /// Configure the bounded device working set used by streaming weight providers.
+    pub fn set_weight_cache_budget(&self, bytes: u64, buffer_count: u32) -> Result<()> {
+        for plugin in &self.plugins {
+            if let Some(set_budget) = plugin.set_weight_cache_budget {
+                let rc = unsafe { set_budget(bytes, buffer_count) };
+                if rc != 0 {
+                    return Err(FellmError::other(format!(
+                        "plugin weight-cache budget failed ({rc})"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue an architecture-neutral future execution group's immutable weights.
+    pub fn prefetch_weight_group(
+        &self,
+        group_id: u64,
+        weights: &[fellm_plugin_abi::TensorRef],
+    ) -> Result<()> {
+        if weights.is_empty() {
+            return Ok(());
+        }
+        for plugin in &self.plugins {
+            if let Some(prefetch) = plugin.prefetch_weights {
+                let rc = unsafe { prefetch(group_id, weights.as_ptr(), weights.len()) };
+                if rc != 0 {
+                    return Err(FellmError::other(format!(
+                        "plugin weight prefetch failed ({rc})"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Aggregate current weight-provider telemetry across loaded device plugins.
+    #[must_use]
+    pub fn weight_cache_metrics(&self) -> PluginWeightCacheMetrics {
+        let mut aggregate = PluginWeightCacheMetrics::default();
+        for plugin in &self.plugins {
+            let Some(read) = plugin.weight_cache_metrics else {
+                continue;
+            };
+            let mut snapshot = PluginWeightCacheMetrics::default();
+            if unsafe { read(std::ptr::from_mut(&mut snapshot)) } == 0 {
+                aggregate.resident_bytes = aggregate
+                    .resident_bytes
+                    .saturating_add(snapshot.resident_bytes);
+                aggregate.h2d_bytes = aggregate.h2d_bytes.saturating_add(snapshot.h2d_bytes);
+                aggregate.prefetch_hits = aggregate
+                    .prefetch_hits
+                    .saturating_add(snapshot.prefetch_hits);
+                aggregate.prefetch_misses = aggregate
+                    .prefetch_misses
+                    .saturating_add(snapshot.prefetch_misses);
+                aggregate.evictions = aggregate.evictions.saturating_add(snapshot.evictions);
+            }
+        }
+        aggregate
     }
 
     /// Capture-capable stream exported by the active device plugin.
@@ -314,6 +381,11 @@ impl PluginHost {
         let update_step_params = unsafe { lib.get(symbols::UPDATE_STEP_PARAMS).ok().map(|s| *s) };
         let register_device_tensor =
             unsafe { lib.get(symbols::REGISTER_DEVICE_TENSOR).ok().map(|s| *s) };
+        let set_weight_cache_budget =
+            unsafe { lib.get(symbols::SET_WEIGHT_CACHE_BUDGET).ok().map(|s| *s) };
+        let prefetch_weights = unsafe { lib.get(symbols::PREFETCH_WEIGHTS).ok().map(|s| *s) };
+        let weight_cache_metrics =
+            unsafe { lib.get(symbols::WEIGHT_CACHE_METRICS).ok().map(|s| *s) };
         let device_stream = unsafe { lib.get(symbols::DEVICE_STREAM).ok().map(|s| *s) };
 
         let result = (|| {
@@ -336,6 +408,9 @@ impl PluginHost {
             invalidate_f32,
             update_step_params,
             register_device_tensor,
+            set_weight_cache_budget,
+            prefetch_weights,
+            weight_cache_metrics,
             device_stream,
         });
         Ok(())

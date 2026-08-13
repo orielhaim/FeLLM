@@ -9,8 +9,10 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DevicePtr as _};
 
-/// Immutable tensor payload supplied to the CUDA model-image packer.
-pub struct ModelBlob<'a> {
+/// Immutable tensor payload supplied to the CUDA weight fabric.
+pub struct WeightBlob<'a> {
+    /// Stable logical identity, independent of the GGUF mmap address.
+    pub id: fellm_memory::WeightId,
     /// Physical-plan tensor identity.
     pub tensor: fellm_plugin_abi::PlanTensorId,
     /// Raw GGUF tensor payload.
@@ -19,51 +21,62 @@ pub struct ModelBlob<'a> {
     pub alignment: usize,
 }
 
-/// One contiguous, model-lifetime GPU allocation containing every weight.
-pub struct ModelImage {
+/// CUDA-resident replica set owned by the Weight Fabric.
+///
+/// The initial provider uses one packed permanent allocation. The identity map is deliberately
+/// separate so bounded streaming providers can replace residency without changing graph identity.
+pub struct CudaWeightFabric {
     #[cfg(feature = "cuda")]
     storage: CudaSlice<u8>,
-    offsets: HashMap<fellm_plugin_abi::PlanTensorId, (usize, usize)>,
+    offsets: HashMap<fellm_memory::WeightId, (usize, usize)>,
+    tensors: HashMap<fellm_plugin_abi::PlanTensorId, fellm_memory::WeightId>,
     byte_len: usize,
 }
 
-impl ModelImage {
+impl CudaWeightFabric {
     /// Pack and upload constants once. GGUF remains a disk format, not a hot-path layout contract.
-    pub fn upload(device: &crate::CudaDeviceState, blobs: &[ModelBlob<'_>]) -> Result<Self> {
+    pub fn materialize(device: &crate::CudaDeviceState, blobs: &[WeightBlob<'_>]) -> Result<Self> {
         let mut offsets = HashMap::with_capacity(blobs.len());
+        let mut tensors = HashMap::with_capacity(blobs.len());
         let mut cursor = 0usize;
         for blob in blobs {
+            tensors.insert(blob.tensor, blob.id);
+            if offsets.contains_key(&blob.id) {
+                continue;
+            }
             cursor = align_up(cursor, blob.alignment.max(128))?;
-            offsets.insert(blob.tensor, (cursor, blob.bytes.len()));
+            offsets.insert(blob.id, (cursor, blob.bytes.len()));
             cursor = cursor
                 .checked_add(blob.bytes.len())
-                .ok_or_else(|| FellmError::other("CUDA model image size overflow"))?;
+                .ok_or_else(|| FellmError::other("CUDA weight replica size overflow"))?;
         }
         let byte_len = align_up(cursor, 256)?;
         #[cfg(feature = "cuda")]
         {
             let mut packed = vec![0u8; byte_len.max(1)];
             for blob in blobs {
-                let (offset, len) = offsets[&blob.tensor];
+                let (offset, len) = offsets[&blob.id];
+                debug_assert_eq!(len, blob.bytes.len());
                 packed[offset..offset + len].copy_from_slice(blob.bytes);
             }
             let mut storage = device
                 .stream()
                 .alloc_zeros::<u8>(packed.len())
-                .map_err(|e| FellmError::other(format!("allocate CUDA model image: {e}")))?;
+                .map_err(|e| FellmError::other(format!("allocate CUDA weight replica: {e}")))?;
             device
                 .stream()
                 .memcpy_htod(&packed, &mut storage)
-                .map_err(|e| FellmError::other(format!("upload CUDA model image: {e}")))?;
+                .map_err(|e| FellmError::other(format!("upload CUDA weight replica: {e}")))?;
             Ok(Self {
                 storage,
                 offsets,
+                tensors,
                 byte_len,
             })
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (device, byte_len);
+            let _ = (device, byte_len, tensors);
             Err(FellmError::other("cuda feature disabled"))
         }
     }
@@ -79,9 +92,13 @@ impl ModelImage {
         &self,
         tensor: fellm_plugin_abi::PlanTensorId,
     ) -> Result<(fellm_plugin_abi::DevicePtr, usize)> {
+        let id = self
+            .tensors
+            .get(&tensor)
+            .ok_or_else(|| FellmError::other("model tensor has no logical WeightId"))?;
         let (offset, len) = self
             .offsets
-            .get(&tensor)
+            .get(id)
             .copied()
             .ok_or_else(|| FellmError::other("model tensor absent from CUDA image"))?;
         #[cfg(feature = "cuda")]
@@ -377,6 +394,8 @@ impl DecodeDeviceState {
                 .memcpy_htod(&self.page_table_upload, &mut target)
                 .map_err(|error| FellmError::other(format!("upload device page table: {error}")))?;
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = device;
         self.page_table_shadow.clear();
         self.page_table_shadow.extend_from_slice(table);
         Ok(true)

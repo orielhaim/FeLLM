@@ -10,6 +10,7 @@ description = "CUDA backend (opt-in). Build under WSL: cargo build -p backend-cu
 fellm-core.workspace = true
 fellm-plugin-abi.workspace = true
 fellm-plugin-host.workspace = true
+fellm-memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 cudarc = { version = "0.19", optional = true, default-features = false, features = [

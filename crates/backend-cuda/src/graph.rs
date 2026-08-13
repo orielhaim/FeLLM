@@ -7,6 +7,7 @@ use cudarc::driver::{CudaContext, result, sys};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn synchronize_external_stream(
     device: &crate::CudaDeviceState,
     stream: u64,

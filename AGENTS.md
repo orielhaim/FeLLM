@@ -11,3 +11,7 @@
 * **Delete aggressively.** Dead code, deprecated paths, temporary shims, and unnecessary complexity should disappear.
 * **Move fast without sacrificing rigor.** Breaking changes are acceptable; regressions, poor testing, and unjustified complexity are not.
 * **Optimize pre-1.0 software for evolution, not preservation.**
+
+## Rust Idioms
+
+* **Use Rust’s type system instead of manual encodings.** Prefer enums, newtypes, and typed variants over `u8`/`bool` tags, magic constants, or structs that manually emulate enums. Make invalid states unrepresentable whenever practical.

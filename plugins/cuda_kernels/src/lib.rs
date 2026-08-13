@@ -15,7 +15,7 @@ use fellm_plugin_abi::c_abi::{
     HostContext, KernelRegistryVtable, PluginManifestJson, PluginOpRegistration,
 };
 use fellm_plugin_abi::op::OpKind;
-use fellm_plugin_abi::{ABI_VERSION, AbiVersion, DeviceStepParams, PagedKvSnapshot};
+use fellm_plugin_abi::{ABI_VERSION, AbiVersion, DeviceStepParams, PagedKvSnapshot, TensorRef};
 use oxide_kernels::kernels;
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_void};
@@ -135,7 +135,7 @@ pub unsafe extern "C" fn _fellm_plugin_update_step_params(
     if result.is_ok() { 0 } else { -3 }
 }
 
-/// Register a stable tensor address from the host-owned packed model image.
+/// Register a stable tensor address from the host-owned Weight Fabric.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _fellm_plugin_register_device_tensor(
     host_ptr: *const u8,
@@ -146,6 +146,50 @@ pub unsafe extern "C" fn _fellm_plugin_register_device_tensor(
         Ok(()) => 0,
         Err(code) => code,
     }
+}
+
+/// Configure the bounded streaming working set selected by the Memory Fabric planner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_set_weight_cache_budget(
+    bytes: u64,
+    buffer_count: u32,
+) -> c_int {
+    match buffers::set_weight_cache_budget(bytes, buffer_count) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
+
+/// Enqueue the current predictive window on the plugin's CUDA stream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_prefetch_weights(
+    group_id: u64,
+    weights: *const TensorRef,
+    count: usize,
+) -> c_int {
+    if weights.is_null() && count != 0 {
+        return -1;
+    }
+    // SAFETY: the host guarantees `weights` covers `count` descriptors for this call.
+    let weights = unsafe { core::slice::from_raw_parts(weights, count) };
+    let stream = oxide_stream().clone();
+    if let Err(code) = buffers::prefetch_group(&stream, group_id, weights) {
+        return code;
+    }
+    0
+}
+
+/// Return weight-tier residency and transfer telemetry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_weight_cache_metrics(
+    metrics: *mut fellm_plugin_abi::c_abi::PluginWeightCacheMetrics,
+) -> c_int {
+    if metrics.is_null() {
+        return -1;
+    }
+    // SAFETY: caller provided a writable metrics record.
+    unsafe { metrics.write(buffers::weight_cache_metrics()) };
+    0
 }
 
 /// Path of this loaded `.so` (oxide embeds PTX in `.oxart` here, not in the host exe).
@@ -580,7 +624,19 @@ pub unsafe extern "C" fn _fellm_plugin_invalidate_f32(ptr: *const f32, nbytes: u
             return;
         }
         let len = nbytes / 4;
-        buffers::invalidate_f32(ptr, len);
+        // Compiled activations may be backed by a registered external device arena rather than
+        // the ordinary pointer-keyed cache. A CPU partition wrote authoritative host bytes, so
+        // immediately refresh that stable device address. Ordinary cached tensors are refreshed
+        // on the same stream as well, making the CPU-to-GPU ownership handoff unambiguous.
+        let host = unsafe { core::slice::from_raw_parts(ptr, len) };
+        let stream = oxide_stream().clone();
+        if buffers::ensure_f32(&stream, host, true).is_err() {
+            buffers::invalidate_f32(ptr, len);
+        } else {
+            // CPU arena slots can be reused immediately by the compiled schedule. Do not let an
+            // asynchronous upload continue reading a host slot after ownership returns to it.
+            let _ = stream.synchronize();
+        }
     }));
 }
 

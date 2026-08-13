@@ -17,5 +17,7 @@ pub use backend::CudaBackend;
 pub use device::{CudaDeviceCaps, CudaDeviceState};
 pub use graph::{CudaGraphCapture, CudaGraphExec};
 pub use pinned_swap::PinnedSwapArena;
-pub use plan::{CudaStaticArena, DecodeDeviceState, ModelBlob, ModelImage, plan_static_arena};
+pub use plan::{
+    CudaStaticArena, CudaWeightFabric, DecodeDeviceState, WeightBlob, plan_static_arena,
+};
 pub use vram_pool::DeviceKvArena;

@@ -456,6 +456,32 @@ impl CompiledStep {
         for i in 0..end {
             let node = &self.nodes[i];
             let Some(rt) = &node.runtime else { continue };
+            fellm_plugin_abi::set_current_execution_op(i as u64);
+
+            // Architecture-neutral predictive window: constants required by this operation and
+            // the next runtime operation. Device backends can overlap the future group transfer.
+            for (group_index, required) in [
+                Some((i, true)),
+                self.next_runtime_index(i + 1, end)
+                    .map(|index| (index, false)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut prefetch: SmallVec<[TensorRef; 8]> = SmallVec::new();
+                for &input in &self.nodes[group_index].inputs {
+                    if matches!(&self.nodes[input].kind, SlotKind::Constant(_)) {
+                        let weight = self.tensor_ref(input)?;
+                        if !prefetch
+                            .iter()
+                            .any(|existing| existing.logical_id == weight.logical_id)
+                        {
+                            prefetch.push(weight);
+                        }
+                    }
+                }
+                backend.prefetch_weight_group(group_index as u64, &prefetch, required)?;
+            }
 
             let mut input_refs: SmallVec<[TensorRef; 6]> = SmallVec::new();
             for &iid in node.inputs.iter().take(rt.input_ref_count) {
@@ -597,6 +623,10 @@ impl CompiledStep {
                         bytes.as_ptr(),
                         bytes.len(),
                     )
+                    .with_logical_id(
+                        t.mmap_extent()
+                            .map_or((1u64 << 63) | idx as u64, |(offset, _)| offset as u64 + 1),
+                    )
                 })
             }
             SlotKind::Input(name) => {
@@ -637,6 +667,10 @@ impl CompiledStep {
                 )
             }
         }
+    }
+
+    fn next_runtime_index(&self, start: usize, end: usize) -> Option<usize> {
+        (start..end).find(|&index| self.nodes[index].runtime.is_some())
     }
 
     /// Build a writable tensor view for slot `idx`.

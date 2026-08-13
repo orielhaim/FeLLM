@@ -53,6 +53,23 @@ impl Storage {
     pub fn len_bytes(&self) -> usize {
         self.as_bytes().len()
     }
+
+    /// Stable byte extent in an mmap backing store, if this storage ultimately has one.
+    /// Unlike `as_bytes().as_ptr()`, this survives remapping and replica movement as identity.
+    #[must_use]
+    pub fn mmap_extent(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Mmap { offset, len, .. } => Some((*offset, *len)),
+            Self::View {
+                parent,
+                offset,
+                len,
+            } => parent
+                .mmap_extent()
+                .map(|(base, _)| (base.saturating_add(*offset), *len)),
+            Self::Owned(_) => None,
+        }
+    }
 }
 
 impl core::fmt::Debug for Storage {

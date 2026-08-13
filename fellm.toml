@@ -1,0 +1,36 @@
+# FeLLM's checked-in defaults. Copy this file for development-specific settings and
+# select it with `fellm --config fellm.dev.toml run ...`.
+log = "info"
+
+[run]
+completion = false
+max_tokens = 128
+temperature = 0.2
+top_k = 80
+top_p = 1.0
+seed = 0
+repetition_penalty = 1.05
+ctx_size = 8192
+batch_size = 2048
+ubatch_size = 512
+backend = "auto"
+cpu_fallback = true
+plugin_config = []
+kv_device_budget = 0
+kv_host_budget = 0
+kv_memory_fraction = 0.25
+kv_safety_reserve_bytes = 2147483648
+kv_mode = "auto"
+kv_addressing = "block_table"
+kv_prefix_sharing = true
+kv_prefetch = true
+
+[memory]
+# Optional deterministic limits and measured transfer properties. Omit limits to probe hardware.
+h2d_bytes_per_second = 25769803776
+storage_bytes_per_second = 3221225472
+storage_latency_micros = 100
+disable_cpu_partitions = false
+
+[plugins]
+# plugin_dir = "plugins"

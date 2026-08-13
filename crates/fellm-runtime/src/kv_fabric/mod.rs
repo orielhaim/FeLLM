@@ -151,10 +151,24 @@ mod tests {
             host_budget: Some(4_096),
             ..KvFabricConfig::default()
         };
-        let plan = KvMemoryPlan::resolve(&config, None, 20, 30, 1024, 2).unwrap();
-        assert_eq!(plan.device_pages, 9);
-        assert_eq!(plan.kv_bytes, 9_216);
-        assert_eq!(plan.host_pages, 4);
+        let plan = KvMemoryPlan::resolve(
+            &config,
+            None,
+            20,
+            30,
+            1024,
+            2,
+            KvExecutionMemory::Accelerator,
+        )
+        .unwrap();
+        assert_eq!(plan.execution_pages, 9);
+        assert_eq!(plan.execution_bytes, 9_216);
+        assert_eq!(plan.overflow_host_pages, 4);
+
+        let host_plan =
+            KvMemoryPlan::resolve(&config, None, 20, 30, 1024, 2, KvExecutionMemory::Host).unwrap();
+        assert_eq!(host_plan.execution_pages, 4);
+        assert_eq!(host_plan.overflow_host_pages, 0);
     }
 
     #[test]

@@ -135,7 +135,10 @@ pub unsafe extern "C" fn launch_materialize_f32(
         }
         let stream = oxide_stream().clone();
         let key = buffers::ensure_f32(&stream, source, false)?;
-        buffers::download_to(&stream, key, host)
+        buffers::download_to(&stream, key, host)?;
+        // The caller immediately executes a CPU kernel over `host`; make the D2H ownership
+        // boundary explicit instead of relying on pageable-memory copy behavior.
+        stream.synchronize().map_err(|_| -5)
     })
 }
 
@@ -562,7 +565,7 @@ pub unsafe extern "C" fn launch_embedding_q4k(
 
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
-        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
@@ -666,7 +669,7 @@ pub unsafe extern "C" fn launch_q4k_matmul(
         };
 
         let stream = oxide_stream().clone();
-        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let (xd, _) = buffers::take_f32(x_key)?;
@@ -776,8 +779,8 @@ pub unsafe extern "C" fn launch_q4k_gate_up_swiglu(
         let gate_bytes = bytes_slice(gate_t);
         let up_bytes = bytes_slice(up_t);
         let stream = oxide_stream().clone();
-        let gate_key = buffers::ensure_weight(&stream, gate_bytes)?;
-        let up_key = buffers::ensure_weight(&stream, up_bytes)?;
+        let gate_key = buffers::ensure_weight(&stream, gate_t.logical_id, gate_bytes)?;
+        let up_key = buffers::ensure_weight(&stream, up_t.logical_id, up_bytes)?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let out_key = buffers::ensure_f32_out(&stream, out)?;
         let (xd, _) = buffers::take_f32(x_key)?;
@@ -861,8 +864,8 @@ pub unsafe extern "C" fn launch_q8_0_gate_up_swiglu(
             return Err(-2);
         }
         let stream = oxide_stream().clone();
-        let gate_key = buffers::ensure_weight(&stream, bytes_slice(gate_t))?;
-        let up_key = buffers::ensure_weight(&stream, bytes_slice(up_t))?;
+        let gate_key = buffers::ensure_weight(&stream, gate_t.logical_id, bytes_slice(gate_t))?;
+        let up_key = buffers::ensure_weight(&stream, up_t.logical_id, bytes_slice(up_t))?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let out_key = buffers::ensure_f32_out(&stream, out)?;
         let (xd, _) = buffers::take_f32(x_key)?;
@@ -963,8 +966,8 @@ pub unsafe extern "C" fn launch_shortconv_q4k(
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
         let module = oxide_module();
-        let in_w_key = buffers::ensure_weight(&stream, in_w)?;
-        let out_w_key = buffers::ensure_weight(&stream, out_w)?;
+        let in_w_key = buffers::ensure_weight(&stream, in_w_t.logical_id, in_w)?;
+        let out_w_key = buffers::ensure_weight(&stream, out_w_t.logical_id, out_w)?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let conv_key = buffers::ensure_f32(&stream, conv, false)?;
         // Scheduler batches repack request-owned recurrent state into row slots,
@@ -1088,9 +1091,9 @@ unsafe fn launch_moe_routed(
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let router_key = buffers::ensure_f32(&stream, router, false)?;
         let bias_key = buffers::ensure_f32(&stream, bias, false)?;
-        let gate_key = buffers::ensure_weight(&stream, gate_w)?;
-        let up_key = buffers::ensure_weight(&stream, up_w)?;
-        let down_key = buffers::ensure_weight(&stream, down_w)?;
+        let gate_key = buffers::ensure_weight(&stream, gate_t.logical_id, gate_w)?;
+        let up_key = buffers::ensure_weight(&stream, up_t.logical_id, up_w)?;
+        let down_key = buffers::ensure_weight(&stream, down_t.logical_id, down_w)?;
         let out_key = buffers::ensure_f32_out(&stream, out)?;
         let (xd, _) = buffers::take_f32(x_key)?;
         let (routerd, _) = buffers::take_f32(router_key)?;
@@ -1316,9 +1319,9 @@ unsafe fn launch_moe_gemma(
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let router_key = buffers::ensure_f32(&stream, router, false)?;
         let out_key = buffers::ensure_f32_out(&stream, out)?;
-        let weight_keys: Result<Vec<usize>, i32> = ts[2..7]
+        let weight_keys: Result<Vec<u64>, i32> = ts[2..7]
             .iter()
-            .map(|t| buffers::ensure_weight(&stream, bytes_slice(t)))
+            .map(|t| buffers::ensure_weight(&stream, t.logical_id, bytes_slice(t)))
             .collect();
         let wk = weight_keys?;
         let (xd, _) = buffers::take_f32(x_key)?;
@@ -1771,7 +1774,7 @@ pub unsafe extern "C" fn launch_q6k_matmul(
         };
 
         let stream = oxide_stream().clone();
-        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let (xd, _) = buffers::take_f32(x_key)?;
@@ -1871,7 +1874,7 @@ pub unsafe extern "C" fn launch_embedding_q6k(
 
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
-        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let (mut od, _) = buffers::take_f32(o_key)?;
         let module = oxide_module();
@@ -1966,7 +1969,7 @@ pub unsafe extern "C" fn launch_q8_0_matmul(
         }
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
-        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
         let x_key = buffers::ensure_f32(&stream, x, false)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let residual_key = residual_t
@@ -2059,7 +2062,7 @@ pub unsafe extern "C" fn launch_q5_0_matmul(
             return Err(-2);
         }
         let stream = oxide_stream().clone();
-        let wk = buffers::ensure_weight(&stream, wb)?;
+        let wk = buffers::ensure_weight(&stream, wt.logical_id, wb)?;
         let xk = buffers::ensure_f32(&stream, x, false)?;
         let ok = buffers::ensure_f32_out(&stream, out)?;
         let (xd, _) = buffers::take_f32(xk)?;
@@ -2133,7 +2136,7 @@ pub unsafe extern "C" fn launch_weighted_embedding_q6k(
             return Err(-2);
         }
         let stream = oxide_stream().clone();
-        let wk = buffers::ensure_weight(&stream, bytes_slice(wt))?;
+        let wk = buffers::ensure_weight(&stream, wt.logical_id, bytes_slice(wt))?;
         let pk = buffers::ensure_f32(&stream, packed, false)?;
         let ok = buffers::ensure_f32_out(&stream, out)?;
         let (packed_d, _) = buffers::take_f32(pk)?;
@@ -2206,7 +2209,7 @@ pub unsafe extern "C" fn launch_embedding_q8_0(
         }
         let _ctx = oxide_ctx();
         let stream = oxide_stream().clone();
-        let w_key = buffers::ensure_weight(&stream, wb)?;
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
         let i_key = buffers::ensure_u32(&stream, ids)?;
         let o_key = buffers::ensure_f32_out(&stream, out)?;
         let id = buffers::take_u32(i_key)?;

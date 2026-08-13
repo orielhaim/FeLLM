@@ -29,6 +29,7 @@ fellm-plugin-abi = { path = "crates/fellm-plugin-abi", version = "0.1.0" }
 fellm-plugin-host = { path = "crates/fellm-plugin-host", version = "0.1.0" }
 fellm-model = { path = "crates/fellm-model", version = "0.1.0" }
 fellm-runtime = { path = "crates/fellm-runtime", version = "0.1.0" }
+fellm-memory = { path = "crates/fellm-memory", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
 backend-cuda = { path = "crates/backend-cuda", version = "0.1.0" }
 fellm-triattention = { path = "plugins/triattention", version = "0.1.0" }
@@ -62,6 +63,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",

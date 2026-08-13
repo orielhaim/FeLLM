@@ -6,8 +6,9 @@ use super::policy::{PageScoreInput, ResidencyPolicy, policy_from_kind};
 use super::share::{PrefixCacheStats, SharedKvStore, ensure_cow};
 use super::storage::PageArena;
 use super::types::{
-    FabricMetrics, KvAddressing, KvEncoding, KvFabricConfig, KvGroupDesc, KvLocation, KvMemoryPlan,
-    KvMode, KvPageId, KvSequence, KvTier, PhysicalSlot, ResidencySignals, STANDARD_PAGE_TOKENS,
+    FabricMetrics, KvAddressing, KvEncoding, KvExecutionMemory, KvFabricConfig, KvGroupDesc,
+    KvLocation, KvMemoryPlan, KvMode, KvPageId, KvSequence, KvTier, PhysicalSlot, ResidencySignals,
+    STANDARD_PAGE_TOKENS,
 };
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::DeviceMemoryInfo;
@@ -24,6 +25,7 @@ impl KvMemoryPlan {
         activation_bytes: u64,
         page_bytes: usize,
         minimum_pages: usize,
+        execution_memory: KvExecutionMemory,
     ) -> Result<Self> {
         if page_bytes == 0 {
             return Err(FellmError::other("KV page size is zero"));
@@ -44,33 +46,43 @@ impl KvMemoryPlan {
                 .saturating_sub(config.safety_reserve_bytes);
             (usable as f64 * fraction) as u64
         });
-        let requested = config.device_budget.or(automatic).ok_or_else(|| {
+        let device_budget = config.device_budget.or(automatic).ok_or_else(|| {
             FellmError::other(
                 "automatic KV budget requires backend memory information; set an explicit byte budget",
             )
         })?;
-        let device_pages = usize::try_from(requested / page_bytes as u64)
+        let host_budget = config.host_budget.unwrap_or(0);
+        let execution_budget = match execution_memory {
+            KvExecutionMemory::Host => host_budget,
+            KvExecutionMemory::Accelerator => device_budget,
+        };
+        let execution_pages = usize::try_from(execution_budget / page_bytes as u64)
             .unwrap_or(usize::MAX)
             .max(minimum_pages.max(1));
-        let kv_bytes = (device_pages as u64).saturating_mul(page_bytes as u64);
-        let host_budget = config.host_budget.unwrap_or(0);
-        let host_pages = usize::try_from(host_budget / page_bytes as u64).unwrap_or(usize::MAX);
-        let host_bytes = (host_pages as u64).saturating_mul(page_bytes as u64);
+        let execution_bytes = (execution_pages as u64).saturating_mul(page_bytes as u64);
+        let overflow_host_pages = match execution_memory {
+            KvExecutionMemory::Host => 0,
+            KvExecutionMemory::Accelerator => {
+                usize::try_from(host_budget / page_bytes as u64).unwrap_or(usize::MAX)
+            }
+        };
+        let overflow_host_bytes = (overflow_host_pages as u64).saturating_mul(page_bytes as u64);
         let remaining_reserve_bytes = memory.map(|info| {
             info.available_bytes
                 .saturating_sub(weights_bytes)
                 .saturating_sub(activation_bytes)
                 .saturating_sub(config.runtime_reserve_bytes)
-                .saturating_sub(kv_bytes)
+                .saturating_sub(execution_bytes)
         });
         Ok(Self {
             weights_bytes,
             activation_bytes,
             page_bytes,
-            device_pages,
-            kv_bytes,
-            host_pages,
-            host_bytes,
+            execution_memory,
+            execution_pages,
+            execution_bytes,
+            overflow_host_pages,
+            overflow_host_bytes,
             remaining_reserve_bytes,
         })
     }

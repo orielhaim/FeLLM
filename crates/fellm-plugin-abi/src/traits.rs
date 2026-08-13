@@ -361,6 +361,17 @@ pub trait Backend: Send + Sync + 'static {
         stream: StreamHandle,
     ) -> Result<()>;
 
+    /// Schedule immutable weights before their execution group reaches the critical path.
+    /// Backends without tiered residency may ignore this hint.
+    fn prefetch_weight_group(
+        &self,
+        _group_id: u64,
+        _weights: &[TensorRef],
+        _required: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Mark the beginning of one forward step.
     ///
     /// Backends may use this boundary to reuse immutable per-step activation

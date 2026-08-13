@@ -67,6 +67,17 @@ impl Tensor {
         &all[start..end]
     }
 
+    /// Stable payload extent in the original mmap backing store, when applicable.
+    #[must_use]
+    pub fn mmap_extent(&self) -> Option<(usize, usize)> {
+        self.storage.mmap_extent().map(|(base, _)| {
+            (
+                base.saturating_add(self.layout.offset_bytes),
+                self.layout.byte_size(),
+            )
+        })
+    }
+
     /// Interpret the payload as `&[T]` if the dtype matches size-wise and the
     /// tensor is contiguous.
     ///

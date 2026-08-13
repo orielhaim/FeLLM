@@ -233,6 +233,7 @@ pub fn moe_decode(
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let k = n_expert_used.min(n_experts);
     let selected = &mut scored[..k];
+    fellm_plugin_abi::record_expert_route(selected.iter().map(|(expert, _)| *expert as u32));
     if norm_topk_prob {
         let sum = selected.iter().map(|(_, score)| *score).sum::<f32>();
         if sum > 0.0 {
@@ -402,6 +403,7 @@ pub fn moe_decode_gemma(
     scores.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let k = n_expert_used.min(n_experts);
     let selected = &mut scores[..k];
+    fellm_plugin_abi::record_expert_route(selected.iter().map(|(expert, _)| *expert as u32));
     if norm_topk_prob {
         let sum = selected.iter().map(|(_, v)| *v).sum::<f32>();
         if sum > 0.0 {
@@ -626,6 +628,9 @@ pub fn moe_decode_gemma_batch(
             }
             scores[..k].sort_unstable_by(ranking);
             let selected = &mut scores[..k];
+            fellm_plugin_abi::record_expert_route(
+                selected.iter().map(|(expert, _)| *expert as u32),
+            );
             if norm_topk_prob {
                 let sum = selected.iter().map(|(_, v)| *v).sum::<f32>();
                 if sum > 0.0 {

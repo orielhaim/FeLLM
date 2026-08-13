@@ -70,6 +70,8 @@ pub struct EngineSettings {
     pub plugin_dir: Option<std::path::PathBuf>,
     /// KV fabric configuration (mode, budgets, addressing, policies).
     pub kv_cache: KvFabricConfig,
+    /// Hardware/planner overrides. Unset capacities are discovered automatically.
+    pub memory_fabric: crate::memory_fabric::MemoryFabricConfig,
 }
 
 impl Default for EngineSettings {
@@ -83,6 +85,7 @@ impl Default for EngineSettings {
             providers: crate::providers::ProviderSelection::new(),
             plugin_dir: None,
             kv_cache: KvFabricConfig::default(),
+            memory_fabric: crate::memory_fabric::MemoryFabricConfig::default(),
         }
     }
 }
@@ -356,6 +359,8 @@ pub struct Engine {
 /// Runtime state + compiled step graph for one GGUF model.
 struct LoadedModel {
     spec: ModelSpec,
+    /// Joint weights/KV/activation plan and cross-tier telemetry.
+    memory_fabric: crate::memory_fabric::MemoryFabric,
     architecture_mode: ArchitectureGenerationMode,
     /// KV fabric (logical identity + residency + sharing).
     cache: KvFabric,
@@ -418,7 +423,7 @@ struct CudaDecodePlan {
     _lowered: LoweredDecodeGraph,
     _physical: fellm_plugin_abi::PhysicalPlan,
     device: backend_cuda::DecodeDeviceState,
-    _model: backend_cuda::ModelImage,
+    _weights: Option<backend_cuda::CudaWeightFabric>,
     graph: Option<backend_cuda::CudaGraphExec>,
     full_step_warmed: bool,
     graph_replay_safe: bool,
@@ -519,6 +524,8 @@ impl Engine {
         }
         let architecture_program = preparation.as_ref().map(|p| p.program.clone());
         let n_attn_layers = spec.n_attn_layers().max(1);
+        let backend_memory = backend.memory_info();
+        let accelerator_memory = (backend.id() == "cuda").then_some(backend_memory).flatten();
         let mut model = LoadedModel::new(
             &gguf,
             spec,
@@ -526,13 +533,22 @@ impl Engine {
             model_max_ctx,
             preparation,
             &settings.kv_cache,
-            backend.memory_info(),
+            backend_memory,
+            accelerator_memory,
             n_ubatch,
+            &settings.memory_fabric,
         )?;
 
         // B2: size VRAM KV arena to match the host fabric arena.
         #[cfg(feature = "backend-cuda")]
         if let Some(cuda) = backend.as_any().downcast_ref::<backend_cuda::CudaBackend>() {
+            cuda.configure_cpu_partitions(
+                model.memory_fabric.cpu_compute_weights(),
+                model.memory_fabric.cpu_compute_ops(),
+            );
+            let (storage_weights, host_buffers, host_buffer_bytes) =
+                model.memory_fabric.storage_stream_configuration();
+            cuda.configure_weight_storage(&storage_weights, host_buffers, host_buffer_bytes)?;
             let n_pages = model.cache.n_pages();
             let host_pages = (n_pages / 2).max(1);
             if let Err(e) = cuda.init_kv_arena(
@@ -564,6 +580,7 @@ impl Engine {
                 providers: settings.providers.clone(),
                 plugin_dir: settings.plugin_dir.clone(),
                 kv_cache: settings.kv_cache.clone(),
+                memory_fabric: settings.memory_fabric.clone(),
             },
             providers,
             seq_attn: SequenceAttentionState::new(n_attn_layers),
@@ -1179,6 +1196,70 @@ impl Engine {
         self.backend.memory_info()
     }
 
+    /// Joint weights/KV/activation placement and fabric telemetry.
+    #[must_use]
+    pub fn memory_fabric_snapshot(&self) -> crate::memory_fabric::MemoryFabricSnapshot {
+        self.model.memory_fabric.snapshot()
+    }
+
+    /// Publish live cross-tier weight and transfer-provider telemetry.
+    pub fn publish_memory_fabric_metrics(&self) {
+        self.model.memory_fabric.publish_metrics();
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cuda::CudaBackend>()
+        {
+            let snapshot = cuda.metrics();
+            metrics::gauge!("fellm_memory_resident_bytes", "tier" => "device_weights")
+                .set(snapshot.weight_resident_bytes as f64);
+            metrics::counter!("fellm_memory_transfer_bytes_total", "path" => "host_to_device_weights")
+                .absolute(snapshot.weight_h2d_bytes);
+            metrics::counter!("fellm_memory_prefetch_hits_total")
+                .absolute(snapshot.weight_prefetch_hits);
+            metrics::counter!("fellm_memory_prefetch_misses_total")
+                .absolute(snapshot.weight_prefetch_misses);
+            metrics::counter!("fellm_memory_evictions_total", "consumer" => "weights")
+                .absolute(snapshot.weight_evictions);
+            metrics::counter!("fellm_memory_transfer_bytes_total", "path" => "storage_to_host_weights")
+                .absolute(snapshot.storage_read_bytes);
+            metrics::counter!("fellm_memory_prefetch_hits_total", "provider" => "storage")
+                .absolute(snapshot.storage_prefetch_hits);
+            metrics::counter!("fellm_memory_prefetch_misses_total", "provider" => "storage")
+                .absolute(snapshot.storage_prefetch_misses);
+            metrics::gauge!("fellm_memory_stall_seconds", "provider" => "storage")
+                .set(snapshot.storage_wait_nanos as f64 / 1_000_000_000.0);
+            metrics::counter!("fellm_memory_cpu_partition_ops_total")
+                .absolute(snapshot.cpu_partition_count);
+        }
+    }
+
+    /// Emit the concrete residency and transfer counters used by the completed run.
+    pub fn log_memory_fabric_runtime(&self) {
+        #[cfg(feature = "backend-cuda")]
+        if let Some(cuda) = self
+            .backend
+            .as_any()
+            .downcast_ref::<backend_cuda::CudaBackend>()
+        {
+            let snapshot = cuda.metrics();
+            tracing::info!(
+                device_weight_resident_bytes = snapshot.weight_resident_bytes,
+                weight_h2d_bytes = snapshot.weight_h2d_bytes,
+                weight_prefetch_hits = snapshot.weight_prefetch_hits,
+                weight_prefetch_misses = snapshot.weight_prefetch_misses,
+                weight_evictions = snapshot.weight_evictions,
+                storage_read_bytes = snapshot.storage_read_bytes,
+                storage_wait_nanos = snapshot.storage_wait_nanos,
+                storage_prefetch_hits = snapshot.storage_prefetch_hits,
+                storage_prefetch_misses = snapshot.storage_prefetch_misses,
+                cpu_partition_ops = snapshot.cpu_partition_count,
+                "Memory Fabric runtime counters"
+            );
+        }
+    }
+
     #[must_use]
     pub fn model_bytes(&self) -> u64 {
         self.gguf.tensors().fold(0u64, |total, tensor| {
@@ -1395,7 +1476,9 @@ impl LoadedModel {
         preparation: Option<ArchitecturePreparation>,
         kv_config: &KvFabricConfig,
         memory_info: Option<fellm_plugin_abi::DeviceMemoryInfo>,
+        accelerator_memory: Option<fellm_plugin_abi::DeviceMemoryInfo>,
         physical_batch: usize,
+        memory_fabric_config: &crate::memory_fabric::MemoryFabricConfig,
     ) -> Result<Self> {
         let n_attn = spec.n_attn_layers().max(1);
         let step_graph = build_step_graph(gguf, &spec)?;
@@ -1463,21 +1546,47 @@ impl LoadedModel {
             STANDARD_PAGE_TOKENS,
             kv_config.default_encoding,
         );
+        let desired_kv_bytes = (max_seq.div_ceil(STANDARD_PAGE_TOKENS) as u64)
+            .saturating_mul(n_attn as u64)
+            .saturating_mul(page_bytes as u64);
+        let memory_fabric = crate::memory_fabric::MemoryFabric::inspect_and_plan(
+            gguf,
+            &step_graph,
+            &step_plan,
+            accelerator_memory,
+            desired_kv_bytes,
+            activation_bytes,
+            memory_fabric_config,
+        )
+        .map_err(|error| FellmError::other(format!("memory fabric planning failed: {error:?}")))?;
+        let fabric_snapshot = memory_fabric.snapshot();
+        let mut resolved_kv_config = kv_config.clone();
+        if resolved_kv_config.device_budget.is_none() {
+            resolved_kv_config.device_budget = Some(fabric_snapshot.plan.budget.kv_device);
+        }
+        if resolved_kv_config.host_budget.is_none() || resolved_kv_config.host_budget == Some(0) {
+            resolved_kv_config.host_budget = Some(fabric_snapshot.plan.budget.kv_host);
+        }
         let memory_plan = KvMemoryPlan::resolve(
-            kv_config,
+            &resolved_kv_config,
             memory_info,
             weights_bytes,
             activation_bytes,
             page_bytes,
             n_attn,
+            if accelerator_memory.is_some() {
+                crate::kv_fabric::KvExecutionMemory::Accelerator
+            } else {
+                crate::kv_fabric::KvExecutionMemory::Host
+            },
         )?;
         let cache = KvFabric::new_full_attention(
-            kv_config.clone(),
-            memory_plan.device_pages,
+            resolved_kv_config.clone(),
+            memory_plan.execution_pages,
             n_attn,
             spec.n_kv_heads.max(1),
             spec.head_dim.max(1),
-            memory_plan.host_pages,
+            memory_plan.overflow_host_pages,
         )?;
         let seq = cache.new_sequence(max_seq);
         let dummy_kv = DummyKvBuffers::new(
@@ -1496,12 +1605,54 @@ impl LoadedModel {
             None
         };
         tracing::info!(
+            weight_device_bytes = fabric_snapshot.plan.budget.weights_device,
+            weight_host_bytes = fabric_snapshot.plan.budget.weights_host,
+            // Storage stays authoritative while host/device replicas are resident.
+            weight_storage_bytes = weights_bytes,
+            device_staging_bytes = fabric_snapshot.plan.budget.device_staging,
+            host_staging_bytes = fabric_snapshot.plan.budget.host_staging,
+            kv_device_bytes = fabric_snapshot.plan.budget.kv_device,
+            kv_host_bytes = fabric_snapshot.plan.budget.kv_host,
+            execution_groups = fabric_snapshot.plan.placements.len(),
+            permanent_groups =
+                fabric_snapshot
+                    .plan
+                    .placements
+                    .iter()
+                    .filter(|placement| placement.class
+                        == fellm_memory::ResidencyClass::PermanentDevice)
+                    .count(),
+            host_stream_groups = fabric_snapshot
+                .plan
+                .placements
+                .iter()
+                .filter(|placement| placement.class == fellm_memory::ResidencyClass::HostResident)
+                .count(),
+            storage_stream_groups = fabric_snapshot
+                .plan
+                .placements
+                .iter()
+                .filter(|placement| placement.class == fellm_memory::ResidencyClass::StorageStream)
+                .count(),
+            cpu_compute_groups = fabric_snapshot
+                .plan
+                .placements
+                .iter()
+                .filter(|placement| placement.class == fellm_memory::ResidencyClass::CpuCompute)
+                .count(),
+            device_buffers = fabric_snapshot.plan.device_buffer_count,
+            host_buffers = fabric_snapshot.plan.host_buffer_count,
+            "selected automatic Memory Fabric plan"
+        );
+        memory_fabric.publish_metrics();
+        tracing::info!(
             weights_bytes = memory_plan.weights_bytes,
             activation_bytes = memory_plan.activation_bytes,
             kv_page_bytes = memory_plan.page_bytes,
-            kv_device_pages = memory_plan.device_pages,
-            kv_bytes = memory_plan.kv_bytes,
-            host_bytes = memory_plan.host_bytes,
+            execution_memory = ?memory_plan.execution_memory,
+            kv_execution_pages = memory_plan.execution_pages,
+            kv_execution_bytes = memory_plan.execution_bytes,
+            overflow_host_bytes = memory_plan.overflow_host_bytes,
             mode = ?kv_config.mode,
             addressing = ?kv_config.addressing,
             remaining_reserve_bytes = ?memory_plan.remaining_reserve_bytes,
@@ -1520,6 +1671,7 @@ impl LoadedModel {
 
         Ok(Self {
             spec,
+            memory_fabric,
             architecture_mode,
             cache,
             seq,
@@ -1561,7 +1713,11 @@ impl LoadedModel {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, &id)| match &self.step_graph.node(id).value {
-                    OpValue::Constant(tensor) => Some(backend_cuda::ModelBlob {
+                    OpValue::Constant(tensor) => Some(backend_cuda::WeightBlob {
+                        id: self
+                            .memory_fabric
+                            .weight_id_for_tensor(tensor)
+                            .unwrap_or(fellm_memory::WeightId((1u64 << 63) | index as u64)),
                         tensor: fellm_plugin_abi::PlanTensorId(index as u32),
                         bytes: tensor.as_bytes(),
                         alignment: 128,
@@ -1569,17 +1725,64 @@ impl LoadedModel {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let model = backend_cuda::ModelImage::upload(cuda.device_state(), &blobs)?;
-            // `ModelImage` is uploaded on the host backend's cudarc stream, while
-            // dynamically loaded cuda-oxide kernels execute on the plugin stream.
-            // Establish ownership before publishing the raw device pointers;
-            // otherwise the plugin can race the asynchronous model upload and
-            // deterministically consume zero/partial weights.
-            cuda.synchronize()?;
-            for blob in &blobs {
-                let (device_ptr, len) = model.resolve(blob.tensor)?;
-                debug_assert_eq!(len, blob.bytes.len());
-                cuda.register_device_tensor(blob.bytes.as_ptr(), blob.bytes.len(), device_ptr)?;
+            let fabric_plan = self.memory_fabric.snapshot().plan;
+            cuda.set_weight_cache_budget(
+                fabric_plan.budget.device_staging.max(1),
+                u32::from(fabric_plan.device_buffer_count.max(1)),
+            )?;
+            let all_permanent = fabric_plan
+                .placements
+                .iter()
+                .all(|placement| placement.class == fellm_memory::ResidencyClass::PermanentDevice);
+            cuda.set_weight_streaming_enabled(!all_permanent);
+            let permanent_ids = self.memory_fabric.permanent_device_weights();
+            let resident_blobs = blobs
+                .iter()
+                .filter(|blob| permanent_ids.contains(&blob.id))
+                .map(|blob| backend_cuda::WeightBlob {
+                    id: blob.id,
+                    tensor: blob.tensor,
+                    bytes: blob.bytes,
+                    alignment: blob.alignment,
+                })
+                .collect::<Vec<_>>();
+            let weights = if resident_blobs.is_empty() {
+                None
+            } else {
+                match backend_cuda::CudaWeightFabric::materialize(
+                    cuda.device_state(),
+                    &resident_blobs,
+                ) {
+                    Ok(weights) => Some(weights),
+                    Err(error) => {
+                        let attempted = resident_blobs.iter().fold(0u64, |total, blob| {
+                            total.saturating_add(blob.bytes.len() as u64)
+                        });
+                        let replanned = self
+                            .memory_fabric
+                            .replan_after_pressure(fellm_memory::MemoryDomain::Device, attempted)
+                            .map_err(|plan_error| {
+                                FellmError::other(format!(
+                                    "CUDA weight allocation failed ({error}); pressure replan failed: {plan_error:?}"
+                                ))
+                            })?;
+                        tracing::warn!(
+                            error = %error,
+                            device_staging_bytes = replanned.budget.device_staging,
+                            "CUDA allocation pressure demoted weights to bounded streaming"
+                        );
+                        None
+                    }
+                }
+            };
+            if let Some(resident) = &weights {
+                // Establish ownership across the host and dynamically loaded plugin streams.
+                cuda.synchronize()?;
+                for blob in &resident_blobs {
+                    let (device_ptr, len) = resident.resolve(blob.tensor)?;
+                    debug_assert_eq!(len, blob.bytes.len());
+                    cuda.register_device_tensor(blob.bytes.as_ptr(), blob.bytes.len(), device_ptr)?;
+                }
             }
             let page_table_capacity = self
                 .cache
@@ -1592,7 +1795,9 @@ impl LoadedModel {
                 self.cache.n_layers(),
             )?;
             let tensors = device.arena.resolve(&physical, &lowered.tensors)?;
-            let graph_replay_safe = !self.spec.is_hybrid()
+            let graph_replay_safe = all_permanent
+                && weights.is_some()
+                && !self.spec.is_hybrid()
                 && lowered
                     .operations
                     .iter()
@@ -1610,7 +1815,16 @@ impl LoadedModel {
                 arena_bytes = physical.arena_bytes,
                 tensor_count = lowered.tensors.len(),
                 macro_ops = physical.operations.len(),
-                model_image_bytes = model.byte_len(),
+                weight_device_bytes = weights
+                    .as_ref()
+                    .map_or(0, backend_cuda::CudaWeightFabric::byte_len),
+                weight_strategy = if all_permanent {
+                    "permanent"
+                } else if weights.is_some() {
+                    "permanent-plus-predictive-window"
+                } else {
+                    "predictive-window"
+                },
                 graph_replay_safe,
                 "compiled device-native CUDA decode layout"
             );
@@ -1619,7 +1833,7 @@ impl LoadedModel {
                 _lowered: lowered,
                 _physical: physical,
                 device,
-                _model: model,
+                _weights: weights,
                 graph: None,
                 full_step_warmed: false,
                 graph_replay_safe,
@@ -2165,7 +2379,10 @@ impl LoadedModel {
             decode.full_step_warmed = true;
         }
 
-        step.run(backend, compute_logits)
+        let result = step.run(backend, compute_logits);
+        self.memory_fabric
+            .observe_expert_route_batch(&fellm_plugin_abi::take_expert_routes());
+        result
     }
 
     fn canvas_step(

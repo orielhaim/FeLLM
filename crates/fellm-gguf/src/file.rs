@@ -33,6 +33,7 @@ pub struct TensorInfo {
 /// The file is memory-mapped; tensor accesses are zero-copy views.
 pub struct GgufFile {
     mmap: Arc<Mmap>,
+    source_path: Option<std::path::PathBuf>,
     /// Absolute offset within the file where tensor payloads start.
     tensor_data_offset: u64,
     /// Alignment (bytes) required for tensor payloads.
@@ -52,7 +53,9 @@ impl GgufFile {
         // SAFETY: the file remains open for the lifetime of the mapping,
         // and we treat the bytes as immutable throughout.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_mmap(Arc::new(mmap))
+        let mut gguf = Self::from_mmap(Arc::new(mmap))?;
+        gguf.source_path = Some(path.as_ref().to_path_buf());
+        Ok(gguf)
     }
 
     /// Construct from an existing memory map.
@@ -139,6 +142,7 @@ impl GgufFile {
 
         Ok(Self {
             mmap,
+            source_path: None,
             tensor_data_offset,
             alignment,
             metadata,
@@ -151,6 +155,12 @@ impl GgufFile {
     #[must_use]
     pub fn mmap(&self) -> &Arc<Mmap> {
         &self.mmap
+    }
+
+    /// Original backing-store path, when opened from a file.
+    #[must_use]
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
     }
 
     /// Absolute byte offset where tensor data starts.

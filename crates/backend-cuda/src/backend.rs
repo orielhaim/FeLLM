@@ -6,6 +6,7 @@ use crate::vram_pool::DeviceKvArena;
 use backend_cpu::CpuBackend;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
+use fellm_core::storage::AlignedBuffer;
 use fellm_plugin_abi::op::{OpAttrs, OpKind};
 use fellm_plugin_abi::traits::{Backend, BackendCaps, DeviceKind, KernelDescriptor, KernelHandle};
 use fellm_plugin_abi::{StreamHandle, TensorMut, TensorRef};
@@ -13,13 +14,25 @@ use fellm_plugin_host::PluginHost;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+
+struct WeightStorageState {
+    pool: fellm_memory::BoundedTransferPool,
+    extents: std::collections::HashMap<u64, fellm_memory::StorageExtent>,
+    pending: std::collections::HashMap<u64, Vec<Receiver<Result<fellm_memory::PrefetchedRead>>>>,
+}
 
 /// Bit set on handles that route to the embedded CPU backend.
 const CPU_FALLBACK_BIT: u64 = 1 << 55;
 /// Bit set on handles that route to a loaded CUDA plugin.
 const PLUGIN_BIT: u64 = 1 << 56;
+/// Handle contains both a CUDA kernel and an explicit planned CPU partition kernel.
+const HYBRID_BIT: u64 = 1 << 57;
+const HYBRID_HANDLE_BITS: u32 = 28;
+const HYBRID_HANDLE_MASK: u64 = (1 << HYBRID_HANDLE_BITS) - 1;
 
 /// CUDA execution policy. Only debug mode permits arbitrary per-operation CPU fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +72,18 @@ pub struct CudaExecutionMetrics {
     pub d2h_bytes: u64,
     /// Operations executed by the CPU debug fallback.
     pub cpu_fallback_count: u64,
+    /// Current bytes in the bounded device weight working set.
+    pub weight_resident_bytes: u64,
+    /// Weight bytes uploaded by the streaming provider.
+    pub weight_h2d_bytes: u64,
+    pub weight_prefetch_hits: u64,
+    pub weight_prefetch_misses: u64,
+    pub weight_evictions: u64,
+    pub storage_read_bytes: u64,
+    pub storage_wait_nanos: u64,
+    pub storage_prefetch_hits: u64,
+    pub storage_prefetch_misses: u64,
+    pub cpu_partition_count: u64,
 }
 
 /// CUDA compute backend with per-op CPU fallback for missing GPU kernels.
@@ -80,6 +105,17 @@ pub struct CudaBackend {
     h2d_bytes: AtomicU64,
     d2h_bytes: AtomicU64,
     cpu_fallback_count: AtomicU64,
+    weight_streaming_enabled: AtomicBool,
+    weight_storage: Mutex<Option<WeightStorageState>>,
+    storage_read_bytes: AtomicU64,
+    storage_wait_nanos: AtomicU64,
+    storage_prefetch_hits: AtomicU64,
+    storage_prefetch_misses: AtomicU64,
+    cpu_partition_count: AtomicU64,
+    cpu_weight_ids: RwLock<std::collections::HashSet<u64>>,
+    cpu_execution_ops: RwLock<std::collections::HashSet<u64>>,
+    active_cpu_partition: AtomicBool,
+    active_execution_op: AtomicU64,
 }
 
 impl CudaBackend {
@@ -97,7 +133,7 @@ impl CudaBackend {
         self.plugins.update_step_params(params)
     }
 
-    /// Register one immutable tensor already resident in the packed model image.
+    /// Publish one resident immutable weight replica to a device plugin.
     pub fn register_device_tensor(
         &self,
         host_ptr: *const u8,
@@ -106,6 +142,62 @@ impl CudaBackend {
     ) -> Result<()> {
         self.plugins
             .register_device_tensor(host_ptr, nbytes, device_ptr.0)
+    }
+
+    /// Set the device working-set budget for demand-streamed immutable weights.
+    pub fn set_weight_cache_budget(&self, bytes: u64, buffer_count: u32) -> Result<()> {
+        self.plugins.set_weight_cache_budget(bytes, buffer_count)
+    }
+
+    /// Enable predictive staging only when the selected plan contains streamed weights.
+    pub fn set_weight_streaming_enabled(&self, enabled: bool) {
+        self.weight_streaming_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Attach the explicit SSD provider selected by the joint planner.
+    pub fn configure_weight_storage(
+        &self,
+        weights: &[fellm_memory::WeightDescriptor],
+        buffer_count: usize,
+        buffer_bytes: usize,
+    ) -> Result<()> {
+        if weights.is_empty() {
+            *self.weight_storage.lock().expect("weight storage lock") = None;
+            return Ok(());
+        }
+        let path = weights
+            .first()
+            .map(|weight| weight.home.path.clone())
+            .ok_or_else(|| FellmError::other("storage weight catalog is empty"))?;
+        let provider = std::sync::Arc::new(fellm_memory::FileProvider::open(&path)?);
+        let pool = fellm_memory::BoundedTransferPool::new(
+            provider,
+            buffer_count.max(1),
+            buffer_bytes.max(1),
+        )?;
+        let extents = weights
+            .iter()
+            .map(|weight| (weight.id.0, weight.home.clone()))
+            .collect();
+        *self.weight_storage.lock().expect("weight storage lock") = Some(WeightStorageState {
+            pool,
+            extents,
+            pending: std::collections::HashMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Install explicit planner-selected CPU partitions by stable logical weight identity.
+    pub fn configure_cpu_partitions(
+        &self,
+        weights: impl IntoIterator<Item = fellm_memory::WeightId>,
+        execution_ops: impl IntoIterator<Item = u64>,
+    ) {
+        *self.cpu_weight_ids.write().expect("cpu partition lock") =
+            weights.into_iter().map(|weight| weight.0).collect();
+        *self.cpu_execution_ops.write().expect("cpu partition lock") =
+            execution_ops.into_iter().collect();
     }
     /// Device/context owner used while creating backend physical plans.
     #[must_use]
@@ -193,6 +285,17 @@ impl CudaBackend {
             h2d_bytes: AtomicU64::new(0),
             d2h_bytes: AtomicU64::new(0),
             cpu_fallback_count: AtomicU64::new(0),
+            weight_streaming_enabled: AtomicBool::new(false),
+            weight_storage: Mutex::new(None),
+            storage_read_bytes: AtomicU64::new(0),
+            storage_wait_nanos: AtomicU64::new(0),
+            storage_prefetch_hits: AtomicU64::new(0),
+            storage_prefetch_misses: AtomicU64::new(0),
+            cpu_partition_count: AtomicU64::new(0),
+            cpu_weight_ids: RwLock::new(std::collections::HashSet::new()),
+            cpu_execution_ops: RwLock::new(std::collections::HashSet::new()),
+            active_cpu_partition: AtomicBool::new(false),
+            active_execution_op: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -220,10 +323,21 @@ impl CudaBackend {
     /// Snapshot transfer/fallback instrumentation.
     #[must_use]
     pub fn metrics(&self) -> CudaExecutionMetrics {
+        let weights = self.plugins.weight_cache_metrics();
         CudaExecutionMetrics {
             h2d_bytes: self.h2d_bytes.load(Ordering::Relaxed),
             d2h_bytes: self.d2h_bytes.load(Ordering::Relaxed),
             cpu_fallback_count: self.cpu_fallback_count.load(Ordering::Relaxed),
+            weight_resident_bytes: weights.resident_bytes,
+            weight_h2d_bytes: weights.h2d_bytes,
+            weight_prefetch_hits: weights.prefetch_hits,
+            weight_prefetch_misses: weights.prefetch_misses,
+            weight_evictions: weights.evictions,
+            storage_read_bytes: self.storage_read_bytes.load(Ordering::Relaxed),
+            storage_wait_nanos: self.storage_wait_nanos.load(Ordering::Relaxed),
+            storage_prefetch_hits: self.storage_prefetch_hits.load(Ordering::Relaxed),
+            storage_prefetch_misses: self.storage_prefetch_misses.load(Ordering::Relaxed),
+            cpu_partition_count: self.cpu_partition_count.load(Ordering::Relaxed),
         }
     }
 
@@ -387,6 +501,104 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn prefetch_weight_group(
+        &self,
+        group_id: u64,
+        weights: &[TensorRef],
+        required: bool,
+    ) -> Result<()> {
+        if required {
+            self.active_execution_op.store(group_id, Ordering::Release);
+            self.active_cpu_partition.store(
+                self.cpu_execution_ops
+                    .read()
+                    .expect("cpu partition lock")
+                    .contains(&group_id),
+                Ordering::Release,
+            );
+        }
+        if !self.use_plugins || !self.weight_streaming_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut direct = Vec::with_capacity(weights.len());
+        let mut storage = self.weight_storage.lock().expect("weight storage lock");
+        let mut storage_weights = Vec::new();
+        for weight in weights {
+            let Some(state) = storage.as_mut() else {
+                direct.push(*weight);
+                continue;
+            };
+            let Some(extent) = state.extents.get(&weight.logical_id).cloned() else {
+                direct.push(*weight);
+                continue;
+            };
+            storage_weights.push((*weight, extent));
+        }
+        if !storage_weights.is_empty() {
+            let state = storage
+                .as_mut()
+                .expect("storage weights require configured storage state");
+            let was_pending = state.pending.contains_key(&group_id);
+            if !was_pending {
+                let extents = storage_weights
+                    .iter()
+                    .map(|(_, extent)| extent.clone())
+                    .collect::<Vec<_>>();
+                let reads = fellm_memory::coalesce_extents(
+                    &extents,
+                    64 * 1024,
+                    state.pool.buffer_bytes() as u64,
+                )
+                .into_iter()
+                .map(|extent| state.pool.prefetch(extent))
+                .collect::<Result<Vec<_>>>()?;
+                state.pending.insert(group_id, reads);
+            }
+            if required {
+                if was_pending {
+                    self.storage_prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.storage_prefetch_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                let receivers = state
+                    .pending
+                    .remove(&group_id)
+                    .ok_or_else(|| FellmError::other("missing pending storage group"))?;
+                for receiver in receivers {
+                    let wait_started = std::time::Instant::now();
+                    let read = receiver.recv().map_err(|_| {
+                        FellmError::other("storage prefetch worker stopped before required group")
+                    })??;
+                    self.storage_wait_nanos.fetch_add(
+                        wait_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                    let read_start = read.extent().offset;
+                    let read_end = read_start.saturating_add(read.extent().len);
+                    let mut staged = Vec::new();
+                    for (weight, extent) in &storage_weights {
+                        let extent_end = extent.offset.saturating_add(extent.len);
+                        if extent.offset >= read_start && extent_end <= read_end {
+                            let mut weight = *weight;
+                            let delta = usize::try_from(extent.offset - read_start)
+                                .map_err(|_| FellmError::other("staged extent offset overflow"))?;
+                            weight.data = unsafe { read.staging_address().add(delta) };
+                            weight.byte_len = extent.len;
+                            staged.push(weight);
+                        }
+                    }
+                    self.storage_read_bytes
+                        .fetch_add(read.bytes().len() as u64, Ordering::Relaxed);
+                    self.plugins.prefetch_weight_group(group_id, &staged)?;
+                    drop(read);
+                }
+            }
+        }
+        drop(storage);
+        self.plugins.prefetch_weight_group(group_id, &direct)?;
+        Ok(())
+    }
+
     fn synchronize(&self) -> Result<()> {
         // No GPU work when plugins are off — skip driver sync.
         if !self.use_plugins {
@@ -464,6 +676,22 @@ impl Backend for CudaBackend {
                 .registry()
                 .lookup(op, input_dtypes, output_dtype)
         {
+            if !self
+                .cpu_weight_ids
+                .read()
+                .expect("cpu partition lock")
+                .is_empty()
+                && let Some(cpu) = self.cpu.resolve_kernel(op, input_dtypes, output_dtype)
+                && h <= HYBRID_HANDLE_MASK
+                && cpu.handle.0 <= HYBRID_HANDLE_MASK
+            {
+                return Some(KernelDescriptor {
+                    op,
+                    input_dtypes: input_dtypes.to_vec(),
+                    output_dtype,
+                    handle: KernelHandle(HYBRID_BIT | (h << HYBRID_HANDLE_BITS) | cpu.handle.0),
+                });
+            }
             return Some(KernelDescriptor {
                 op,
                 input_dtypes: input_dtypes.to_vec(),
@@ -491,6 +719,158 @@ impl Backend for CudaBackend {
         outputs: &mut [TensorMut],
         stream: StreamHandle,
     ) -> Result<()> {
+        if handle.0 & HYBRID_BIT != 0 {
+            let cpu_partition = self.active_cpu_partition.load(Ordering::Acquire);
+            if cpu_partition {
+                let mut cpu_inputs = inputs.to_vec();
+                let mut materialized = Vec::new();
+                for (index, input) in inputs.iter().enumerate() {
+                    if input.logical_id != 0 || input.dtype() != Some(DType::F32) {
+                        continue;
+                    }
+                    let mut buffer = AlignedBuffer::new_zeroed(input.byte_len as usize, 64);
+                    let mut host = unsafe {
+                        TensorMut::from_raw(
+                            DType::F32,
+                            input.dims_slice(),
+                            input.strides_slice(),
+                            buffer.as_mut_slice().as_mut_ptr(),
+                            input.byte_len as usize,
+                        )
+                    };
+                    let (cast, _) = self
+                        .plugins
+                        .registry()
+                        .lookup(OpKind::Cast, &[DType::F32], DType::F32)
+                        .ok_or_else(|| {
+                            FellmError::other("CUDA f32 materialization kernel is unavailable")
+                        })?;
+                    self.plugins.registry().launch(
+                        cast,
+                        &OpAttrs::default(),
+                        std::slice::from_ref(input),
+                        std::slice::from_mut(&mut host),
+                        self.device.stream_handle(),
+                    )?;
+                    cpu_inputs[index].data = buffer.as_slice().as_ptr();
+                    materialized.push(buffer);
+                }
+                // Temporary hybrid buffers can reuse an address within one forward step. The
+                // CPU Q8_K cache keys activations by pointer and length, so reset it at each
+                // ownership boundary instead of accepting a prior layer's cached activation.
+                self.cpu.end_step();
+                self.cpu.begin_step();
+                self.cpu_partition_count.fetch_add(1, Ordering::Relaxed);
+                let cpu = KernelHandle(handle.0 & HYBRID_HANDLE_MASK);
+                if std::env::var_os("FELLM_VERIFY_CPU_PARTITIONS").is_some() {
+                    let mut cpu_buffers = outputs
+                        .iter()
+                        .map(|output| AlignedBuffer::new_zeroed(output.byte_len as usize, 64))
+                        .collect::<Vec<_>>();
+                    let mut cpu_outputs = outputs
+                        .iter()
+                        .zip(cpu_buffers.iter_mut())
+                        .map(|(output, buffer)| unsafe {
+                            TensorMut::from_raw(
+                                output.dtype().expect("resolved output dtype"),
+                                output.dims_slice(),
+                                output.strides_slice(),
+                                buffer.as_mut_slice().as_mut_ptr(),
+                                output.byte_len as usize,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    self.cpu
+                        .launch(cpu, attrs, &cpu_inputs, &mut cpu_outputs, 0)?;
+                    let plugin = (handle.0 >> HYBRID_HANDLE_BITS) & HYBRID_HANDLE_MASK;
+                    self.plugins.registry().launch(
+                        plugin,
+                        attrs,
+                        inputs,
+                        outputs,
+                        self.device.stream_handle(),
+                    )?;
+                    let (cast, _) = self
+                        .plugins
+                        .registry()
+                        .lookup(OpKind::Cast, &[DType::F32], DType::F32)
+                        .ok_or_else(|| FellmError::other("CUDA materialization unavailable"))?;
+                    for (index, (output, expected)) in
+                        outputs.iter().zip(cpu_buffers.iter()).enumerate()
+                    {
+                        if output.dtype() != Some(DType::F32) {
+                            continue;
+                        }
+                        let mut actual = AlignedBuffer::new_zeroed(output.byte_len as usize, 64);
+                        let source = unsafe {
+                            TensorRef::from_raw(
+                                DType::F32,
+                                output.dims_slice(),
+                                output.strides_slice(),
+                                output.data,
+                                output.byte_len as usize,
+                            )
+                        };
+                        let mut target = unsafe {
+                            TensorMut::from_raw(
+                                DType::F32,
+                                output.dims_slice(),
+                                output.strides_slice(),
+                                actual.as_mut_slice().as_mut_ptr(),
+                                output.byte_len as usize,
+                            )
+                        };
+                        self.plugins.registry().launch(
+                            cast,
+                            &OpAttrs::default(),
+                            std::slice::from_ref(&source),
+                            std::slice::from_mut(&mut target),
+                            self.device.stream_handle(),
+                        )?;
+                        let expected = expected
+                            .as_slice()
+                            .chunks_exact(4)
+                            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 bytes")));
+                        let actual = actual
+                            .as_slice()
+                            .chunks_exact(4)
+                            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 bytes")))
+                            .collect::<Vec<_>>();
+                        let mut max_abs = 0.0f32;
+                        let mut sum_sq = 0.0f64;
+                        for (cpu, &cuda) in expected.zip(&actual) {
+                            let error = (cpu - cuda).abs();
+                            max_abs = max_abs.max(error);
+                            sum_sq += f64::from(error) * f64::from(error);
+                        }
+                        tracing::info!(
+                            execution_op = self.active_execution_op.load(Ordering::Acquire),
+                            output_index = index,
+                            elements = actual.len(),
+                            max_abs,
+                            rmse = (sum_sq / actual.len().max(1) as f64).sqrt(),
+                            "CPU partition parity"
+                        );
+                    }
+                    return Ok(());
+                }
+                let result = self.cpu.launch(cpu, attrs, &cpu_inputs, outputs, 0);
+                if result.is_ok() {
+                    self.plugins.invalidate_f32_outputs(outputs);
+                }
+                return result;
+            }
+            let plugin = (handle.0 >> HYBRID_HANDLE_BITS) & HYBRID_HANDLE_MASK;
+            let stream = if stream == 0 {
+                self.device.stream_handle()
+            } else {
+                stream
+            };
+            return self
+                .plugins
+                .registry()
+                .launch(plugin, attrs, inputs, outputs, stream);
+        }
         if handle.0 & PLUGIN_BIT != 0 {
             let stream = if stream == 0 {
                 self.device.stream_handle()

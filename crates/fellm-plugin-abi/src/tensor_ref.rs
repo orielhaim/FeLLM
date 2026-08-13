@@ -12,6 +12,8 @@ pub const ABI_MAX_RANK: usize = 5;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TensorRef {
+    /// Stable logical identity. Zero means an ephemeral activation/input.
+    pub logical_id: u64,
     /// dtype as ggml code (see [`DType::from_ggml_code`]).
     pub dtype: u32,
     /// Number of dimensions.
@@ -75,6 +77,7 @@ impl TensorRef {
             s[i] = v;
         }
         Self {
+            logical_id: 0,
             dtype: dtype as u32,
             rank: dims.len() as u32,
             dims: d,
@@ -82,6 +85,13 @@ impl TensorRef {
             data,
             byte_len: byte_len as u64,
         }
+    }
+
+    /// Attach a stable logical identity to an immutable tensor view.
+    #[must_use]
+    pub const fn with_logical_id(mut self, logical_id: u64) -> Self {
+        self.logical_id = logical_id;
+        self
     }
 
     /// The dtype.

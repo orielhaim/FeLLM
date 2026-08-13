@@ -487,14 +487,21 @@ impl SharedKvKey {
 
 /// Fully resolved memory plan for fabric startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvExecutionMemory {
+    Host,
+    Accelerator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvMemoryPlan {
     pub weights_bytes: u64,
     pub activation_bytes: u64,
     pub page_bytes: usize,
-    pub device_pages: usize,
-    pub kv_bytes: u64,
-    pub host_pages: usize,
-    pub host_bytes: u64,
+    pub execution_memory: KvExecutionMemory,
+    pub execution_pages: usize,
+    pub execution_bytes: u64,
+    pub overflow_host_pages: usize,
+    pub overflow_host_bytes: u64,
     pub remaining_reserve_bytes: Option<u64>,
 }
 

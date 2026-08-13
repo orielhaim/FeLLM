@@ -21,6 +21,7 @@ fellm-plugin-host.workspace = true
 fellm-triattention.workspace = true
 fellm-tokenizer.workspace = true
 fellm-model.workspace = true
+fellm-memory.workspace = true
 backend-cpu.workspace = true
 backend-cuda = { workspace = true, optional = true }
 tracing.workspace = true
@@ -31,6 +32,7 @@ rand_chacha.workspace = true
 half.workspace = true
 smallvec.workspace = true
 metrics.workspace = true
+sysinfo.workspace = true
 
 [lints]
 workspace = true

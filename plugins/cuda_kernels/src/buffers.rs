@@ -8,15 +8,26 @@ use std::sync::{Arc, Mutex, OnceLock};
 // --- Q4_K / byte weight cache ------------------------------------------------
 
 struct WeightEntry {
-    buf: DeviceBuffer<u8>,
-    stamp: u64,
+    slot: usize,
+    offset: usize,
+    len: usize,
+    group: u64,
 }
 
 struct WeightCache {
-    entries: HashMap<usize, WeightEntry>,
+    entries: HashMap<u64, WeightEntry>,
+    /// Fixed-address staging regions. They are allocated once on first use.
+    slots: Vec<DeviceBuffer<u8>>,
+    slot_count: usize,
+    slot_bytes: usize,
+    slot_groups: Vec<Option<u64>>,
     bytes: usize,
     clock: u64,
     limit: usize,
+    h2d_bytes: u64,
+    prefetch_hits: u64,
+    prefetch_misses: u64,
+    evictions: u64,
 }
 
 fn weight_cache_limit() -> usize {
@@ -27,16 +38,45 @@ fn weight_cache_limit() -> usize {
         .unwrap_or(DEFAULT)
 }
 
+fn weight_staging_buffers() -> usize {
+    env::var("FELLM_CUDA_STAGING_BUFFERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|count| *count >= 2)
+        .unwrap_or(3)
+}
+
 fn weight_cache() -> &'static Mutex<WeightCache> {
     static CACHE: OnceLock<Mutex<WeightCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
         Mutex::new(WeightCache {
             entries: HashMap::new(),
+            slots: Vec::new(),
+            slot_count: weight_staging_buffers(),
+            slot_bytes: weight_cache_limit() / weight_staging_buffers(),
+            slot_groups: Vec::new(),
             bytes: 0,
             clock: 0,
             limit: weight_cache_limit(),
+            h2d_bytes: 0,
+            prefetch_hits: 0,
+            prefetch_misses: 0,
+            evictions: 0,
         })
     })
+}
+
+pub fn set_weight_cache_budget(bytes: u64, buffer_count: u32) -> Result<(), i32> {
+    let limit = usize::try_from(bytes).map_err(|_| -2)?.max(1);
+    let slot_count = usize::try_from(buffer_count).map_err(|_| -2)?.max(1);
+    let mut cache = weight_cache().lock().map_err(|_| -30)?;
+    if !cache.slots.is_empty() && (cache.limit != limit || cache.slot_count != slot_count) {
+        return Err(-33);
+    }
+    cache.limit = limit;
+    cache.slot_count = slot_count;
+    cache.slot_bytes = limit.div_ceil(cache.slot_count).max(1);
+    Ok(())
 }
 
 fn external_weights() -> &'static Mutex<HashMap<(usize, usize), (u64, usize)>> {
@@ -52,7 +92,7 @@ fn external_tensor(host_ptr: usize, len: usize) -> Result<Option<(u64, usize)>, 
         .copied())
 }
 
-/// Bind a host GGUF view to a stable address inside the host-owned model image.
+/// Bind a host execution view to a stable device-resident replica.
 pub fn register_external_weight(
     host_ptr: *const u8,
     len: usize,
@@ -69,41 +109,151 @@ pub fn register_external_weight(
 }
 
 /// Ensure `host` weights are resident in VRAM; return the cache key (host ptr).
-pub fn ensure_weight(stream: &CudaStream, host: &[u8]) -> Result<usize, i32> {
-    let key = host.as_ptr() as usize;
+pub fn ensure_weight(stream: &CudaStream, logical_id: u64, host: &[u8]) -> Result<u64, i32> {
+    let host_key = host.as_ptr() as usize;
     if external_weights()
         .lock()
         .map_err(|_| -30)?
-        .contains_key(&(key, host.len()))
+        .contains_key(&(host_key, host.len()))
+    {
+        return Ok(host_key as u64);
+    }
+    let key = if logical_id == 0 { host_key as u64 } else { logical_id };
+    if weight_cache()
+        .lock()
+        .map_err(|_| -30)?
+        .entries
+        .contains_key(&key)
     {
         return Ok(key);
     }
-    let mut guard = weight_cache().lock().map_err(|_| -30)?;
-    guard.clock = guard.clock.wrapping_add(1);
-    let stamp = guard.clock;
-    if let Some(entry) = guard.entries.get_mut(&key) {
-        entry.stamp = stamp;
-        return Ok(key);
-    }
-    while guard.bytes.saturating_add(host.len()) > guard.limit && !guard.entries.is_empty() {
-        let victim = guard
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.stamp)
-            .map(|(&victim, _)| victim)
-            .ok_or(-31)?;
-        if let Some(entry) = guard.entries.remove(&victim) {
-            guard.bytes = guard.bytes.saturating_sub(entry.buf.len());
-        }
-    }
-    let buf = DeviceBuffer::from_host(stream, host).map_err(|_| -3)?;
-    guard.bytes = guard.bytes.saturating_add(buf.len());
-    guard.entries.insert(key, WeightEntry { buf, stamp });
+    stage_group(stream, key, &[(key, host)])?;
     Ok(key)
 }
 
+pub fn prefetch_group(
+    stream: &CudaStream,
+    group: u64,
+    weights: &[fellm_plugin_abi::TensorRef],
+) -> Result<(), i32> {
+    let mut staged = Vec::with_capacity(weights.len());
+    for weight in weights {
+        let host_key = weight.data as usize;
+        if external_weights()
+            .lock()
+            .map_err(|_| -30)?
+            .contains_key(&(host_key, weight.byte_len as usize))
+        {
+            continue;
+        }
+        // SAFETY: the host keeps every TensorRef payload valid for this synchronous call.
+        let bytes = unsafe { weight.as_bytes() };
+        let key = if weight.logical_id == 0 {
+            host_key as u64
+        } else {
+            weight.logical_id
+        };
+        staged.push((key, bytes));
+    }
+    stage_group(stream, group, &staged)
+}
+
+fn stage_group(stream: &CudaStream, group: u64, weights: &[(u64, &[u8])]) -> Result<(), i32> {
+    if weights.is_empty() {
+        return Ok(());
+    }
+    let mut guard = weight_cache().lock().map_err(|_| -30)?;
+    guard.clock = guard.clock.wrapping_add(1);
+    if guard.slots.is_empty() {
+        let slot_count = guard.slot_count;
+        let slot_bytes = guard.slot_bytes;
+        guard.slots.reserve(slot_count);
+        for _ in 0..slot_count {
+            let buffer = DeviceBuffer::<u8>::zeroed(stream, slot_bytes).map_err(|_| -3)?;
+            guard.slots.push(buffer);
+        }
+        guard.slot_groups = vec![None; slot_count];
+    }
+    let slot = group as usize % guard.slot_count;
+    if guard.slot_groups[slot] == Some(group)
+        && weights.iter().all(|(key, _)| guard.entries.contains_key(key))
+    {
+        guard.prefetch_hits = guard.prefetch_hits.saturating_add(weights.len() as u64);
+        return Ok(());
+    }
+    if guard.slot_groups[slot] != Some(group) {
+        let victims = guard
+            .entries
+            .iter()
+            .filter_map(|(&key, entry)| (entry.slot == slot).then_some(key))
+            .collect::<Vec<_>>();
+        for victim in victims {
+            if let Some(entry) = guard.entries.remove(&victim) {
+                guard.bytes = guard.bytes.saturating_sub(entry.len);
+                guard.evictions = guard.evictions.saturating_add(1);
+            }
+        }
+    }
+    let base = guard.slots[slot].cu_deviceptr();
+    let mut cursor = guard
+        .entries
+        .values()
+        .filter(|entry| entry.slot == slot && entry.group == group)
+        .map(|entry| entry.offset.saturating_add(entry.len))
+        .max()
+        .unwrap_or(0);
+    for &(key, host) in weights {
+        if guard.entries.contains_key(&key) {
+            guard.prefetch_hits = guard.prefetch_hits.saturating_add(1);
+            continue;
+        }
+        cursor = cursor.div_ceil(256).saturating_mul(256);
+        let end = cursor.checked_add(host.len()).ok_or(-32)?;
+        if end > guard.slot_bytes {
+            return Err(-32);
+        }
+        let mut view = unsafe {
+            DeviceBuffer::<u8>::from_raw_parts(
+                base + cursor as u64,
+                host.len(),
+                crate::oxide_ctx().clone(),
+            )
+        };
+        view.copy_from_host(stream, host).map_err(|_| -3)?;
+        let _ = view.into_raw_parts();
+        guard.entries.insert(
+            key,
+            WeightEntry {
+                slot,
+                offset: cursor,
+                len: host.len(),
+                group,
+            },
+        );
+        guard.bytes = guard.bytes.saturating_add(host.len());
+        guard.h2d_bytes = guard.h2d_bytes.saturating_add(host.len() as u64);
+        guard.prefetch_misses = guard.prefetch_misses.saturating_add(1);
+        cursor = end;
+    }
+    guard.slot_groups[slot] = Some(group);
+    Ok(())
+}
+
+pub fn weight_cache_metrics() -> fellm_plugin_abi::c_abi::PluginWeightCacheMetrics {
+    let Ok(cache) = weight_cache().lock() else {
+        return fellm_plugin_abi::c_abi::PluginWeightCacheMetrics::default();
+    };
+    fellm_plugin_abi::c_abi::PluginWeightCacheMetrics {
+        resident_bytes: cache.bytes as u64,
+        h2d_bytes: cache.h2d_bytes,
+        prefetch_hits: cache.prefetch_hits,
+        prefetch_misses: cache.prefetch_misses,
+        evictions: cache.evictions,
+    }
+}
+
 /// Run `f` with a shared reference to the cached weight buffer.
-pub fn with_weight<R>(key: usize, f: impl FnOnce(&DeviceBuffer<u8>) -> R) -> Result<R, i32> {
+pub fn with_weight<R>(key: u64, f: impl FnOnce(&DeviceBuffer<u8>) -> R) -> Result<R, i32> {
     // Do not let the mutex guard temporary live across `f`. Multi-weight
     // macro-kernels nest `with_weight` calls and would otherwise self-deadlock.
     let external = {
@@ -111,7 +261,7 @@ pub fn with_weight<R>(key: usize, f: impl FnOnce(&DeviceBuffer<u8>) -> R) -> Res
             .lock()
             .map_err(|_| -30)?
             .iter()
-            .find_map(|(&(ptr, _), &binding)| (ptr == key).then_some(binding))
+            .find_map(|(&(ptr, _), &binding)| ((ptr as u64) == key).then_some(binding))
     };
     if let Some((ptr, len)) = external {
         let buffer =
@@ -120,12 +270,23 @@ pub fn with_weight<R>(key: usize, f: impl FnOnce(&DeviceBuffer<u8>) -> R) -> Res
         let _ = buffer.into_raw_parts();
         return Ok(result);
     }
-    let mut guard = weight_cache().lock().map_err(|_| -30)?;
-    guard.clock = guard.clock.wrapping_add(1);
-    let stamp = guard.clock;
-    let entry = guard.entries.get_mut(&key).ok_or(-31)?;
-    entry.stamp = stamp;
-    Ok(f(&entry.buf))
+    let (ptr, len, context) = {
+        let guard = weight_cache().lock().map_err(|_| -30)?;
+        let entry = guard.entries.get(&key).ok_or(-31)?;
+        let slot = entry.slot;
+        let offset = entry.offset;
+        let len = entry.len;
+        let _group = entry.group;
+        (
+            guard.slots[slot].cu_deviceptr() + offset as u64,
+            len,
+            crate::oxide_ctx().clone(),
+        )
+    };
+    let buffer = unsafe { DeviceBuffer::<u8>::from_raw_parts(ptr, len, context) };
+    let result = f(&buffer);
+    let _ = buffer.into_raw_parts();
+    Ok(result)
 }
 
 // --- f32 activation cache ----------------------------------------------------
