@@ -7,6 +7,10 @@ use cuda_host::cuda_module;
 pub const Q4K_BLOCK_BYTES: u32 = 144;
 /// Elements per Q4_K super-block.
 pub const Q4K_BLOCK_ELEMS: u32 = 256;
+/// Q5_K super-block size (GGUF / ggml).
+pub const Q5K_BLOCK_BYTES: u32 = 176;
+/// Elements per Q5_K super-block.
+pub const Q5K_BLOCK_ELEMS: u32 = 256;
 /// Q6_K super-block size (GGUF / ggml).
 pub const Q6K_BLOCK_BYTES: u32 = 210;
 /// Elements per Q6_K super-block.
@@ -69,6 +73,41 @@ pub mod kernels {
             // silu(x) = x / (1 + exp(-x))
             let s = g / (1.0 + (-g).exp());
             *o = s * u;
+        }
+    }
+
+    #[kernel]
+    pub fn sigmoid_gate(value: &[f32], gate: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(output) = out.get_mut(idx) {
+            *output = value[i] / (1.0 + (-gate[i]).exp());
+        }
+    }
+
+    #[kernel]
+    pub fn interleaved_head_select(
+        input: &[f32],
+        heads: u32,
+        width: u32,
+        lane: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= output.len() {
+            return;
+        }
+        let row_width = heads as usize * width as usize;
+        let row = linear / row_width;
+        let within_row = linear % row_width;
+        let head = within_row / width as usize;
+        let element = within_row % width as usize;
+        let source = row * row_width * 2
+            + (head * 2 + lane as usize) * width as usize
+            + element;
+        if let Some(value) = output.get_mut(idx) {
+            *value = input[source];
         }
     }
 
@@ -178,6 +217,53 @@ pub mod kernels {
     /// RoPE: rotate pairs in the first `rope_dim` of each head.
     ///
     /// `x` / `out` layout `[n_heads * head_dim]`. `inv_freqs` length `rope_dim/2`.
+    /// `pairing != 0` is NeoX / Qwen split-half (`x[i]` with `x[i + rope_dim/2]`).
+    #[inline]
+    fn apply_rope_at(
+        x: &[f32],
+        inv_freqs: &[f32],
+        n_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        pairing: u32,
+        position: f32,
+        total: u32,
+        i: usize,
+        out: &mut DisjointSlice<f32>,
+    ) {
+        if i >= total as usize {
+            return;
+        }
+        let d = i % head_dim as usize;
+        let base = i - d;
+        let rope = rope_dim as usize;
+        if d >= rope {
+            unsafe { *out.get_unchecked_mut(i) = x[i] };
+            return;
+        }
+        let split = pairing != 0;
+        let (first, second, freq) = if split {
+            let half = rope / 2;
+            if d >= half {
+                return;
+            }
+            (d, d + half, d)
+        } else {
+            if d % 2 == 1 {
+                return;
+            }
+            (d, d + 1, d / 2)
+        };
+        let theta = position * inv_freqs[freq];
+        let (s, c) = (theta.sin(), theta.cos());
+        let a = x[base + first];
+        let b = x[base + second];
+        unsafe {
+            *out.get_unchecked_mut(base + first) = a * c - b * s;
+            *out.get_unchecked_mut(base + second) = a * s + b * c;
+        }
+    }
+
     #[kernel]
     pub fn rope(
         x: &[f32],
@@ -185,39 +271,23 @@ pub mod kernels {
         n_heads: u32,
         head_dim: u32,
         rope_dim: u32,
+        pairing: u32,
         position: f32,
         total: u32,
         mut out: DisjointSlice<f32>,
     ) {
-        let idx = thread::index_1d();
-        let i = idx.get();
-        if i >= total as usize {
-            return;
-        }
-        let d = i % head_dim as usize;
-        let base = i - d;
-        let row = i / (n_heads as usize * head_dim as usize);
-
-        // Copy non-rotated dims; rotate even/odd pairs for d < rope_dim.
-        if d >= rope_dim as usize {
-            unsafe {
-                *out.get_unchecked_mut(i) = x[i];
-            }
-            return;
-        }
-        // Only even indices perform the pair write (to avoid races).
-        if d % 2 == 1 {
-            return;
-        }
-        let pair = d / 2;
-        let theta = (position + row as f32) * inv_freqs[pair];
-        let (s, c) = (theta.sin(), theta.cos());
-        let a = x[base + d];
-        let b = x[base + d + 1];
-        unsafe {
-            *out.get_unchecked_mut(base + d) = a * c - b * s;
-            *out.get_unchecked_mut(base + d + 1) = a * s + b * c;
-        }
+        apply_rope_at(
+            x,
+            inv_freqs,
+            n_heads,
+            head_dim,
+            rope_dim,
+            pairing,
+            position,
+            total,
+            thread::index_1d().get(),
+            &mut out,
+        );
     }
 
     /// Single-row decode RoPE reading position from the stable device control block.
@@ -230,32 +300,22 @@ pub mod kernels {
         n_heads: u32,
         head_dim: u32,
         rope_dim: u32,
+        pairing: u32,
         total: u32,
         mut out: DisjointSlice<f32>,
     ) {
-        let i = thread::index_1d().get();
-        if i >= total as usize {
-            return;
-        }
-        let d = i % head_dim as usize;
-        let base = i - d;
-        let row = i / (n_heads as usize * head_dim as usize);
-        if d >= rope_dim as usize {
-            unsafe { *out.get_unchecked_mut(i) = x[i] };
-            return;
-        }
-        if d % 2 == 1 {
-            return;
-        }
-        let position = control_u32(params, 4);
-        let theta = (position as f32 + row as f32) * inv_freqs[d / 2];
-        let (s, c) = (theta.sin(), theta.cos());
-        let a = x[base + d];
-        let b = x[base + d + 1];
-        unsafe {
-            *out.get_unchecked_mut(base + d) = a * c - b * s;
-            *out.get_unchecked_mut(base + d + 1) = a * s + b * c;
-        }
+        apply_rope_at(
+            x,
+            inv_freqs,
+            n_heads,
+            head_dim,
+            rope_dim,
+            pairing,
+            control_u32(params, 4) as f32,
+            total,
+            thread::index_1d().get(),
+            &mut out,
+        );
     }
 
     /// RoPE for independent physical-batch rows with arbitrary positions.
@@ -267,6 +327,7 @@ pub mod kernels {
         n_heads: u32,
         head_dim: u32,
         rope_dim: u32,
+        pairing: u32,
         total: u32,
         mut out: DisjointSlice<f32>,
     ) {
@@ -274,24 +335,19 @@ pub mod kernels {
         if i >= total as usize {
             return;
         }
-        let d = i % head_dim as usize;
-        let base = i - d;
         let row = i / (n_heads as usize * head_dim as usize);
-        if d >= rope_dim as usize {
-            unsafe { *out.get_unchecked_mut(i) = x[i] };
-            return;
-        }
-        if d % 2 == 1 {
-            return;
-        }
-        let theta = positions[row] as f32 * inv_freqs[d / 2];
-        let (s, c) = (theta.sin(), theta.cos());
-        let a = x[base + d];
-        let b = x[base + d + 1];
-        unsafe {
-            *out.get_unchecked_mut(base + d) = a * c - b * s;
-            *out.get_unchecked_mut(base + d + 1) = a * s + b * c;
-        }
+        apply_rope_at(
+            x,
+            inv_freqs,
+            n_heads,
+            head_dim,
+            rope_dim,
+            pairing,
+            positions[row] as f32,
+            total,
+            i,
+            &mut out,
+        );
     }
 
     #[inline]
@@ -540,6 +596,79 @@ pub mod kernels {
 
         if let Some(o) = out.get_mut(idx) {
             *o = acc;
+        }
+    }
+
+    /// Q5_K × f32 GEMV, including an optional fused residual.
+    #[kernel]
+    pub fn q5k_gemv_row(
+        w: &[u8],
+        x: &[f32],
+        residual: &[f32],
+        has_residual: u32,
+        out_dim: u32,
+        n_blocks: u32,
+        batch_rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= out_dim as usize * batch_rows as usize {
+            return;
+        }
+        let row = linear % out_dim as usize;
+        let batch = linear / out_dim as usize;
+        let row_off = row * (n_blocks * Q5K_BLOCK_BYTES) as usize;
+        let mut acc = if has_residual != 0 { residual[linear] } else { 0.0 };
+        let mut block = 0u32;
+        while block < n_blocks {
+            let base = row_off + block as usize * Q5K_BLOCK_BYTES as usize;
+            let d = f16_to_f32(u16::from_le_bytes([w[base], w[base + 1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([w[base + 2], w[base + 3]]));
+            let (scales, mins) = decode_scales_mins(
+                w[base + 4], w[base + 5], w[base + 6], w[base + 7],
+                w[base + 8], w[base + 9], w[base + 10], w[base + 11],
+                w[base + 12], w[base + 13], w[base + 14], w[base + 15],
+            );
+            let qh = base + 16;
+            let qs = base + 48;
+            let x_base = batch * n_blocks as usize * Q5K_BLOCK_ELEMS as usize
+                + block as usize * Q5K_BLOCK_ELEMS as usize;
+            let mut chunk = 0usize;
+            while chunk < 4 {
+                let qbase = qs + chunk * 32;
+                let low_bit = 1u8 << (chunk * 2);
+                let high_bit = 2u8 << (chunk * 2);
+                let mut low_dot = 0.0f32;
+                let mut low_sum = 0.0f32;
+                let mut high_dot = 0.0f32;
+                let mut high_sum = 0.0f32;
+                let mut lane = 0usize;
+                while lane < 32 {
+                    let low_x = x[x_base + chunk * 64 + lane];
+                    let high_x = x[x_base + chunk * 64 + 32 + lane];
+                    let low = (w[qbase + lane] & 0x0f)
+                        + if w[qh + lane] & low_bit != 0 { 16 } else { 0 };
+                    let high = (w[qbase + lane] >> 4)
+                        + if w[qh + lane] & high_bit != 0 { 16 } else { 0 };
+                    low_dot += low as f32 * low_x;
+                    low_sum += low_x;
+                    high_dot += high as f32 * high_x;
+                    high_sum += high_x;
+                    lane += 1;
+                }
+                let low_group = chunk * 2;
+                let high_group = low_group + 1;
+                acc += d * scales[low_group] as f32 * low_dot
+                    - dmin * mins[low_group] as f32 * low_sum;
+                acc += d * scales[high_group] as f32 * high_dot
+                    - dmin * mins[high_group] as f32 * high_sum;
+                chunk += 1;
+            }
+            block += 1;
+        }
+        if let Some(value) = out.get_mut(idx) {
+            *value = acc;
         }
     }
 
@@ -1091,18 +1220,82 @@ pub mod kernels {
     }
 
     #[inline]
-    fn q4k_q8_chunk(w: &[u8], blk: usize, j: usize, xp: u32, sx: i32, xs: f32) -> f32 {
-        let qp = q4k_signed4(w, blk, j);
-        let dot = dp4a_s32(qp, xp, 0) + 8 * sx;
+    fn q4k_load_d_dm(w: &[u8], blk: usize) -> (f32, f32) {
         let d = f16_to_f32(u16::from_le_bytes(unsafe {
             [*w.get_unchecked(blk), *w.get_unchecked(blk + 1)]
         }));
         let dm = f16_to_f32(u16::from_le_bytes(unsafe {
             [*w.get_unchecked(blk + 2), *w.get_unchecked(blk + 3)]
         }));
+        (d, dm)
+    }
+
+    #[inline]
+    fn q4k_q8_chunk_pre(
+        w: &[u8],
+        blk: usize,
+        j: usize,
+        xp: u32,
+        sx: i32,
+        xs: f32,
+        d: f32,
+        dm: f32,
+    ) -> f32 {
+        let qp = q4k_signed4(w, blk, j);
+        let dot = dp4a_s32(qp, xp, 0) + 8 * sx;
         let group = j / 32;
         xs * (d * q4k_scale(w, blk, group) as f32 * dot as f32
             - dm * q4k_min(w, blk, group) as f32 * sx as f32)
+    }
+
+    #[inline]
+    fn q4k_q8_chunk(w: &[u8], blk: usize, j: usize, xp: u32, sx: i32, xs: f32) -> f32 {
+        let (d, dm) = q4k_load_d_dm(w, blk);
+        q4k_q8_chunk_pre(w, blk, j, xp, sx, xs, d, dm)
+    }
+
+    #[inline]
+    fn q5k_packed4(w: &[u8], blk: usize, j: usize) -> u32 {
+        let byte_index = j % 32;
+        let chunk = j / 64;
+        let packed = load_u32(w, blk + 48 + chunk * 32 + byte_index);
+        let nibble = if j % 64 < 32 {
+            packed & 0x0f0f_0f0f
+        } else {
+            (packed >> 4) & 0x0f0f_0f0f
+        };
+        let qh = load_u32(w, blk + 16 + byte_index);
+        let bit_shift = if j % 64 < 32 {
+            chunk * 2
+        } else {
+            chunk * 2 + 1
+        };
+        let high = (qh >> bit_shift) & 0x0101_0101;
+        nibble + high * 16
+    }
+
+    #[inline]
+    fn q5k_q8_chunk_pre(
+        w: &[u8],
+        blk: usize,
+        j: usize,
+        xp: u32,
+        sx: i32,
+        xs: f32,
+        d: f32,
+        dm: f32,
+    ) -> f32 {
+        let qp = q5k_packed4(w, blk, j);
+        let dot = dp4a_s32(qp, xp, 0);
+        let group = j / 32;
+        xs * (d * q4k_scale(w, blk, group) as f32 * dot as f32
+            - dm * q4k_min(w, blk, group) as f32 * sx as f32)
+    }
+
+    #[inline]
+    fn q5k_q8_chunk(w: &[u8], blk: usize, j: usize, xp: u32, sx: i32, xs: f32) -> f32 {
+        let (d, dm) = q4k_load_d_dm(w, blk);
+        q5k_q8_chunk_pre(w, blk, j, xp, sx, xs, d, dm)
     }
 
     /// Q4_K matvec using Q8 activation chunks and packed signed-byte dots.
@@ -1215,12 +1408,10 @@ pub mod kernels {
         }
     }
 
-    /// Ada decode MMVQ policy: four warps cooperate on one output row.
-    /// Each warp walks a disjoint set of Q4_K super-blocks, which exposes
-    /// enough independent global-memory requests to hide quant metadata and
-    /// DP4A latency. This follows llama.cpp's one-row/four-warp decode policy.
+    /// One output row per block; eight warps split Q4_K super-blocks.
+    /// Prefer this when `n_blocks` is modest so the GPU stays occupancy-bound.
     #[kernel]
-    pub fn q4k_q8_gemv_multiwarp(
+    pub fn q4k_q8_gemv_warp(
         w: &[u8],
         qx: &[i8],
         x_scales: &[f32],
@@ -1237,7 +1428,7 @@ pub mod kernels {
         let warp_id = tid >> 5;
         let nwarps = (thread::blockDim_x() as usize) >> 5;
         let linear_row = thread::blockIdx_x() as usize;
-        if linear_row >= out_dim as usize * batch_rows as usize || warp_id >= nwarps {
+        if linear_row >= out_dim as usize * batch_rows as usize {
             return;
         }
         let row = linear_row % out_dim as usize;
@@ -1248,6 +1439,7 @@ pub mod kernels {
         let mut block = warp_id;
         while block < n_blocks as usize {
             let blk = row * row_bytes + block * Q4K_BLOCK_BYTES as usize;
+            let (d, dm) = q4k_load_d_dm(w, blk);
             let mut half = 0usize;
             while half < 2 {
                 let j = half * 128 + lane * 4;
@@ -1259,7 +1451,7 @@ pub mod kernels {
                 let x3 = (xp >> 24) as u8 as i8;
                 let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
                 let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
-                sum += q4k_q8_chunk(w, blk, j, xp, sx, xs);
+                sum += q4k_q8_chunk_pre(w, blk, j, xp, sx, xs, d, dm);
                 half += 1;
             }
             block += nwarps;
@@ -1291,6 +1483,124 @@ pub mod kernels {
                     0.0
                 };
                 unsafe { *out.get_unchecked_mut(linear_row) = total + skip };
+            }
+        }
+    }
+
+    /// Decode MMVQ: four output rows share the Q8 activation.
+    #[kernel]
+    pub fn q4k_q8_gemv_multiwarp(
+        w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        residual: &[f32],
+        fuse_residual: u32,
+        out_dim: u32,
+        n_blocks: u32,
+        batch_rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let nwarps = (thread::blockDim_x() as usize) >> 5;
+        let groups = (out_dim as usize + 3) / 4;
+        let group = thread::blockIdx_x() as usize;
+        if group >= groups * batch_rows as usize {
+            return;
+        }
+        let batch = group / groups;
+        let row0 = (group % groups) * 4;
+        let row_bytes = n_blocks as usize * Q4K_BLOCK_BYTES as usize;
+        let x_base = batch * n_blocks as usize * Q4K_BLOCK_ELEMS as usize;
+        let mut sums = [0.0f32; 4];
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let mut d = [0.0f32; 4];
+            let mut dm = [0.0f32; 4];
+            let mut r = 0usize;
+            while r < 4 {
+                if row0 + r < out_dim as usize {
+                    let blk = (row0 + r) * row_bytes + block * Q4K_BLOCK_BYTES as usize;
+                    let loaded = q4k_load_d_dm(w, blk);
+                    d[r] = loaded.0;
+                    dm[r] = loaded.1;
+                }
+                r += 1;
+            }
+            let mut half = 0usize;
+            while half < 2 {
+                let j = half * 128 + lane * 4;
+                let xi = x_base + block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
+                let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                let blk0 = row0 * row_bytes + block * Q4K_BLOCK_BYTES as usize;
+                sums[0] += q4k_q8_chunk_pre(w, blk0, j, xp, sx, xs, d[0], dm[0]);
+                sums[1] += q4k_q8_chunk_pre(w, blk0 + row_bytes, j, xp, sx, xs, d[1], dm[1]);
+                sums[2] += q4k_q8_chunk_pre(w, blk0 + 2 * row_bytes, j, xp, sx, xs, d[2], dm[2]);
+                sums[3] += q4k_q8_chunk_pre(w, blk0 + 3 * row_bytes, j, xp, sx, xs, d[3], dm[3]);
+                half += 1;
+            }
+            block += nwarps;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            let mut r = 0usize;
+            while r < 4 {
+                sums[r] += warp::shuffle_down_f32(sums[r], stride);
+                r += 1;
+            }
+            stride /= 2;
+        }
+        if lane == 0 {
+            let mut r = 0usize;
+            while r < 4 {
+                unsafe { WARP_SUMS[warp_id * 4 + r] = sums[r] };
+                r += 1;
+            }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut totals = [0.0f32; 4];
+            let mut r = 0usize;
+            while r < 4 {
+                totals[r] = if lane < nwarps {
+                    unsafe { WARP_SUMS[lane * 4 + r] }
+                } else {
+                    0.0
+                };
+                r += 1;
+            }
+            let mut width = 16u32;
+            while width > 0 {
+                r = 0;
+                while r < 4 {
+                    totals[r] += warp::shuffle_down_f32(totals[r], width);
+                    r += 1;
+                }
+                width /= 2;
+            }
+            if lane == 0 {
+                r = 0;
+                while r < 4 {
+                    let row = row0 + r;
+                    if row < out_dim as usize {
+                        let linear = batch * out_dim as usize + row;
+                        let skip = if fuse_residual != 0 {
+                            unsafe { *residual.get_unchecked(linear) }
+                        } else {
+                            0.0
+                        };
+                        unsafe { *out.get_unchecked_mut(linear) = totals[r] + skip };
+                    }
+                    r += 1;
+                }
             }
         }
     }
@@ -1335,6 +1645,280 @@ pub mod kernels {
                 let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
                 gate += q4k_q8_chunk(gate_w, gate_blk, j, xp, sx, xs);
                 up += q4k_q8_chunk(up_w, up_blk, j, xp, sx, xs);
+                half += 1;
+            }
+            block += 4;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            gate += warp::shuffle_down_f32(gate, stride);
+            up += warp::shuffle_down_f32(up, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                GATE_SUMS[warp_id] = gate;
+                UP_SUMS[warp_id] = up;
+            }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut gate_total = if lane < 4 {
+                unsafe { GATE_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut up_total = if lane < 4 {
+                unsafe { UP_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut width = 16u32;
+            while width > 0 {
+                gate_total += warp::shuffle_down_f32(gate_total, width);
+                up_total += warp::shuffle_down_f32(up_total, width);
+                width /= 2;
+            }
+            if lane == 0 {
+                let silu = gate_total / (1.0 + (-gate_total).exp());
+                unsafe { *out.get_unchecked_mut(row) = silu * up_total };
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn q5k_q8_gemv_warp(
+        w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        residual: &[f32],
+        fuse_residual: u32,
+        out_dim: u32,
+        n_blocks: u32,
+        batch_rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let nwarps = (thread::blockDim_x() as usize) >> 5;
+        let linear_row = thread::blockIdx_x() as usize;
+        if linear_row >= out_dim as usize * batch_rows as usize {
+            return;
+        }
+        let row = linear_row % out_dim as usize;
+        let batch = linear_row / out_dim as usize;
+        let row_bytes = n_blocks as usize * Q5K_BLOCK_BYTES as usize;
+        let x_base = batch * n_blocks as usize * Q5K_BLOCK_ELEMS as usize;
+        let mut sum = 0.0f32;
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let blk = row * row_bytes + block * Q5K_BLOCK_BYTES as usize;
+            let (d, dm) = q4k_load_d_dm(w, blk);
+            let mut half = 0usize;
+            while half < 2 {
+                let j = half * 128 + lane * 4;
+                let xi = x_base + block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
+                let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                sum += q5k_q8_chunk_pre(w, blk, j, xp, sx, xs, d, dm);
+                half += 1;
+            }
+            block += nwarps;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            sum += warp::shuffle_down_f32(sum, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe { WARP_SUMS[warp_id] = sum };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut total = if lane < nwarps {
+                unsafe { WARP_SUMS[lane] }
+            } else {
+                0.0
+            };
+            let mut width = 16u32;
+            while width > 0 {
+                total += warp::shuffle_down_f32(total, width);
+                width /= 2;
+            }
+            if lane == 0 {
+                let skip = if fuse_residual != 0 {
+                    unsafe { *residual.get_unchecked(linear_row) }
+                } else {
+                    0.0
+                };
+                unsafe { *out.get_unchecked_mut(linear_row) = total + skip };
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn q5k_q8_gemv_multiwarp(
+        w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        residual: &[f32],
+        fuse_residual: u32,
+        out_dim: u32,
+        n_blocks: u32,
+        batch_rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let nwarps = (thread::blockDim_x() as usize) >> 5;
+        let groups = (out_dim as usize + 3) / 4;
+        let group = thread::blockIdx_x() as usize;
+        if group >= groups * batch_rows as usize {
+            return;
+        }
+        let batch = group / groups;
+        let row0 = (group % groups) * 4;
+        let row_bytes = n_blocks as usize * Q5K_BLOCK_BYTES as usize;
+        let x_base = batch * n_blocks as usize * Q5K_BLOCK_ELEMS as usize;
+        let mut sums = [0.0f32; 4];
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let mut d = [0.0f32; 4];
+            let mut dm = [0.0f32; 4];
+            let mut r = 0usize;
+            while r < 4 {
+                if row0 + r < out_dim as usize {
+                    let blk = (row0 + r) * row_bytes + block * Q5K_BLOCK_BYTES as usize;
+                    let loaded = q4k_load_d_dm(w, blk);
+                    d[r] = loaded.0;
+                    dm[r] = loaded.1;
+                }
+                r += 1;
+            }
+            let mut half = 0usize;
+            while half < 2 {
+                let j = half * 128 + lane * 4;
+                let xi = x_base + block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
+                let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                let blk0 = row0 * row_bytes + block * Q5K_BLOCK_BYTES as usize;
+                sums[0] += q5k_q8_chunk_pre(w, blk0, j, xp, sx, xs, d[0], dm[0]);
+                sums[1] += q5k_q8_chunk_pre(w, blk0 + row_bytes, j, xp, sx, xs, d[1], dm[1]);
+                sums[2] += q5k_q8_chunk_pre(w, blk0 + 2 * row_bytes, j, xp, sx, xs, d[2], dm[2]);
+                sums[3] += q5k_q8_chunk_pre(w, blk0 + 3 * row_bytes, j, xp, sx, xs, d[3], dm[3]);
+                half += 1;
+            }
+            block += nwarps;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            let mut r = 0usize;
+            while r < 4 {
+                sums[r] += warp::shuffle_down_f32(sums[r], stride);
+                r += 1;
+            }
+            stride /= 2;
+        }
+        if lane == 0 {
+            let mut r = 0usize;
+            while r < 4 {
+                unsafe { WARP_SUMS[warp_id * 4 + r] = sums[r] };
+                r += 1;
+            }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let mut totals = [0.0f32; 4];
+            let mut r = 0usize;
+            while r < 4 {
+                totals[r] = if lane < nwarps {
+                    unsafe { WARP_SUMS[lane * 4 + r] }
+                } else {
+                    0.0
+                };
+                r += 1;
+            }
+            let mut width = 16u32;
+            while width > 0 {
+                r = 0;
+                while r < 4 {
+                    totals[r] += warp::shuffle_down_f32(totals[r], width);
+                    r += 1;
+                }
+                width /= 2;
+            }
+            if lane == 0 {
+                r = 0;
+                while r < 4 {
+                    let row = row0 + r;
+                    if row < out_dim as usize {
+                        let linear = batch * out_dim as usize + row;
+                        let skip = if fuse_residual != 0 {
+                            unsafe { *residual.get_unchecked(linear) }
+                        } else {
+                            0.0
+                        };
+                        unsafe { *out.get_unchecked_mut(linear) = totals[r] + skip };
+                    }
+                    r += 1;
+                }
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn q5k_gate_up_swiglu_multiwarp(
+        gate_w: &[u8],
+        up_w: &[u8],
+        qx: &[i8],
+        x_scales: &[f32],
+        out_dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut GATE_SUMS: SharedArray<f32, 4> = SharedArray::UNINIT;
+        static mut UP_SUMS: SharedArray<f32, 4> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let row = thread::blockIdx_x() as usize;
+        if row >= out_dim as usize || warp_id >= 4 {
+            return;
+        }
+        let row_bytes = n_blocks as usize * Q5K_BLOCK_BYTES as usize;
+        let mut gate = 0.0f32;
+        let mut up = 0.0f32;
+        let mut block = warp_id;
+        while block < n_blocks as usize {
+            let gate_blk = row * row_bytes + block * Q5K_BLOCK_BYTES as usize;
+            let up_blk = gate_blk;
+            let mut half = 0usize;
+            while half < 2 {
+                let j = half * 128 + lane * 4;
+                let xi = block * 256 + j;
+                let xp = load_i8x4(qx, xi);
+                let x0 = xp as u8 as i8;
+                let x1 = (xp >> 8) as u8 as i8;
+                let x2 = (xp >> 16) as u8 as i8;
+                let x3 = (xp >> 24) as u8 as i8;
+                let sx = x0 as i32 + x1 as i32 + x2 as i32 + x3 as i32;
+                let xs = unsafe { *x_scales.get_unchecked(xi / 32) };
+                gate += q5k_q8_chunk(gate_w, gate_blk, j, xp, sx, xs);
+                up += q5k_q8_chunk(up_w, up_blk, j, xp, sx, xs);
                 half += 1;
             }
             block += 4;
@@ -2551,6 +3135,394 @@ pub mod kernels {
         }
     }
 
+    /// Gather BF16 embedding rows and promote to f32 on device.
+    #[kernel]
+    pub fn embedding_bf16_rows(
+        table: &[u8],
+        ids: &[u32],
+        rows: u32,
+        dim: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let linear = index.get();
+        if linear >= rows as usize * dim as usize {
+            return;
+        }
+        let row = linear / dim as usize;
+        let column = linear % dim as usize;
+        let element = ids[row] as usize * dim as usize + column;
+        let lo = table[element * 2] as u32;
+        let hi = table[element * 2 + 1] as u32;
+        let value = f32::from_bits((lo | (hi << 8)) << 16);
+        if let Some(output) = out.get_mut(index) {
+            *output = value;
+        }
+    }
+
+    /// BF16 row-major matrix times one or more f32 activation rows.
+    #[kernel]
+    pub fn bf16_matmul_rows(
+        weights: &[u8],
+        x: &[f32],
+        out_dim: u32,
+        in_dim: u32,
+        rows: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let linear = index.get();
+        if linear >= rows as usize * out_dim as usize {
+            return;
+        }
+        let row = linear / out_dim as usize;
+        let output = linear % out_dim as usize;
+        let weight_base = output * in_dim as usize;
+        let input_base = row * in_dim as usize;
+        let mut sum = 0.0f32;
+        let mut column = 0usize;
+        while column < in_dim as usize {
+            let element = weight_base + column;
+            let lo = weights[element * 2] as u32;
+            let hi = weights[element * 2 + 1] as u32;
+            let weight = f32::from_bits((lo | (hi << 8)) << 16);
+            sum += weight * x[input_base + column];
+            column += 1;
+        }
+        if let Some(value) = out.get_mut(index) {
+            *value = sum;
+        }
+    }
+
+    #[kernel]
+    pub fn f32_matmul_rows(
+        weight: &[f32],
+        input: &[f32],
+        out_dim: u32,
+        in_dim: u32,
+        rows: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= out_dim as usize * rows as usize {
+            return;
+        }
+        let row = linear / out_dim as usize;
+        let channel = linear % out_dim as usize;
+        let mut sum = 0.0f32;
+        let mut column = 0usize;
+        while column < in_dim as usize {
+            sum += weight[channel * in_dim as usize + column]
+                * input[row * in_dim as usize + column];
+            column += 1;
+        }
+        if let Some(value) = output.get_mut(idx) {
+            *value = sum;
+        }
+    }
+
+    #[kernel]
+    pub fn f32_gemv_warp(
+        weight: &[f32],
+        input: &[f32],
+        out_dim: u32,
+        in_dim: u32,
+        rows: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        if tid >= 32 {
+            return;
+        }
+        let lane = tid;
+        let linear = thread::blockIdx_x() as usize;
+        if linear >= out_dim as usize * rows as usize {
+            return;
+        }
+        let row = linear / out_dim as usize;
+        let channel = linear % out_dim as usize;
+        let mut sum = 0.0f32;
+        let mut column = lane;
+        while column < in_dim as usize {
+            sum += weight[channel * in_dim as usize + column]
+                * input[row * in_dim as usize + column];
+            column += 32;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            sum += warp::shuffle_down_f32(sum, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe { *output.get_unchecked_mut(linear) = sum };
+        }
+    }
+
+    #[kernel]
+    pub fn gdn_convolve(
+        mut mixed: DisjointSlice<f32>,
+        convolution: &[f32],
+        mut state: DisjointSlice<f32>,
+        mixed_width: u32,
+        kernel: u32,
+        rows: u32,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= mixed_width as usize * rows as usize {
+            return;
+        }
+        let row = linear / mixed_width as usize;
+        let channel = linear % mixed_width as usize;
+        let history = kernel.saturating_sub(1) as usize;
+        let state_base = row * mixed_width as usize * history + channel * history;
+        let kernel_base = channel * kernel as usize;
+        let current = unsafe { *mixed.get_unchecked_mut(linear) };
+        let mut value = current * convolution[kernel_base + history];
+        let mut time = 0usize;
+        while time < history {
+            value += unsafe { *state.get_unchecked_mut(state_base + time) }
+                * convolution[kernel_base + time];
+            time += 1;
+        }
+        time = 0;
+        while time < history {
+            let next = if time + 1 < history {
+                unsafe { *state.get_unchecked_mut(state_base + time + 1) }
+            } else {
+                current
+            };
+            unsafe { *state.get_unchecked_mut(state_base + time) = next };
+            time += 1;
+        }
+        unsafe { *mixed.get_unchecked_mut(linear) = value / (1.0 + (-value).exp()) };
+    }
+
+    #[kernel]
+    pub fn gdn_recurrence(
+        mixed: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+        dt_bias: &[f32],
+        decay: &[f32],
+        mut state: DisjointSlice<f32>,
+        key_heads: u32,
+        value_heads: u32,
+        state_size: u32,
+        mixed_width: u32,
+        epsilon: f32,
+        rows: u32,
+        mut recurrent: DisjointSlice<f32>,
+    ) {
+        static mut WQ: SharedArray<f32, 8> = SharedArray::UNINIT;
+        static mut WK: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let bdx = thread::blockDim_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let linear = thread::blockIdx_x() as usize;
+        if linear >= value_heads as usize * rows as usize {
+            return;
+        }
+        let row = linear / value_heads as usize;
+        let value_head = linear % value_heads as usize;
+        let key_head = value_head % key_heads as usize;
+        let size = state_size as usize;
+        let qk_width = key_heads as usize * size;
+        let mixed_base = row * mixed_width as usize;
+        let query_base = mixed_base + key_head * size;
+        let key_base = mixed_base + qk_width + key_head * size;
+        let value_base = mixed_base + 2 * qk_width + value_head * size;
+        let mut q_magnitude = 0.0f32;
+        let mut k_magnitude = 0.0f32;
+        let mut index = tid;
+        while index < size {
+            q_magnitude += mixed[query_base + index] * mixed[query_base + index];
+            k_magnitude += mixed[key_base + index] * mixed[key_base + index];
+            index += bdx;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            q_magnitude += warp::shuffle_down_f32(q_magnitude, stride);
+            k_magnitude += warp::shuffle_down_f32(k_magnitude, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                WQ[warp_id] = q_magnitude;
+                WK[warp_id] = k_magnitude;
+            }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let nwarps = bdx >> 5;
+            let mut q_total = if lane < nwarps {
+                unsafe { WQ[lane] }
+            } else {
+                0.0
+            };
+            let mut k_total = if lane < nwarps {
+                unsafe { WK[lane] }
+            } else {
+                0.0
+            };
+            stride = 16;
+            while stride > 0 {
+                q_total += warp::shuffle_down_f32(q_total, stride);
+                k_total += warp::shuffle_down_f32(k_total, stride);
+                stride /= 2;
+            }
+            if lane == 0 {
+                unsafe {
+                    WQ[0] = q_total;
+                    WK[0] = k_total;
+                }
+            }
+        }
+        thread::sync_threads();
+        q_magnitude = unsafe { WQ[0] };
+        k_magnitude = unsafe { WK[0] };
+        let q_inverse = q_magnitude.sqrt().max(epsilon).recip();
+        let k_inverse = k_magnitude.sqrt().max(epsilon).recip();
+        let control = row * value_heads as usize + value_head;
+        let alpha_value = alpha[control] + dt_bias[value_head];
+        let softplus = if alpha_value > 20.0 {
+            alpha_value
+        } else if alpha_value < -20.0 {
+            alpha_value.exp()
+        } else {
+            (1.0 + alpha_value.exp()).ln()
+        };
+        let retention = (decay[value_head] * softplus).exp();
+        let update_rate = 1.0 / (1.0 + (-beta[control]).exp());
+        let state_base = (row * value_heads as usize + value_head) * size * size;
+        let output_base = (row * value_heads as usize + value_head) * size;
+        let scale = (size as f32).sqrt().recip();
+        let mut value_index = tid;
+        while value_index < size {
+            let state_row = state_base + value_index * size;
+            let mut predicted = 0.0f32;
+            index = 0;
+            while index < size {
+                let retained = unsafe { *state.get_unchecked_mut(state_row + index) } * retention;
+                unsafe { *state.get_unchecked_mut(state_row + index) = retained };
+                predicted += retained * mixed[key_base + index] * k_inverse;
+                index += 1;
+            }
+            let delta = (mixed[value_base + value_index] - predicted) * update_rate;
+            let mut projected = 0.0f32;
+            index = 0;
+            while index < size {
+                let updated = unsafe { *state.get_unchecked_mut(state_row + index) }
+                    + delta * mixed[key_base + index] * k_inverse;
+                unsafe { *state.get_unchecked_mut(state_row + index) = updated };
+                projected += updated * mixed[query_base + index] * q_inverse;
+                index += 1;
+            }
+            unsafe {
+                *recurrent.get_unchecked_mut(output_base + value_index) = projected * scale
+            };
+            value_index += bdx;
+        }
+    }
+
+    #[kernel]
+    pub fn gdn_norm_gate(
+        mut recurrent: DisjointSlice<f32>,
+        z: &[f32],
+        norm: &[f32],
+        value_heads: u32,
+        state_size: u32,
+        epsilon: f32,
+        rows: u32,
+    ) {
+        static mut WN: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let bdx = thread::blockDim_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        let linear = thread::blockIdx_x() as usize;
+        if linear >= value_heads as usize * rows as usize {
+            return;
+        }
+        let size = state_size as usize;
+        let base = linear * size;
+        let mut sum = 0.0f32;
+        let mut element = tid;
+        while element < size {
+            let value = unsafe { *recurrent.get_unchecked_mut(base + element) };
+            sum += value * value;
+            element += bdx;
+        }
+        let mut stride = 16u32;
+        while stride > 0 {
+            sum += warp::shuffle_down_f32(sum, stride);
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe { WN[warp_id] = sum };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            let nwarps = bdx >> 5;
+            let mut total = if lane < nwarps {
+                unsafe { WN[lane] }
+            } else {
+                0.0
+            };
+            stride = 16;
+            while stride > 0 {
+                total += warp::shuffle_down_f32(total, stride);
+                stride /= 2;
+            }
+            if lane == 0 {
+                unsafe { WN[0] = total };
+            }
+        }
+        thread::sync_threads();
+        sum = unsafe { WN[0] };
+        let inverse = (sum / size as f32 + epsilon).sqrt().recip();
+        element = tid;
+        while element < size {
+            let gate = z[base + element];
+            let value = unsafe { *recurrent.get_unchecked_mut(base + element) }
+                * inverse
+                * norm[element]
+                * (gate / (1.0 + (-gate).exp()));
+            unsafe { *recurrent.get_unchecked_mut(base + element) = value };
+            element += bdx;
+        }
+    }
+
+    /// Concatenate two contiguous f32 tensors along their last dimension.
+    #[kernel]
+    pub fn concat_last_f32(
+        left: &[f32],
+        right: &[f32],
+        rows: u32,
+        left_width: u32,
+        right_width: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let linear = index.get();
+        let output_width = left_width as usize + right_width as usize;
+        if linear >= rows as usize * output_width {
+            return;
+        }
+        let row = linear / output_width;
+        let column = linear % output_width;
+        let value = if column < left_width as usize {
+            left[row * left_width as usize + column]
+        } else {
+            right[row * right_width as usize + column - left_width as usize]
+        };
+        if let Some(output) = out.get_mut(index) {
+            *output = value;
+        }
+    }
+
     /// Batched ShortConv recurrence with independent state per row.
     #[kernel]
     pub fn shortconv_mix_rows(
@@ -2708,6 +3680,89 @@ pub mod kernels {
         };
         if let Some(value) = out.get_mut(idx) {
             *value = d * scales[group] as f32 * q - dmin * mins[group] as f32;
+        }
+    }
+
+    #[inline]
+    fn q5k_dequant_at(w: &[u8], blk: usize, j: usize) -> f32 {
+        let d = f16_to_f32(u16::from_le_bytes([w[blk], w[blk + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([w[blk + 2], w[blk + 3]]));
+        let (scales, mins) = decode_scales_mins(
+            w[blk + 4],
+            w[blk + 5],
+            w[blk + 6],
+            w[blk + 7],
+            w[blk + 8],
+            w[blk + 9],
+            w[blk + 10],
+            w[blk + 11],
+            w[blk + 12],
+            w[blk + 13],
+            w[blk + 14],
+            w[blk + 15],
+        );
+        let group = j / 32;
+        let lane = j % 32;
+        let chunk = j / 64;
+        let qbase = blk + 48 + chunk * 32;
+        let bit = if j % 64 < 32 {
+            1u8 << (chunk * 2)
+        } else {
+            2u8 << (chunk * 2)
+        };
+        let q = if j % 64 < 32 {
+            (w[qbase + lane] & 15) + if w[blk + 16 + lane] & bit != 0 { 16 } else { 0 }
+        } else {
+            (w[qbase + lane] >> 4) + if w[blk + 16 + lane] & bit != 0 { 16 } else { 0 }
+        };
+        d * scales[group] as f32 * q as f32 - dmin * mins[group] as f32
+    }
+
+    #[kernel]
+    pub fn embedding_q5k_row(
+        w: &[u8],
+        params: &[u8],
+        dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= dim as usize {
+            return;
+        }
+        let token_id = control_u32(params, 0);
+        let row_bytes = (n_blocks * Q5K_BLOCK_BYTES) as usize;
+        let b = i / Q5K_BLOCK_ELEMS as usize;
+        let j = i % Q5K_BLOCK_ELEMS as usize;
+        let blk = token_id as usize * row_bytes + b * Q5K_BLOCK_BYTES as usize;
+        if let Some(o) = out.get_mut(idx) {
+            *o = q5k_dequant_at(w, blk, j);
+        }
+    }
+
+    #[kernel]
+    pub fn embedding_q5k_rows(
+        w: &[u8],
+        ids: &[u32],
+        rows: u32,
+        dim: u32,
+        n_blocks: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= rows as usize * dim as usize {
+            return;
+        }
+        let row = linear / dim as usize;
+        let i = linear % dim as usize;
+        let row_bytes = n_blocks as usize * Q5K_BLOCK_BYTES as usize;
+        let b = i / Q5K_BLOCK_ELEMS as usize;
+        let j = i % Q5K_BLOCK_ELEMS as usize;
+        let blk = ids[row] as usize * row_bytes + b * Q5K_BLOCK_BYTES as usize;
+        if let Some(value) = out.get_mut(idx) {
+            *value = q5k_dequant_at(w, blk, j);
         }
     }
 
@@ -3117,6 +4172,17 @@ pub mod kernels {
     ///
     /// Launch with `for_num_elems(tokens_stride)`.
     #[kernel]
+    pub fn kv_write_contiguous_f32(row: &[f32], mut cache: DisjointSlice<f32>, offset: u32) {
+        let i = thread::index_1d().get() as u32;
+        if i < row.len() as u32 {
+            unsafe {
+                *cache.get_unchecked_mut(offset as usize + i as usize) = row[i as usize];
+            }
+        }
+    }
+
+    /// Write one f32 KV row into the paged f16 arena (device).
+    #[kernel]
     pub fn kv_write_row(
         row: &[f32],
         mut arena: DisjointSlice<u8>,
@@ -3397,18 +4463,18 @@ pub mod kernels {
 
     /// Decode attention with one cooperative warp per query head.
     ///
-    /// Lanes split `head_dim`, reduce Q·K cooperatively, and retain up to four
-    /// V accumulators in registers (head dimensions through 128). This replaces
-    /// the old one-thread-per-head decode path on supported model shapes.
+    /// Lanes split `head_dim` and keep eight V accumulators (through 256).
+    /// Sequence length is read from `DeviceStepParams` so CUDA graph replay
+    /// can extend context without recapturing.
     #[kernel]
     pub fn attention_paged_warp(
         q: &[f32],
         arena: &[u8],
         block_table: &[u32],
+        params: &[u8],
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
-        seq: u32,
         scale: f32,
         layer: u32,
         n_logical: u32,
@@ -3419,10 +4485,11 @@ pub mod kernels {
     ) {
         let lane = thread::threadIdx_x() as usize;
         let head = thread::blockIdx_x() as u32;
-        if head >= n_heads || lane >= 32 || head_dim > 128 {
+        if head >= n_heads || lane >= 32 || head_dim > 256 {
             return;
         }
         let hd = head_dim as usize;
+        let seq = control_u32(params, 8);
         let n_kv = n_kv_heads.max(1);
         let kv_group = (n_heads / n_kv).max(1);
         let kv_h = (head / kv_group) as usize;
@@ -3437,6 +4504,10 @@ pub mod kernels {
         let mut a1 = 0.0f32;
         let mut a2 = 0.0f32;
         let mut a3 = 0.0f32;
+        let mut a4 = 0.0f32;
+        let mut a5 = 0.0f32;
+        let mut a6 = 0.0f32;
+        let mut a7 = 0.0f32;
         let mut running_max = 0.0f32;
         let mut running_sum = 0.0f32;
         let mut t = 0usize;
@@ -3505,9 +4576,45 @@ pub mod kernels {
                 };
                 a3 = a3 * alpha + probability * f16_to_f32(bits);
             }
+            let d4 = lane + 128;
+            if d4 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d4 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d4 * 2 + 1) as u16) << 8)
+                };
+                a4 = a4 * alpha + probability * f16_to_f32(bits);
+            }
+            let d5 = lane + 160;
+            if d5 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d5 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d5 * 2 + 1) as u16) << 8)
+                };
+                a5 = a5 * alpha + probability * f16_to_f32(bits);
+            }
+            let d6 = lane + 192;
+            if d6 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d6 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d6 * 2 + 1) as u16) << 8)
+                };
+                a6 = a6 * alpha + probability * f16_to_f32(bits);
+            }
+            let d7 = lane + 224;
+            if d7 < hd {
+                let bits = unsafe {
+                    *arena.get_unchecked(v_base + d7 * 2) as u16
+                        | ((*arena.get_unchecked(v_base + d7 * 2 + 1) as u16) << 8)
+                };
+                a7 = a7 * alpha + probability * f16_to_f32(bits);
+            }
             t += 1;
         }
-        let inv_l = 1.0 / running_sum;
+        let inv_l = if running_sum > 0.0 {
+            1.0 / running_sum
+        } else {
+            0.0
+        };
         if lane < hd {
             unsafe {
                 *out.get_unchecked_mut(q_base + lane) = a0 * inv_l;
@@ -3526,6 +4633,26 @@ pub mod kernels {
         if lane + 96 < hd {
             unsafe {
                 *out.get_unchecked_mut(q_base + lane + 96) = a3 * inv_l;
+            }
+        }
+        if lane + 128 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 128) = a4 * inv_l;
+            }
+        }
+        if lane + 160 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 160) = a5 * inv_l;
+            }
+        }
+        if lane + 192 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 192) = a6 * inv_l;
+            }
+        }
+        if lane + 224 < hd {
+            unsafe {
+                *out.get_unchecked_mut(q_base + lane + 224) = a7 * inv_l;
             }
         }
     }

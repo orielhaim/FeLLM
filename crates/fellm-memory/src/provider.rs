@@ -6,7 +6,20 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+
+fn short_read_error(path: &Path, offset: u64, requested: usize, got: usize) -> FellmError {
+    let file_len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    FellmError::other(format!(
+        "corrupt/truncated GGUF shard: short storage read path={} offset={} requested={} got={} file_size={}",
+        path.display(),
+        offset,
+        requested,
+        got,
+        file_len
+    ))
+}
 
 /// Storage-side transfer source. Providers fill bounded caller-owned staging buffers.
 pub trait TransferProvider: Send + Sync {
@@ -52,12 +65,14 @@ impl TransferProvider for MmapProvider {
 /// Explicit bounded file reads. Multiple provider instances can be used as an async read pool.
 pub struct FileProvider {
     file: File,
+    path: PathBuf,
 }
 
 /// Native unbuffered provider for sector-aligned storage objects.
 #[cfg(any(target_os = "linux", windows))]
 pub struct DirectFileProvider {
     file: File,
+    path: PathBuf,
     #[cfg(windows)]
     file_len: u64,
     #[cfg(windows)]
@@ -74,7 +89,10 @@ impl DirectFileProvider {
             .custom_flags(0o40000)
             .open(path.as_ref())
             .map_err(FellmError::Io)?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path: path.as_ref().to_path_buf(),
+        })
     }
 }
 
@@ -93,10 +111,42 @@ impl DirectFileProvider {
         let file_len = file.metadata().map_err(FellmError::Io)?.len();
         Ok(Self {
             file,
+            path: path.as_ref().to_path_buf(),
             file_len,
             fallback: FileProvider::open(path.as_ref())?,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_direct_loop(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    buf: &mut [u8],
+    logical: usize,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut read = 0usize;
+    while read < buf.len() {
+        let count = file
+            .read_at(&mut buf[read..], offset.saturating_add(read as u64))
+            .map_err(FellmError::Io)?;
+        if count == 0 {
+            if read >= logical {
+                return Ok(());
+            }
+            return Err(short_read_error(path, offset, logical, read));
+        }
+        read += count;
+        if read >= logical && read >= buf.len() {
+            break;
+        }
+    }
+    if read < logical {
+        return Err(short_read_error(path, offset, logical, read));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -107,29 +157,25 @@ impl TransferProvider for DirectFileProvider {
 
     fn read_at(&self, offset: u64, target: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        if !offset.is_multiple_of(4096)
-            || !target.len().is_multiple_of(4096)
-            || !(target.as_ptr() as usize).is_multiple_of(4096)
-        {
+        if !offset.is_multiple_of(4096) {
             return Err(FellmError::other(
-                "O_DIRECT read requires 4096-byte aligned offset, length, and staging buffer",
+                "O_DIRECT read requires a 4096-byte aligned offset",
             ));
         }
-        let mut read = 0usize;
-        while read < target.len() {
-            let count = self
-                .file
-                .read_at(&mut target[read..], offset.saturating_add(read as u64))
-                .map_err(FellmError::Io)?;
-            if count == 0 {
-                if read > 0 {
-                    target[read..].fill(0);
-                    return Ok(());
-                }
-                return Err(FellmError::other("unexpected EOF in O_DIRECT read"));
-            }
-            read += count;
+        let logical = target.len();
+        let physical = logical.next_multiple_of(4096);
+        if physical == logical && (target.as_ptr() as usize).is_multiple_of(4096) {
+            return read_direct_loop(&self.file, &self.path, offset, target, logical);
         }
+        let mut staging = AlignedBuffer::new_zeroed(physical, 4096);
+        read_direct_loop(
+            &self.file,
+            &self.path,
+            offset,
+            staging.as_mut_slice(),
+            logical,
+        )?;
+        target.copy_from_slice(&staging.as_slice()[..logical]);
         Ok(())
     }
 }
@@ -148,15 +194,15 @@ impl TransferProvider for DirectFileProvider {
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
         use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0_0};
         use windows_sys::Win32::System::Threading::CreateEventW;
-        if !offset.is_multiple_of(4096)
-            || !target.len().is_multiple_of(4096)
-            || !(target.as_ptr() as usize).is_multiple_of(4096)
-        {
+        if !offset.is_multiple_of(4096) {
             return Err(FellmError::other(
-                "Windows unbuffered read requires 4096-byte aligned offset, length, and staging buffer",
+                "Windows unbuffered read requires a 4096-byte aligned offset",
             ));
         }
-        if offset.saturating_add(target.len() as u64) > self.file_len {
+        if !target.len().is_multiple_of(4096)
+            || !(target.as_ptr() as usize).is_multiple_of(4096)
+            || offset.saturating_add(target.len() as u64) > self.file_len
+        {
             return self.fallback.read_at(offset, target);
         }
         let mut read = 0usize;
@@ -187,9 +233,8 @@ impl TransferProvider for DirectFileProvider {
                 let error = unsafe { GetLastError() };
                 if error != ERROR_IO_PENDING {
                     unsafe { CloseHandle(event) };
-                    if error == ERROR_HANDLE_EOF && read > 0 {
-                        target[read..].fill(0);
-                        return Ok(());
+                    if error == ERROR_HANDLE_EOF {
+                        return Err(short_read_error(&self.path, offset, target.len(), read));
                     }
                     return Err(FellmError::Io(std::io::Error::from_raw_os_error(
                         error as i32,
@@ -204,11 +249,7 @@ impl TransferProvider for DirectFileProvider {
             }
             let count = count as usize;
             if count == 0 {
-                if read > 0 {
-                    target[read..].fill(0);
-                    return Ok(());
-                }
-                return Err(FellmError::other("unexpected EOF in unbuffered read"));
+                return Err(short_read_error(&self.path, offset, target.len(), read));
             }
             read += count;
         }
@@ -217,9 +258,10 @@ impl TransferProvider for DirectFileProvider {
 }
 
 impl FileProvider {
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            file: File::open(path).map_err(FellmError::Io)?,
+            file: File::open(path.as_ref()).map_err(FellmError::Io)?,
+            path: path.as_ref().to_path_buf(),
         })
     }
 }
@@ -250,13 +292,7 @@ impl TransferProvider for FileProvider {
                 "positional file reads are unsupported on this platform",
             ));
             if count == 0 {
-                if read > 0 {
-                    target[read..].fill(0);
-                    return Ok(());
-                }
-                return Err(FellmError::other(
-                    "unexpected EOF in buffered positional read",
-                ));
+                return Err(short_read_error(&self.path, offset, target.len(), read));
             }
             read += count;
         }

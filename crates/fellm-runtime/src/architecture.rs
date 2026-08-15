@@ -87,6 +87,21 @@ pub fn source_from_gguf(gguf: &GgufFile) -> ModelSource {
 /// Shared plugin handle used by builders and host registries.
 pub type ArchitecturePluginHandle = Arc<dyn ArchitecturePlugin>;
 
+/// Graphs and requirements produced by a model-native speculator plugin.
+pub struct SpeculatorPreparation {
+    pub compatibility: fellm_plugin_abi::SpeculatorCompatibility,
+    pub graphs: Vec<Graph>,
+}
+
+/// Preparation boundary for speculators whose weights live in the target
+/// checkpoint. Execution, KV, sampling, and verification remain runtime-owned.
+pub trait ModelSpeculatorPlugin: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn prepare(&self, gguf: &GgufFile, spec: &ModelSpec) -> Result<Option<SpeculatorPreparation>>;
+}
+
+pub type ModelSpeculatorPluginHandle = Arc<dyn ModelSpeculatorPlugin>;
+
 /// Build backend capabilities for a plugin preparation call.
 #[must_use]
 pub fn backend_capabilities(backend: &dyn Backend) -> BackendCapabilities {

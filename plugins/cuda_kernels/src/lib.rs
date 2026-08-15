@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub use oxide_kernels::{
-    Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q6K_BLOCK_BYTES,
-    Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
+    Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMS, Q5K_BLOCK_BYTES,
+    Q5K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
 };
 
 /// Paged KV tokens per physical block.
@@ -158,6 +158,12 @@ pub unsafe extern "C" fn _fellm_plugin_set_weight_cache_budget(
         Ok(()) => 0,
         Err(code) => code,
     }
+}
+
+/// Report the Memory Fabric capacity available to one execution group.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _fellm_plugin_weight_group_capacity() -> u64 {
+    buffers::weight_group_capacity()
 }
 
 /// Enqueue the current predictive window on the plugin's CUDA stream.
@@ -330,6 +336,7 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         let vt = unsafe { &*registry };
         let f32 = DType::F32;
         let q4k = DType::Q4K;
+        let q5k = DType::Q5K;
         let q5_0 = DType::Q5_0;
         let q6k = DType::Q6K;
         let q8_0 = DType::Q8_0;
@@ -378,6 +385,23 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         {
             return -3;
         }
+        if register_one(
+            vt,
+            OpKind::SigmoidGate,
+            &[f32, f32],
+            f32,
+            launchers::launch_sigmoid_gate,
+        ) != 0
+            || register_one(
+                vt,
+                OpKind::InterleavedHeadSelect,
+                &[f32],
+                f32,
+                launchers::launch_interleaved_head_select,
+            ) != 0
+        {
+            return -38;
+        }
         // Rope: [x, inv_freqs]
         if register_one(vt, OpKind::Rope, &[f32, f32], f32, launchers::launch_rope) != 0 {
             return -4;
@@ -425,6 +449,23 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         }
         if register_one(
             vt,
+            OpKind::MatMul,
+            &[q5k, f32],
+            f32,
+            launchers::launch_q5k_matmul,
+        ) != 0
+            || register_one(
+                vt,
+                OpKind::MatMul,
+                &[q5k, f32, f32],
+                f32,
+                launchers::launch_q5k_matmul,
+            ) != 0
+        {
+            return -37;
+        }
+        if register_one(
+            vt,
             OpKind::GateUpSwiGlu,
             &[q4k, q4k, f32],
             f32,
@@ -432,6 +473,16 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         ) != 0
         {
             return -31;
+        }
+        if register_one(
+            vt,
+            OpKind::GateUpSwiGlu,
+            &[q5k, q5k, f32],
+            f32,
+            launchers::launch_q5k_gate_up_swiglu,
+        ) != 0
+        {
+            return -40;
         }
         if register_one(
             vt,
@@ -475,6 +526,16 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         }
         if register_one(
             vt,
+            OpKind::MatMul,
+            &[DType::BF16, f32],
+            f32,
+            launchers::launch_bf16_matmul,
+        ) != 0
+        {
+            return -34;
+        }
+        if register_one(
+            vt,
             OpKind::Attention,
             &[f32, f32, f32],
             f32,
@@ -501,6 +562,16 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         }
         if register_one(
             vt,
+            OpKind::Concat,
+            &[f32, f32],
+            f32,
+            launchers::launch_concat_f32,
+        ) != 0
+        {
+            return -36;
+        }
+        if register_one(
+            vt,
             OpKind::Attention,
             &[f32, f32, f32, f32, f32],
             f32,
@@ -519,6 +590,18 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         {
             return -26;
         }
+        // Placeholder signature; the launcher dispatches on the actual weight
+        // dtypes so any Q4/Q5/Q6/F32 mix of qkv/gate/out stays on device.
+        if register_one(
+            vt,
+            OpKind::GatedDeltaNet,
+            &[f32, q4k, q4k, f32, f32, f32, f32, f32, f32, q4k],
+            f32,
+            launchers::launch_gated_delta_net,
+        ) != 0
+        {
+            return -39;
+        }
         if register_one(
             vt,
             OpKind::Embedding,
@@ -532,12 +615,32 @@ pub unsafe extern "C" fn _fellm_plugin_register_kernels(
         if register_one(
             vt,
             OpKind::Embedding,
+            &[DType::BF16, u32],
+            f32,
+            launchers::launch_embedding_bf16,
+        ) != 0
+        {
+            return -35;
+        }
+        if register_one(
+            vt,
+            OpKind::Embedding,
             &[q4k, u32],
             f32,
             launchers::launch_embedding_q4k,
         ) != 0
         {
             return -10;
+        }
+        if register_one(
+            vt,
+            OpKind::Embedding,
+            &[q5k, u32],
+            f32,
+            launchers::launch_embedding_q5k,
+        ) != 0
+        {
+            return -41;
         }
         if register_one(
             vt,

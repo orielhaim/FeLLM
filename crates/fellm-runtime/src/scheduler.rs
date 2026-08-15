@@ -5,7 +5,7 @@ use crate::kv_fabric::{KvFabric, KvSequence};
 use fellm_core::error::Result;
 use fellm_core::tensor::Tensor;
 use fellm_model::parse_assistant_output;
-use fellm_tokenizer::{AssistantOutput, Message, ToolDef};
+use fellm_tokenizer::{AssistantOutput, ChatRenderOptions, Message, ToolDef};
 use std::collections::VecDeque;
 
 /// Stable request identity used by scheduling plans and cancellation commands.
@@ -230,7 +230,7 @@ struct Sequence {
     admitted_at: Option<std::time::Instant>,
     prefill_done_at: Option<std::time::Instant>,
     hit_stop: bool,
-    generated_tokens: Vec<u32>,
+    sampler_state: crate::sampling::SamplerState,
     sampling: crate::sampling::SamplingWorkspace,
 }
 
@@ -294,10 +294,15 @@ impl Scheduler {
         stream: bool,
     ) -> Result<SequenceHandle> {
         let prepared_messages = engine.prepare_chat_messages(messages);
-        let prompt = match engine.tokenizer().apply_chat_template_with_tools(
+        let prompt = match engine.tokenizer().apply_chat_template_with_options(
             &prepared_messages,
             tools,
             true,
+            ChatRenderOptions {
+                enable_thinking: params.enable_thinking.or_else(|| {
+                    engine.tokenizer().supports_thinking().then_some(false)
+                }),
+            },
         )? {
             Some(formatted) => formatted,
             None => messages
@@ -330,6 +335,11 @@ impl Scheduler {
         // Prefix match against engine cache.
         let matched = engine.attach_prefix(&ids, &mut seq_cache);
 
+        let mut sampler_state = crate::sampling::SamplerState::with_grammar(
+            params.max_tokens as usize,
+            params.grammar.clone(),
+        );
+        sampler_state.prime_history(&ids);
         let seq = Sequence {
             id,
             status: SequenceStatus::Waiting,
@@ -353,7 +363,7 @@ impl Scheduler {
             admitted_at: None,
             prefill_done_at: None,
             hit_stop: false,
-            generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            sampler_state,
             sampling: crate::sampling::SamplingWorkspace::default(),
         };
         self.waiting.push_back(seq);
@@ -669,13 +679,18 @@ impl Scheduler {
                 temperature: seq.params.temperature,
                 top_k: seq.params.top_k,
                 top_p: seq.params.top_p,
-                seed: seq.params.seed.wrapping_add(u64::from(seq.emitted)),
+                min_p: seq.params.min_p,
+                seed: seq.params.seed.wrapping_add(seq.sampler_state.draw_index()),
                 repetition_penalty: seq.params.repetition_penalty,
-                recent_tokens: &seq.generated_tokens,
+                frequency_penalty: seq.params.frequency_penalty,
+                presence_penalty: seq.params.presence_penalty,
+                logit_bias: &seq.params.logit_bias,
+                grammar: seq.sampler_state.grammar_view(),
+                recent_tokens: seq.sampler_state.history(),
             },
             &mut seq.sampling,
         );
-        seq.generated_tokens.push(token);
+        seq.sampler_state.commit_token(token);
         seq.emitted += 1;
         if seq.first_token_at.is_none() {
             let now = std::time::Instant::now();
@@ -688,7 +703,8 @@ impl Scheduler {
         }
         seq.last_token_at = Some(std::time::Instant::now());
 
-        if engine.stop_token_ids_pub().contains(&token) {
+        if engine.stop_token_ids_pub().contains(&token) || seq.sampler_state.grammar_is_accepting()
+        {
             seq.hit_stop = true;
             return Ok((Some(self.finish_seq(seq, engine)?), None));
         }

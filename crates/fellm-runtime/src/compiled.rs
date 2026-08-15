@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Shared mutable buffer for a runtime / mutable-input slot.
@@ -53,6 +54,8 @@ struct CompiledNode {
     inputs: Vec<usize>,
     /// The value backing for this node.
     kind: SlotKind,
+    /// Graph label, used by activation probes.
+    label: String,
     /// dtype of the value.
     dtype: DType,
     /// dims of the value.
@@ -77,6 +80,13 @@ struct BoundInput {
     tensor: Tensor,
 }
 
+#[derive(Clone)]
+struct OutputSlot {
+    source: usize,
+    dtype: DType,
+    shape: Shape,
+}
+
 /// A compiled, reusable step schedule.
 pub struct CompiledStep {
     nodes: Vec<CompiledNode>,
@@ -90,6 +100,7 @@ pub struct CompiledStep {
     /// dtype / shape of the logits output.
     logits_dtype: DType,
     logits_shape: Shape,
+    outputs: HashMap<String, OutputSlot>,
     /// Read-only inputs bound this step, keyed by input name.
     inputs: HashMap<String, BoundInput>,
     /// Per-step attribute patches indexed directly by plan slot.
@@ -97,6 +108,8 @@ pub struct CompiledStep {
     /// This is deliberately dense: decode visits every runtime node, so a
     /// HashMap lookup here multiplied host-side bookkeeping by every layer.
     attr_patches: Vec<Option<OpAttrs>>,
+    /// Globally unique namespace for backend prefetch/staging groups.
+    group_namespace: u64,
 }
 
 impl CompiledStep {
@@ -153,10 +166,14 @@ impl CompiledStep {
                 .iter()
                 .filter_map(|input| inferred_dtypes.get(input).copied())
                 .collect();
-            // The recurrent ShortConv state is an aliased mutable output, not
-            // a read-only kernel input (see the launch path below).
-            if node.op == Some(OpKind::ShortConv) {
-                input_dtypes.truncate(input_dtypes.len().saturating_sub(1));
+            // Recurrent state is an aliased mutable output, not a read-only
+            // kernel input (see the launch path below).
+            if let Some(op) = node.op {
+                input_dtypes.truncate(
+                    input_dtypes
+                        .len()
+                        .saturating_sub(mutable_state_input_count(op)),
+                );
             }
             let output_dtype = match &node.value {
                 OpValue::Input { dtype, .. } | OpValue::Runtime { dtype, .. } => *dtype,
@@ -235,6 +252,7 @@ impl CompiledStep {
                         nodes.push(CompiledNode {
                             inputs,
                             kind: SlotKind::Buffer(mb.buffer.clone()),
+                            label: node.label.clone(),
                             dtype: mb.dtype,
                             dims,
                             strides,
@@ -245,6 +263,7 @@ impl CompiledStep {
                         nodes.push(CompiledNode {
                             inputs,
                             kind: SlotKind::Input(name.clone()),
+                            label: node.label.clone(),
                             dtype: *dtype,
                             dims: Vec::new(),
                             strides: Vec::new(),
@@ -257,6 +276,7 @@ impl CompiledStep {
                     nodes.push(CompiledNode {
                         inputs,
                         kind: SlotKind::Constant(t.clone()),
+                        label: node.label.clone(),
                         dtype: t.dtype(),
                         dims,
                         strides,
@@ -268,6 +288,7 @@ impl CompiledStep {
                     nodes.push(CompiledNode {
                         inputs,
                         kind: SlotKind::None,
+                        label: node.label.clone(),
                         dtype: DType::F32,
                         dims: Vec::new(),
                         strides: Vec::new(),
@@ -330,11 +351,8 @@ impl CompiledStep {
                     let (dims, strides) = dims_strides(&out_shape);
 
                     // Resolve the kernel using compile-time input dtypes.
-                    let input_ref_count = if op == OpKind::ShortConv {
-                        inputs.len().saturating_sub(1)
-                    } else {
-                        inputs.len()
-                    };
+                    let input_ref_count =
+                        inputs.len().saturating_sub(mutable_state_input_count(op));
                     let input_dtypes: Vec<DType> = inputs
                         .iter()
                         .take(input_ref_count)
@@ -354,6 +372,7 @@ impl CompiledStep {
                     nodes.push(CompiledNode {
                         inputs,
                         kind,
+                        label: node.label.clone(),
                         dtype: out_dtype,
                         dims,
                         strides,
@@ -372,26 +391,33 @@ impl CompiledStep {
         let mut logits_src = None;
         let mut logits_dtype = DType::F32;
         let mut logits_shape = Shape::new(&[1])?;
+        let mut outputs = HashMap::new();
         for &oid in graph.outputs() {
             let out_node = graph.node(oid);
             let name = match &out_node.value {
                 OpValue::Output { name } => name.clone(),
                 _ => continue,
             };
-            if name != "logits" {
-                continue;
-            }
             let preds = graph.inputs_slice(oid);
-            let src = preds
-                .first()
-                .copied()
-                .ok_or_else(|| FellmError::InvalidGraph("logits output has no source".into()))?;
-            let src_idx = *index_of
-                .get(&src)
-                .ok_or_else(|| FellmError::InvalidGraph("logits source not in plan".into()))?;
-            logits_src = Some(src_idx);
-            logits_dtype = nodes[src_idx].dtype;
-            logits_shape = shape_from_dims(&nodes[src_idx].dims);
+            let src = preds.first().copied().ok_or_else(|| {
+                FellmError::InvalidGraph(format!("output '{name}' has no source"))
+            })?;
+            let src_idx = *index_of.get(&src).ok_or_else(|| {
+                FellmError::InvalidGraph(format!("output '{name}' source not in plan"))
+            })?;
+            outputs.insert(
+                name.clone(),
+                OutputSlot {
+                    source: src_idx,
+                    dtype: nodes[src_idx].dtype,
+                    shape: shape_from_dims(&nodes[src_idx].dims),
+                },
+            );
+            if name == "logits" {
+                logits_src = Some(src_idx);
+                logits_dtype = nodes[src_idx].dtype;
+                logits_shape = shape_from_dims(&nodes[src_idx].dims);
+            }
         }
         let logits_src =
             logits_src.ok_or_else(|| FellmError::other("graph has no logits output"))?;
@@ -414,8 +440,13 @@ impl CompiledStep {
             body_end,
             logits_dtype,
             logits_shape,
+            outputs,
             inputs: HashMap::new(),
             attr_patches: vec![None; plan.order.len()],
+            group_namespace: {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
         })
     }
 
@@ -479,7 +510,11 @@ impl CompiledStep {
                         }
                     }
                 }
-                backend.prefetch_weight_group(group_index as u64, &prefetch, required)?;
+                let group = self
+                    .group_namespace
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(group_index as u64);
+                backend.prefetch_weight_group(group, &prefetch, required)?;
             }
 
             let mut input_refs: SmallVec<[TensorRef; 6]> = SmallVec::new();
@@ -496,11 +531,9 @@ impl CompiledStep {
             }
             let started = profile_ops.then(Instant::now);
 
-            if rt.op == OpKind::ShortConv {
-                let state_idx = *node
-                    .inputs
-                    .get(4)
-                    .ok_or_else(|| FellmError::other("shortconv node missing state input"))?;
+            let mutable_states = mutable_state_input_count(rt.op);
+            if mutable_states == 1 {
+                let state_idx = node.inputs[rt.input_ref_count];
                 let state_mut = self.tensor_mut(state_idx)?;
                 let mut outs = [out_mut, state_mut];
                 backend
@@ -514,6 +547,18 @@ impl CompiledStep {
                                 .map(u64::to_string)
                                 .collect::<Vec<_>>()
                                 .join("x")
+                        ))
+                    })?;
+            } else if mutable_states == 2 {
+                let first_state = self.tensor_mut(node.inputs[rt.input_ref_count])?;
+                let second_state = self.tensor_mut(node.inputs[rt.input_ref_count + 1])?;
+                let mut outs = [out_mut, first_state, second_state];
+                backend
+                    .launch(rt.handle, &attrs, &input_refs, &mut outs, 0)
+                    .map_err(|error| {
+                        FellmError::other(format!(
+                            "CUDA/runtime launch failed at {}: {error}",
+                            rt.op.name()
                         ))
                     })?;
             } else {
@@ -531,6 +576,13 @@ impl CompiledStep {
                                 .join("x")
                         ))
                     })?;
+            }
+            if crate::activation::probe_step_enabled()
+                && node.dtype == DType::F32
+                && node.runtime.is_some()
+            {
+                let out = self.tensor_ref(i)?;
+                crate::activation::log_f32_ref(&node.label, out.data, out.byte_len);
             }
             if let Some(started) = started {
                 backend.synchronize()?;
@@ -550,7 +602,7 @@ impl CompiledStep {
         if profile_ops {
             let mut profile: Vec<_> = profile.into_iter().collect();
             profile.sort_unstable_by_key(|(_, (_, nanos))| std::cmp::Reverse(*nanos));
-            tracing::info!(
+            tracing::debug!(
                 ops = ?profile.iter().map(|(op, (count, nanos))| {
                     format!("{op}:{count}={:.3}ms", *nanos as f64 / 1_000_000.0)
                 }).collect::<Vec<_>>(),
@@ -573,13 +625,47 @@ impl CompiledStep {
             return Ok(Tensor::from_storage(layout, storage));
         }
 
-        // Copy the logits out of the persistent activation arena. Sampling owns
+        self.materialize_output_slot(
+            backend,
+            &OutputSlot {
+                source: self.logits_src,
+                dtype: self.logits_dtype,
+                shape: self.logits_shape.clone(),
+            },
+        )
+    }
+
+    /// Materialize one explicitly retained named graph output on demand.
+    pub fn materialize_named_output(&self, backend: &dyn Backend, name: &str) -> Result<Tensor> {
+        let output = self.outputs.get(name).ok_or_else(|| {
+            FellmError::other(format!(
+                "graph output '{name}' was not requested at compile time"
+            ))
+        })?;
+        self.materialize_output_slot(backend, output)
+    }
+
+    /// Borrow a retained output in its authoritative execution placement.
+    /// The view is invalidated by the next invocation of this compiled graph.
+    pub(crate) fn named_output_ref(&self, name: &str) -> Result<TensorRef> {
+        let output = self.outputs.get(name).ok_or_else(|| {
+            FellmError::other(format!(
+                "graph output '{name}' was not requested at compile time"
+            ))
+        })?;
+        self.tensor_ref(output.source)
+    }
+
+    fn materialize_output_slot(
+        &self,
+        backend: &dyn Backend,
+        output: &OutputSlot,
+    ) -> Result<Tensor> {
+        // Copy the output from the persistent activation arena. The consumer owns
         // this result while the arena is immediately reusable by another batch.
-        let bytes_len = self
-            .logits_dtype
-            .byte_size(self.logits_shape.num_elements());
+        let bytes_len = output.dtype.byte_size(output.shape.num_elements());
         let mut taken = AlignedBuffer::new_zeroed(bytes_len, 64);
-        let source = self.tensor_ref(self.logits_src)?;
+        let source = self.tensor_ref(output.source)?;
         // SAFETY: tensor_ref describes a live contiguous logits buffer for this step.
         let bytes = unsafe { core::slice::from_raw_parts(source.data, source.byte_len as usize) };
         taken.as_mut_slice().copy_from_slice(&bytes[..bytes_len]);
@@ -590,7 +676,7 @@ impl CompiledStep {
         // intermediate activation) before the reusable arena is overwritten.
         let host_logits = unsafe {
             TensorMut::from_raw(
-                self.logits_dtype,
+                output.dtype,
                 source.dims_slice(),
                 source.strides_slice(),
                 taken.as_mut_slice().as_mut_ptr(),
@@ -598,7 +684,7 @@ impl CompiledStep {
             )
         };
         backend.materialize(source, host_logits)?;
-        let layout = Layout::contiguous(self.logits_dtype, self.logits_shape.clone());
+        let layout = Layout::contiguous(output.dtype, output.shape.clone());
         let storage = Arc::new(Storage::Owned(Arc::new(taken)));
         Ok(Tensor::from_storage(layout, storage))
     }
@@ -612,17 +698,19 @@ impl CompiledStep {
         let node = &self.nodes[idx];
         match &node.kind {
             SlotKind::Constant(t) => {
-                if let Some((_, offset, len)) = t.file_extent() {
-                    static STORAGE_SENTINEL: u8 = 0;
+                if let Some((_, _, len)) = t.file_extent() {
+                    // Null data means the CPU/CUDA launch path must remap from
+                    // a published storage object. A 1-byte sentinel was read as
+                    // a full weight (UB) and produced exact-zero logits.
                     return Ok(unsafe {
                         TensorRef::from_raw(
                             t.dtype(),
                             &node.dims,
                             &node.strides,
-                            &STORAGE_SENTINEL,
+                            core::ptr::null(),
                             len,
                         )
-                        .with_logical_id(offset.saturating_add(1))
+                        .with_logical_id(t.logical_id())
                     });
                 }
                 let bytes = t.as_bytes();
@@ -635,10 +723,7 @@ impl CompiledStep {
                         bytes.as_ptr(),
                         bytes.len(),
                     )
-                    .with_logical_id(
-                        t.mmap_extent()
-                            .map_or((1u64 << 63) | idx as u64, |(offset, _)| offset as u64 + 1),
-                    )
+                    .with_logical_id(t.logical_id())
                 })
             }
             SlotKind::Input(name) => {
@@ -724,6 +809,16 @@ impl CompiledStep {
                 "cannot take mutable view of a non-buffer slot",
             )),
         }
+    }
+}
+
+const fn mutable_state_input_count(op: OpKind) -> usize {
+    if op.0 == OpKind::ShortConv.0 {
+        1
+    } else if op.0 == OpKind::GatedDeltaNet.0 {
+        2
+    } else {
+        0
     }
 }
 

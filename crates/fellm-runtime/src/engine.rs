@@ -23,15 +23,18 @@ use fellm_graph::Graph;
 use fellm_graph::graph::OpValue;
 use fellm_graph::plan::ExecutionPlan;
 use fellm_model::{
-    ModelSpec, StepBindings, build_batch_step_graph, build_step_graph, collect_step_bindings,
-    parse_assistant_output,
+    ModelSpec, StepBindings, build_batch_step_graph_with_features, build_step_graph_with_features,
+    collect_step_bindings, parse_assistant_output,
 };
+use fellm_plugin_abi::op::OpKind;
 use fellm_plugin_abi::{
     AttentionDispatch, AttentionKernelPath, AttentionPathKind, Backend, DriverAction, DriverEvent,
     GenerationRequest, GraphId, GraphOutput, PagedKvContext, PreRopeKeyStore, RetentionContext,
     SequenceAttentionState, set_attention_dispatch, set_paged_context, set_pre_rope_store,
 };
-use fellm_tokenizer::{AssistantOutput, Message, Tokenizer, ToolDef, load as load_tokenizer};
+use fellm_tokenizer::{
+    AssistantOutput, ChatRenderOptions, Message, Tokenizer, ToolDef, load as load_tokenizer,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -72,6 +75,8 @@ pub struct EngineSettings {
     pub kv_cache: KvFabricConfig,
     /// Hardware/planner overrides. Unset capacities are discovered automatically.
     pub memory_fabric: crate::memory_fabric::MemoryFabricConfig,
+    /// Internal representations retained for the active speculator only.
+    pub target_features: Vec<fellm_plugin_abi::TargetFeature>,
 }
 
 impl Default for EngineSettings {
@@ -86,6 +91,7 @@ impl Default for EngineSettings {
             plugin_dir: None,
             kv_cache: KvFabricConfig::default(),
             memory_fabric: crate::memory_fabric::MemoryFabricConfig::default(),
+            target_features: Vec::new(),
         }
     }
 }
@@ -159,6 +165,23 @@ impl EngineSettings {
     #[must_use]
     pub fn kv_cache(mut self, config: KvFabricConfig) -> Self {
         self.kv_cache = config;
+        self
+    }
+
+    /// Request internal target representations for a prepared speculator.
+    #[must_use]
+    pub fn target_features(
+        mut self,
+        features: impl IntoIterator<Item = fellm_plugin_abi::TargetFeature>,
+    ) -> Self {
+        self.target_features = features.into_iter().collect();
+        self.target_features
+            .sort_unstable_by_key(|feature| match feature {
+                fellm_plugin_abi::TargetFeature::EmbeddingOutput => 0,
+                fellm_plugin_abi::TargetFeature::LayerHiddenState(layer) => layer + 1,
+                fellm_plugin_abi::TargetFeature::FinalHiddenState => u32::MAX,
+            });
+        self.target_features.dedup();
         self
     }
 
@@ -242,7 +265,7 @@ impl GenStats {
 }
 
 /// Sampling parameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GenParams {
     /// Maximum number of tokens to generate.
     pub max_tokens: u32,
@@ -252,12 +275,34 @@ pub struct GenParams {
     pub top_k: u32,
     /// top-p / nucleus (>= 1.0 disables).
     pub top_p: f32,
+    /// Minimum probability relative to the most likely token (0 disables).
+    pub min_p: f32,
     /// RNG seed.
     pub seed: u64,
     /// Repetition penalty. Values <= 1.0 disable it.
     pub repetition_penalty: f32,
+    /// OpenAI-style count-scaled frequency penalty.
+    pub frequency_penalty: f32,
+    /// OpenAI-style one-time presence penalty.
+    pub presence_penalty: f32,
+    /// Sparse token-id logit adjustments.
+    pub logit_bias: Arc<[(u32, f32)]>,
+    /// Optional transactional finite-state token grammar.
+    pub grammar: Option<Arc<sampling::TokenGrammar>>,
     /// Scheduler priority; larger values are selected first within a work class.
     pub priority: i32,
+    /// Chat-template `enable_thinking`. `None` uses the tokenizer default
+    /// (off when the GGUF template supports the switch).
+    pub enable_thinking: Option<bool>,
+}
+
+impl GenParams {
+    /// True when the processed distribution is a point mass, so greedy
+    /// speculative verification is distributionally exact.
+    #[must_use]
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0 || self.top_k == 1
+    }
 }
 
 impl Default for GenParams {
@@ -267,9 +312,15 @@ impl Default for GenParams {
             temperature: 0.2,
             top_k: 80,
             top_p: 1.0,
+            min_p: 0.0,
             seed: 0,
             repetition_penalty: 1.05,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            logit_bias: Arc::from([]),
+            grammar: None,
             priority: 0,
+            enable_thinking: None,
         }
     }
 }
@@ -376,6 +427,7 @@ struct LoadedModel {
     step_graph: Graph,
     step_plan: ExecutionPlan,
     bindings: StepBindings,
+    target_features: Vec<fellm_plugin_abi::TargetFeature>,
     /// Compiled step schedule, built once on first step and reused.
     compiled: Option<CompiledStep>,
     /// Reusable physical-batch graphs keyed by row count (`<= n_ubatch`).
@@ -401,6 +453,7 @@ struct CompiledBatch {
     bindings: StepBindings,
     step: CompiledStep,
     conv_buffers: Vec<Rc<RefCell<AlignedBuffer>>>,
+    ssm_buffers: Vec<Rc<RefCell<AlignedBuffer>>>,
 }
 
 /// One token row in a physical inference batch.
@@ -414,6 +467,32 @@ pub struct BatchToken {
     pub position: usize,
     /// Whether the caller needs this row's logits.
     pub compute_logits: bool,
+}
+
+/// Independently owned autoregressive sequence state, used by generic draft
+/// models as well as target verification.
+pub struct DecodeSequence {
+    pub(crate) cache: KvSequence,
+    pub(crate) recurrent: Option<HybridConvState>,
+    pub(crate) pending_logits: Tensor,
+    pub(crate) position: usize,
+}
+
+impl DecodeSequence {
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    #[must_use]
+    pub fn logits(&self) -> &Tensor {
+        &self.pending_logits
+    }
+
+    #[must_use]
+    pub fn kv_len(&self) -> usize {
+        self.cache.len_tokens
+    }
 }
 
 #[cfg(feature = "backend-cuda")]
@@ -430,6 +509,13 @@ struct CudaDecodePlan {
 }
 
 impl Engine {
+    /// Parsed GGUF backing this engine. Model-native speculators use this to
+    /// Arc-share checkpoint tensors rather than reopening or duplicating them.
+    #[must_use]
+    pub fn gguf(&self) -> &GgufFile {
+        &self.gguf
+    }
+
     pub fn open(path: &Path, max_seq_override: Option<usize>) -> Result<Self> {
         let mut settings = EngineSettings::default();
         if let Some(n) = max_seq_override {
@@ -449,14 +535,15 @@ impl Engine {
         architecture: Option<ArchitecturePluginHandle>,
     ) -> Result<Self> {
         let backend = settings.backend.resolve()?;
-        let storage_native_cpu = backend.id() == "cpu"
-            && matches!(
-                settings.memory_fabric.storage_provider,
-                fellm_memory::StorageProviderRequest::Buffered
-                    | fellm_memory::StorageProviderRequest::Direct
-                    | fellm_memory::StorageProviderRequest::Mmap
-                    | fellm_memory::StorageProviderRequest::IoUring
-            );
+        let storage_native_cpu = backend.id() == "cpu";
+        let mut settings = settings;
+        let mut probe_features = settings.target_features.clone();
+        probe_features.extend([
+            fellm_plugin_abi::TargetFeature::EmbeddingOutput,
+            fellm_plugin_abi::TargetFeature::LayerHiddenState(0),
+            fellm_plugin_abi::TargetFeature::FinalHiddenState,
+        ]);
+        settings = settings.target_features(probe_features);
         let gguf = Arc::new(if storage_native_cpu {
             GgufFile::open_storage_native(path)?
         } else {
@@ -468,9 +555,7 @@ impl Engine {
         tracing::info!(
             arch = %spec.arch_id,
             n_layers = spec.n_layers,
-            attn = spec.n_attn_layers(),
-            conv = spec.n_conv_layers(),
-            "probed model recipe from GGUF"
+            "loaded model"
         );
 
         let model_max_ctx = spec.context_length.max(1);
@@ -480,11 +565,11 @@ impl Engine {
 
         tracing::info!(
             n_ctx = max_seq,
-            model_max_ctx,
             n_batch,
             n_ubatch,
-            "context / batch settings"
+            "context"
         );
+        tracing::info!(backend = backend.id(), "backend");
 
         // Discover dynamic plugins and prepare attention / KV-policy providers.
         let mut providers = crate::providers::ProviderManager::new(settings.providers.clone());
@@ -498,10 +583,13 @@ impl Engine {
         )?;
         tracing::info!(
             attention = %prep.attention_name,
-            attention_id = prep.attention_id.0,
             kv_policy = %prep.kv_policy_name,
+            "providers"
+        );
+        tracing::debug!(
+            attention_id = prep.attention_id.0,
             kv_policy_id = prep.kv_policy_id.0,
-            "providers prepared"
+            "provider ids"
         );
         for note in &prep.report.notes {
             tracing::debug!(%note, "provider selection");
@@ -527,7 +615,7 @@ impl Engine {
             ));
         }
         if let Some(preparation) = &preparation {
-            tracing::info!(
+            tracing::debug!(
                 architecture = %preparation.program.architecture_id,
                 graphs = preparation.program.graphs.len(),
                 "architecture plugin program ready"
@@ -548,6 +636,7 @@ impl Engine {
             accelerator_memory,
             n_ubatch,
             &settings.memory_fabric,
+            &settings.target_features,
         )?;
 
         // B2: size VRAM KV arena to match the host fabric arena.
@@ -589,6 +678,7 @@ impl Engine {
                 plugin_dir: settings.plugin_dir.clone(),
                 kv_cache: settings.kv_cache.clone(),
                 memory_fabric: settings.memory_fabric.clone(),
+                target_features: settings.target_features.clone(),
             },
             providers,
             seq_attn: SequenceAttentionState::new(n_attn_layers),
@@ -653,6 +743,35 @@ impl Engine {
             prepared
         } else {
             messages.to_vec()
+        }
+    }
+
+    fn chat_render_options(&self, params: &GenParams) -> ChatRenderOptions {
+        let enable_thinking = params.enable_thinking.or_else(|| {
+            self.tokenizer.supports_thinking().then_some(false)
+        });
+        ChatRenderOptions { enable_thinking }
+    }
+
+    fn invalidate_hybrid_device_mirrors(&self) {
+        #[cfg(feature = "backend-cuda")]
+        if let (Some(conv), Some(cuda)) = (
+            &self.model.conv,
+            self.backend
+                .as_any()
+                .downcast_ref::<backend_cuda::CudaBackend>(),
+        ) {
+            for buffer in conv.conv.iter().chain(conv.ssm.iter()) {
+                let host = buffer.borrow();
+                let bytes = host.as_slice();
+                if bytes.is_empty() {
+                    continue;
+                }
+                cuda.plugins().invalidate_f32_host(
+                    bytes.as_ptr() as *const f32,
+                    bytes.len(),
+                );
+            }
         }
     }
 
@@ -827,8 +946,9 @@ impl Engine {
     /// instruction-tuned models.
     pub fn generate(&mut self, prompt: &str, params: GenParams) -> Result<TokenStream<'_>> {
         self.model.reset();
+        self.invalidate_hybrid_device_mirrors();
         let ids = self.tokenizer.encode(prompt, true)?;
-        tracing::info!(n_tokens = ids.len(), "prompt tokenized");
+        self.log_prompt_tokens(prompt, &ids);
         self.generate_from_ids(&ids, params)
     }
 
@@ -845,23 +965,26 @@ impl Engine {
         params: GenParams,
     ) -> Result<TokenStream<'_>> {
         self.model.reset();
+        self.invalidate_hybrid_device_mirrors();
         let prepared_messages = self.prepare_chat_messages(messages);
-        let prompt =
-            match self
-                .tokenizer
-                .apply_chat_template_with_tools(&prepared_messages, tools, true)?
-            {
-                Some(formatted) => {
-                    tracing::debug!(prompt = %formatted, "chat template applied");
-                    formatted
-                }
-                None => prepared_messages
-                    .iter()
-                    .map(|m| m.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            };
+        let prompt = match self.tokenizer.apply_chat_template_with_options(
+            &prepared_messages,
+            tools,
+            true,
+            self.chat_render_options(&params),
+        )? {
+            Some(formatted) => {
+                tracing::debug!(prompt = %formatted, "chat template applied");
+                formatted
+            }
+            None => prepared_messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
         let ids = self.tokenizer.encode(&prompt, true)?;
+        self.log_prompt_tokens(&prompt, &ids);
         self.generate_from_ids(&ids, params)
     }
 
@@ -923,9 +1046,17 @@ impl Engine {
                 let chunk = (scheduled - done).min(n_ubatch);
                 for i in 0..chunk {
                     let abs = pos + done + i;
-                    // Only the last prompt token needs lm_head / logits.
                     let need_logits = abs + 1 == n_prompt;
+                    crate::activation::set_probe_step(abs == 0 || need_logits);
                     logits = Some(self.step(ids[abs], abs, need_logits)?);
+                    crate::activation::set_probe_step(false);
+                    if abs == 0 {
+                        self.probe_named_activation("feature.embedding", true)?;
+                        self.probe_named_activation("feature.layer.0", true)?;
+                    }
+                    if need_logits {
+                        let _ = self.probe_named_activation("feature.final", false);
+                    }
                 }
                 done += chunk;
             }
@@ -934,7 +1065,16 @@ impl Engine {
 
         let prompt_elapsed = gen_start.elapsed();
         let last_logits = logits.ok_or_else(|| FellmError::other("empty prompt"))?;
+        {
+            let values = last_logits.as_slice::<f32>()?;
+            crate::activation::require_nonzero("logits", values)?;
+        }
         let start_pos = n_prompt;
+        let mut sampler_state = sampling::SamplerState::with_grammar(
+            params.max_tokens as usize,
+            params.grammar.clone(),
+        );
+        sampler_state.prime_history(ids);
 
         Ok(TokenStream {
             engine: self,
@@ -945,7 +1085,7 @@ impl Engine {
             position: start_pos,
             finished: false,
             stop_token_ids,
-            generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            sampler_state,
             sampling: sampling::SamplingWorkspace::default(),
             stats: GenStats {
                 prompt_tokens: ids.len() as u32,
@@ -1094,6 +1234,11 @@ impl Engine {
                 DriverAction::Done => DriverAction::Done,
             };
         }
+        let mut sampler_state = sampling::SamplerState::with_grammar(
+            params.max_tokens as usize,
+            params.grammar.clone(),
+        );
+        sampler_state.prime_history(ids);
         Ok(TokenStream {
             engine: self,
             params,
@@ -1103,7 +1248,7 @@ impl Engine {
             position: context_len,
             finished: false,
             stop_token_ids,
-            generated_tokens: Vec::with_capacity(params.max_tokens as usize),
+            sampler_state,
             sampling: sampling::SamplingWorkspace::default(),
             stats: GenStats {
                 prompt_tokens: ids.len() as u32,
@@ -1117,6 +1262,34 @@ impl Engine {
             first_token_at: None,
             last_token_at: None,
         })
+    }
+
+    fn log_prompt_tokens(&self, prompt: &str, ids: &[u32]) {
+        let pieces: Vec<String> = ids
+            .iter()
+            .map(|&id| {
+                self.tokenizer
+                    .vocabulary_piece(id)
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        let types: Vec<i32> = ids
+            .iter()
+            .map(|&id| self.tokenizer.token_type(id).unwrap_or(-1))
+            .collect();
+        tracing::debug!(
+            n_tokens = ids.len(),
+            bos = self.tokenizer.bos(),
+            eos = self.tokenizer.eos(),
+            bos_str = self.tokenizer.bos_str().unwrap_or(""),
+            starts_with_bos = ids.first().copied() == self.tokenizer.bos(),
+            ids = ?ids,
+            pieces = ?pieces,
+            token_types = ?types,
+            prompt_chars = prompt.chars().count(),
+            "prompt tokenized"
+        );
     }
 
     fn stop_token_ids(&self) -> Vec<u32> {
@@ -1210,6 +1383,81 @@ impl Engine {
         self.model.memory_fabric.snapshot()
     }
 
+    /// Materialize one explicitly requested feature from the most recent
+    /// single-token target step. No feature is retained unless requested in settings.
+    pub fn capture_target_feature(
+        &self,
+        feature: fellm_plugin_abi::TargetFeature,
+    ) -> Result<Tensor> {
+        if !self.model.target_features.contains(&feature) {
+            return Err(FellmError::other(format!(
+                "target feature {feature:?} was not requested during engine preparation"
+            )));
+        }
+        let name = target_feature_output_name(feature);
+        self.model
+            .compiled
+            .as_ref()
+            .ok_or_else(|| FellmError::other("target step has not executed"))?
+            .materialize_named_output(self.backend.as_ref(), &name)
+    }
+
+    fn probe_named_activation(&self, name: &str, require_nonzero: bool) -> Result<()> {
+        let compiled = self
+            .model
+            .compiled
+            .as_ref()
+            .ok_or_else(|| FellmError::other("target step has not executed"))?;
+        let view = match compiled.named_output_ref(name) {
+            Ok(view) => view,
+            Err(_) => return Ok(()),
+        };
+        if view.data.is_null() || view.byte_len < 4 {
+            if require_nonzero {
+                return Err(FellmError::other(format!(
+                    "{name} is missing; inference result is invalid"
+                )));
+            }
+            return Ok(());
+        }
+        let values = unsafe {
+            std::slice::from_raw_parts(view.data.cast::<f32>(), (view.byte_len as usize) / 4)
+        };
+        if require_nonzero {
+            crate::activation::require_nonzero(name, values)?;
+        } else {
+            crate::activation::log_activation(name, values);
+        }
+        Ok(())
+    }
+
+    /// Borrow all requested target features in-place for one synchronous
+    /// speculator call. The references cannot escape the callback or overlap a
+    /// subsequent target execution that reuses the activation arena.
+    pub fn with_target_features<R>(
+        &self,
+        callback: impl FnOnce(&[fellm_plugin_abi::CapturedTargetFeature<'_>]) -> Result<R>,
+    ) -> Result<R> {
+        let compiled = self
+            .model
+            .compiled
+            .as_ref()
+            .ok_or_else(|| FellmError::other("target step has not executed"))?;
+        let device = match self.backend.capabilities().device_kind {
+            fellm_plugin_abi::DeviceKind::Cpu => fellm_plugin_abi::DeviceKind::Cpu,
+            fellm_plugin_abi::DeviceKind::Gpu => fellm_plugin_abi::DeviceKind::Gpu,
+        };
+        let mut captures = Vec::with_capacity(self.model.target_features.len());
+        for &feature in &self.model.target_features {
+            captures.push(fellm_plugin_abi::CapturedTargetFeature::new(
+                feature,
+                compiled.named_output_ref(&target_feature_output_name(feature))?,
+                device,
+            ));
+        }
+        callback(&captures)
+    }
+
     /// Publish live cross-tier weight and transfer-provider telemetry.
     pub fn publish_memory_fabric_metrics(&self) {
         self.model.memory_fabric.publish_metrics();
@@ -1275,7 +1523,7 @@ impl Engine {
                     system.process(pid).map(sysinfo::Process::memory)
                 })
                 .unwrap_or(0);
-            tracing::info!(
+            tracing::debug!(
                 storage_read_bytes = snapshot.physical_bytes,
                 buffered_storage_bytes = snapshot.buffered_storage_bytes,
                 direct_storage_bytes = snapshot.direct_storage_bytes,
@@ -1285,11 +1533,20 @@ impl Engine {
                 mmap_execution_bytes = snapshot.mmap_execution_bytes,
                 storage_wait_nanos = snapshot.storage_stall_nanos,
                 io_compute_overlap_percent = snapshot.io_compute_overlap_percent,
-                storage_staging_bytes = snapshot.staging_bytes,
+                expert_slice_reads = snapshot.expert_slice_reads,
+                expert_slice_bytes = snapshot.expert_slice_bytes,
+                avg_storage_read_bytes = snapshot.avg_read_bytes,
+                resident_dense_bytes = snapshot.resident_dense_bytes,
                 resident_set_bytes,
                 peak_rss_bytes = process_peak_rss_bytes(),
                 zero_mmap_weight_execution = snapshot.mmap_execution_bytes == 0,
                 "CPU Memory Fabric runtime counters"
+            );
+            tracing::info!(
+                storage_read_gb = snapshot.physical_bytes as f64 / 1e9,
+                storage_reads = snapshot.physical_reads,
+                rss_gb = resident_set_bytes as f64 / 1e9,
+                "storage"
             );
         }
         #[cfg(feature = "backend-cuda")]
@@ -1299,7 +1556,7 @@ impl Engine {
             .downcast_ref::<backend_cuda::CudaBackend>()
         {
             let snapshot = cuda.metrics();
-            tracing::info!(
+            tracing::debug!(
                 device_weight_resident_bytes = self
                     .model
                     .memory_fabric
@@ -1337,6 +1594,7 @@ impl Engine {
                         .saturating_add(snapshot.storage_prefetch_misses)
                         .max(1) as f64,
                 cpu_partition_ops = snapshot.cpu_partition_count,
+                cpu_fallback_ops = snapshot.cpu_fallback_count,
                 "Memory Fabric runtime counters"
             );
         }
@@ -1456,6 +1714,11 @@ impl Engine {
                     &self.model.spec.layer_kv_heads_for_state(),
                     self.model.spec.d_model,
                     self.model.spec.shortconv_l_cache,
+                    self.model.spec.gdn_conv_kernel,
+                    self.model.spec.gdn_inner_size,
+                    self.model.spec.gdn_key_heads,
+                    self.model.spec.gdn_value_heads,
+                    self.model.spec.gdn_state_size,
                 )
             })
             .transpose()
@@ -1522,11 +1785,17 @@ impl Engine {
         compute_logits: bool,
     ) -> Result<Tensor> {
         std::mem::swap(&mut self.model.seq, seq_cache);
-        std::mem::swap(&mut self.model.conv, conv);
+        if let (Some(bound), Some(request)) = (&mut self.model.conv, conv.as_ref()) {
+            copy_hybrid_state(request, bound)?;
+        }
         let result = self
             .model
             .step(self.backend.as_ref(), tok, pos, compute_logits);
-        std::mem::swap(&mut self.model.conv, conv);
+        if let (Some(bound), Some(request)) = (&self.model.conv, conv.as_mut()) {
+            // Export even on an execution error: the caller's transaction
+            // checkpoint decides whether this provisional mutation is kept.
+            copy_hybrid_state(bound, request)?;
+        }
         std::mem::swap(&mut self.model.seq, seq_cache);
         result
     }
@@ -1546,6 +1815,337 @@ impl Engine {
             conv_states,
             rows,
         )
+    }
+
+    /// Prefill an isolated sequence through the normal model/KV infrastructure.
+    pub fn prefill_sequence(&mut self, token_ids: &[u32]) -> Result<DecodeSequence> {
+        self.prefill_sequence_observing(token_ids, |_, _, _| Ok(()))
+    }
+
+    /// Prefill while synchronously exposing requested feature taps after every
+    /// committed prompt token. This is used to catch up stateful speculators
+    /// without retaining the entire prompt activation history.
+    pub fn prefill_sequence_observing(
+        &mut self,
+        token_ids: &[u32],
+        mut observe: impl FnMut(
+            u32,
+            usize,
+            &[fellm_plugin_abi::CapturedTargetFeature<'_>],
+        ) -> Result<()>,
+    ) -> Result<DecodeSequence> {
+        if token_ids.is_empty() {
+            return Err(FellmError::other("empty prompt"));
+        }
+        if token_ids.len() >= self.model.max_seq {
+            return Err(FellmError::other("prompt exceeds model context"));
+        }
+        let mut cache = self.model.cache.new_sequence(self.model.max_seq);
+        let mut recurrent = self.new_hybrid_state()?;
+        let mut pending_logits = None;
+        for (position, &token) in token_ids.iter().enumerate() {
+            pending_logits = Some(self.step_sequence_state(
+                &mut cache,
+                &mut recurrent,
+                token,
+                position,
+                position + 1 == token_ids.len(),
+            )?);
+            self.with_target_features(|features| observe(token, position, features))?;
+        }
+        Ok(DecodeSequence {
+            cache,
+            recurrent,
+            pending_logits: pending_logits.expect("non-empty prompt"),
+            position: token_ids.len(),
+        })
+    }
+
+    /// Consume one committed token and replace the sequence's next-token logits.
+    pub fn advance_sequence(&mut self, sequence: &mut DecodeSequence, token: u32) -> Result<()> {
+        if sequence.position >= self.model.max_seq {
+            return Err(FellmError::other("sequence reached model context limit"));
+        }
+        sequence.pending_logits = self.step_sequence_state(
+            &mut sequence.cache,
+            &mut sequence.recurrent,
+            token,
+            sequence.position,
+            true,
+        )?;
+        sequence.position += 1;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn begin_sequence_transaction(&self, sequence: &DecodeSequence) -> crate::KvTransaction {
+        self.model.cache.begin_transaction(&sequence.cache)
+    }
+
+    /// Finalize a provisional sequence prefix and restore its logical cursor.
+    pub fn finalize_sequence_transaction(
+        &mut self,
+        sequence: &mut DecodeSequence,
+        transaction: &mut crate::KvTransaction,
+        accepted_tokens: usize,
+        recurrent_checkpoint: Option<HybridConvState>,
+    ) -> Result<()> {
+        let start = transaction.start_len();
+        if accepted_tokens == 0 {
+            self.model
+                .cache
+                .rollback_transaction(&mut sequence.cache, transaction)?;
+            sequence.recurrent = recurrent_checkpoint;
+        } else {
+            self.model.cache.commit_transaction(
+                &mut sequence.cache,
+                transaction,
+                accepted_tokens,
+            )?;
+        }
+        sequence.position = start.saturating_add(accepted_tokens);
+        Ok(())
+    }
+
+    /// Release all physical state owned by an isolated sequence.
+    pub fn release_sequence(&mut self, mut sequence: DecodeSequence) {
+        self.model.cache.release_sequence(&mut sequence.cache);
+    }
+
+    /// Score a proposed continuation in one physical target batch where the
+    /// architecture supports it. KV writes remain provisional until finalized.
+    pub fn verify_proposal(
+        &mut self,
+        seq_cache: &mut KvSequence,
+        conv_state: &mut Option<HybridConvState>,
+        initial_logits: &Tensor,
+        proposed_tokens: &[u32],
+        start_position: usize,
+        params: &GenParams,
+        sampler_state: &sampling::SamplerState,
+    ) -> Result<crate::speculative::ProvisionalTargetVerification> {
+        if proposed_tokens.is_empty() {
+            return Err(FellmError::other("cannot verify an empty proposal"));
+        }
+        let transaction = self.model.cache.begin_transaction(seq_cache);
+        let recurrent_checkpoint = conv_state.clone();
+        let mut recurrent_prefixes = Vec::new();
+        let mut feature_rows = Vec::with_capacity(proposed_tokens.len());
+        let outputs = {
+            let packed = false;
+            if packed {
+                let rows: Vec<BatchToken> = proposed_tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, &token)| BatchToken {
+                        sequence: 0,
+                        token,
+                        position: start_position + offset,
+                        compute_logits: true,
+                    })
+                    .collect();
+                match self.model.step_batch(
+                    &self.gguf,
+                    self.backend.as_ref(),
+                    &mut [seq_cache],
+                    &mut [conv_state],
+                    &rows,
+                ) {
+                    Ok(outputs) => {
+                        for _ in &rows {
+                            recurrent_prefixes.push(conv_state.clone());
+                        }
+                        let k = rows.len();
+                        if let Some(batch) = self.model.batches.get(&k) {
+                            let mut split = vec![Vec::new(); k];
+                            for &feature in &self.model.target_features {
+                                let name = target_feature_output_name(feature);
+                                let packed_feat = batch
+                                    .step
+                                    .materialize_named_output(self.backend.as_ref(), &name)?;
+                                for row in 0..k {
+                                    split[row].push((feature, packed_feat.row(row)?));
+                                }
+                            }
+                            feature_rows = split;
+                        }
+                        outputs
+                    }
+                    Err(error) => {
+                        let mut transaction = transaction;
+                        let _ = self
+                            .model
+                            .cache
+                            .rollback_transaction(seq_cache, &mut transaction);
+                        *conv_state = recurrent_checkpoint;
+                        return Err(error);
+                    }
+                }
+            } else {
+            let mut outputs = Vec::with_capacity(proposed_tokens.len());
+            for (offset, &token) in proposed_tokens.iter().enumerate() {
+                match self.step_sequence_state(
+                    seq_cache,
+                    conv_state,
+                    token,
+                    start_position + offset,
+                    true,
+                ) {
+                    Ok(logits) => {
+                        outputs.push(Some(logits));
+                        recurrent_prefixes.push(conv_state.clone());
+                        feature_rows.push(
+                            self.model
+                                .target_features
+                                .iter()
+                                .copied()
+                                .map(|feature| {
+                                    self.capture_target_feature(feature)
+                                        .map(|tensor| (feature, tensor))
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        );
+                    }
+                    Err(error) => {
+                        let mut transaction = transaction;
+                        let _ = self
+                            .model
+                            .cache
+                            .rollback_transaction(seq_cache, &mut transaction);
+                        *conv_state = recurrent_checkpoint;
+                        return Err(error);
+                    }
+                }
+            }
+            outputs
+            }
+        };
+
+        let mut speculative_sampler = sampler_state.clone();
+        let mut workspace = sampling::SamplingWorkspace::default();
+        let first = sampling::distribution_with_workspace(
+            initial_logits.as_slice::<f32>()?,
+            sampling::SamplingOptions {
+                temperature: params.temperature,
+                top_k: params.top_k,
+                top_p: params.top_p,
+                min_p: params.min_p,
+                seed: params.seed.wrapping_add(speculative_sampler.draw_index()),
+                repetition_penalty: params.repetition_penalty,
+                frequency_penalty: params.frequency_penalty,
+                presence_penalty: params.presence_penalty,
+                logit_bias: &params.logit_bias,
+                grammar: speculative_sampler.grammar_view(),
+                recent_tokens: speculative_sampler.history(),
+            },
+            &mut workspace,
+        );
+        let mut distributions = Vec::with_capacity(proposed_tokens.len() + 1);
+        distributions.push((&first).into());
+        for (&proposed, output) in proposed_tokens.iter().zip(outputs) {
+            speculative_sampler.commit_token(proposed);
+            let logits = output
+                .ok_or_else(|| FellmError::other("target verification omitted requested logits"))?;
+            let distribution = sampling::distribution_with_workspace(
+                logits.as_slice::<f32>()?,
+                sampling::SamplingOptions {
+                    temperature: params.temperature,
+                    top_k: params.top_k,
+                    top_p: params.top_p,
+                    min_p: params.min_p,
+                    seed: params.seed.wrapping_add(speculative_sampler.draw_index()),
+                    repetition_penalty: params.repetition_penalty,
+                    frequency_penalty: params.frequency_penalty,
+                    presence_penalty: params.presence_penalty,
+                    logit_bias: &params.logit_bias,
+                    grammar: speculative_sampler.grammar_view(),
+                    recent_tokens: speculative_sampler.history(),
+                },
+                &mut workspace,
+            );
+            distributions.push((&distribution).into());
+        }
+        Ok(crate::speculative::ProvisionalTargetVerification {
+            distributions,
+            kv_transaction: transaction,
+            recurrent_checkpoint,
+            recurrent_prefixes,
+            feature_rows,
+        })
+    }
+
+    /// Score ragged linear continuations for several requests in one physical
+    /// target batch. Each request retains an independent KV transaction, so a
+    /// later acceptance phase may commit different prefix lengths safely.
+    pub fn verify_proposals_ragged(
+        &mut self,
+        sequences: &mut [DecodeSequence],
+        proposed_tokens: &[Vec<u32>],
+        params: &[GenParams],
+        sampler_states: &[sampling::SamplerState],
+    ) -> Result<Vec<crate::speculative::ProvisionalTargetVerification>> {
+        let request_count = sequences.len();
+        if request_count == 0
+            || proposed_tokens.len() != request_count
+            || params.len() != request_count
+            || sampler_states.len() != request_count
+        {
+            return Err(FellmError::other(
+                "ragged verification request arrays must have the same non-zero length",
+            ));
+        }
+        if proposed_tokens.iter().any(Vec::is_empty) {
+            return Err(FellmError::other(
+                "ragged verification cannot contain an empty proposal",
+            ));
+        }
+        let mut results = Vec::with_capacity(request_count);
+        for index in 0..request_count {
+            let sequence = &mut sequences[index];
+            results.push(self.verify_proposal(
+                &mut sequence.cache,
+                &mut sequence.recurrent,
+                &sequence.pending_logits,
+                &proposed_tokens[index],
+                sequence.position,
+                &params[index],
+                &sampler_states[index],
+            )?);
+        }
+        Ok(results)
+    }
+
+    /// Commit the accepted target KV prefix or restore all provisional state.
+    pub fn finalize_verification(
+        &mut self,
+        seq_cache: &mut KvSequence,
+        conv_state: &mut Option<HybridConvState>,
+        mut verification: crate::speculative::ProvisionalTargetVerification,
+        accepted_tokens: usize,
+    ) -> Result<()> {
+        if accepted_tokens > verification.distributions.len().saturating_sub(1) {
+            return Err(FellmError::other(
+                "accepted speculative prefix exceeds proposal length",
+            ));
+        }
+        if !verification.recurrent_prefixes.is_empty() {
+            *conv_state = if accepted_tokens == 0 {
+                verification.recurrent_checkpoint.clone()
+            } else {
+                verification.recurrent_prefixes[accepted_tokens - 1].clone()
+            };
+        }
+        if accepted_tokens == 0 {
+            self.model
+                .cache
+                .rollback_transaction(seq_cache, &mut verification.kv_transaction)
+        } else {
+            self.model.cache.commit_transaction(
+                seq_cache,
+                &mut verification.kv_transaction,
+                accepted_tokens,
+            )
+        }
     }
 }
 
@@ -1571,6 +2171,31 @@ fn process_peak_rss_bytes() -> usize {
 }
 
 impl LoadedModel {
+    #[allow(dead_code)]
+    fn batch_feature_rows(
+        &self,
+        backend: &dyn Backend,
+        rows: usize,
+    ) -> Result<Vec<Vec<(fellm_plugin_abi::TargetFeature, Tensor)>>> {
+        if self.target_features.is_empty() {
+            return Ok(vec![Vec::new(); rows]);
+        }
+        let batch = self
+            .batches
+            .get(&rows)
+            .ok_or_else(|| FellmError::other("batch feature graph is not compiled"))?;
+        let mut result = vec![Vec::with_capacity(self.target_features.len()); rows];
+        for &feature in &self.target_features {
+            let tensor = batch
+                .step
+                .materialize_named_output(backend, &target_feature_output_name(feature))?;
+            for (row, target) in result.iter_mut().enumerate() {
+                target.push((feature, tensor.row(row)?));
+            }
+        }
+        Ok(result)
+    }
+
     fn new(
         gguf: &GgufFile,
         spec: ModelSpec,
@@ -1582,9 +2207,10 @@ impl LoadedModel {
         accelerator_memory: Option<fellm_plugin_abi::DeviceMemoryInfo>,
         physical_batch: usize,
         memory_fabric_config: &crate::memory_fabric::MemoryFabricConfig,
+        target_features: &[fellm_plugin_abi::TargetFeature],
     ) -> Result<Self> {
         let n_attn = spec.n_attn_layers().max(1);
-        let step_graph = build_step_graph(gguf, &spec)?;
+        let step_graph = build_step_graph_with_features(gguf, &spec, target_features)?;
         let step_plan = ExecutionPlan::from_graph(&step_graph)?;
         let bindings = collect_step_bindings(&step_graph);
         let (architecture_mode, canvas_graph, canvas_plan, canvas_bindings) =
@@ -1622,10 +2248,14 @@ impl LoadedModel {
         let weights_bytes = gguf.tensors().fold(0u64, |total, tensor| {
             total.saturating_add(tensor.dtype.byte_size(tensor.shape.num_elements()) as u64)
         });
-        let batch_activation_reserve = if spec.is_hybrid() || physical_batch <= 1 {
+        let batch_activation_reserve = if spec.is_hybrid()
+            || physical_batch <= 1
+            || !gguf.has_tensor("blk.0.attn_q.weight")
+        {
             0
         } else {
-            let graph = build_batch_step_graph(gguf, &spec, physical_batch)?;
+            let graph =
+                build_batch_step_graph_with_features(gguf, &spec, physical_batch, target_features)?;
             ExecutionPlan::from_graph(&graph)?
                 .memory
                 .arena_bytes
@@ -1703,14 +2333,24 @@ impl LoadedModel {
                 &spec.layer_kv_heads_for_state(),
                 spec.d_model,
                 spec.shortconv_l_cache,
+                spec.gdn_conv_kernel,
+                spec.gdn_inner_size,
+                spec.gdn_key_heads,
+                spec.gdn_value_heads,
+                spec.gdn_state_size,
             )?)
         } else {
             None
         };
         tracing::info!(
+            weights_gb = weights_bytes as f64 / 1e9,
+            kv_mb = fabric_snapshot.plan.budget.kv_host as f64 / 1e6,
+            staging_mb = fabric_snapshot.plan.budget.host_staging as f64 / 1e6,
+            "memory"
+        );
+        tracing::debug!(
             weight_device_bytes = fabric_snapshot.plan.budget.weights_device,
             weight_host_bytes = fabric_snapshot.plan.budget.weights_host,
-            // Storage stays authoritative while host/device replicas are resident.
             weight_storage_bytes = weights_bytes,
             device_staging_bytes = fabric_snapshot.plan.budget.device_staging,
             host_staging_bytes = fabric_snapshot.plan.budget.host_staging,
@@ -1749,7 +2389,7 @@ impl LoadedModel {
             "selected automatic Memory Fabric plan"
         );
         memory_fabric.publish_metrics();
-        tracing::info!(
+        tracing::debug!(
             weights_bytes = memory_plan.weights_bytes,
             activation_bytes = memory_plan.activation_bytes,
             kv_page_bytes = memory_plan.page_bytes,
@@ -1762,7 +2402,7 @@ impl LoadedModel {
             remaining_reserve_bytes = ?memory_plan.remaining_reserve_bytes,
             "resolved KV fabric memory budget"
         );
-        tracing::info!(
+        tracing::debug!(
             nodes = step_graph.node_count(),
             rope = bindings.rope.len(),
             kv_write = bindings.kv_write.len(),
@@ -1786,6 +2426,7 @@ impl LoadedModel {
             step_graph,
             step_plan,
             bindings,
+            target_features: target_features.to_vec(),
             compiled: None,
             batches: HashMap::new(),
             batch_activation_reserve,
@@ -1927,7 +2568,6 @@ impl LoadedModel {
             let tensors = device.arena.resolve(&physical, &lowered.tensors)?;
             let graph_replay_safe = all_permanent
                 && weights.is_some()
-                && !self.spec.is_hybrid()
                 && lowered
                     .operations
                     .iter()
@@ -1937,12 +2577,14 @@ impl LoadedModel {
                             lowered.tensors.iter().any(|desc| {
                                 desc.id == *tensor
                                     && desc.storage == fellm_plugin_abi::StorageClass::Model
-                                    && matches!(desc.dtype, DType::Q4K | DType::Q6K)
+                                    && matches!(
+                                        desc.dtype,
+                                        DType::Q4K | DType::Q5K | DType::Q6K | DType::Q8_0
+                                    )
                             })
                         })
                     });
-            tracing::info!(
-                arena_bytes = physical.arena_bytes,
+            tracing::debug!(
                 tensor_count = lowered.tensors.len(),
                 macro_ops = physical.operations.len(),
                 weight_device_bytes = weights
@@ -2004,6 +2646,16 @@ impl LoadedModel {
                         buffer: state.conv_buffer(conv_ord),
                     },
                 );
+                if state.ssm_elements() > 0 {
+                    mutable_inputs.insert(
+                        format!("ssm_in_{conv_ord}"),
+                        MutableBinding {
+                            dtype: DType::F32,
+                            shape: Shape::new(&[state.ssm_elements() as u64])?,
+                            buffer: state.ssm_buffer(conv_ord),
+                        },
+                    );
+                }
             }
         }
 
@@ -2071,11 +2723,13 @@ impl LoadedModel {
         {
             self.batches.remove(&evicted);
         }
-        let graph = build_batch_step_graph(gguf, &self.spec, rows)?;
+        let graph =
+            build_batch_step_graph_with_features(gguf, &self.spec, rows, &self.target_features)?;
         let plan = ExecutionPlan::from_graph(&graph)?;
         let bindings = collect_step_bindings(&graph);
         let mut mutable_inputs = HashMap::new();
         let mut conv_buffers = Vec::new();
+        let mut ssm_buffers = Vec::new();
         let dim = self.dummy_kv.tokens_stride;
         let shape = Shape::new(&[self.dummy_kv.max_seq as u64, dim as u64])?;
         for layer in 0..self.spec.n_attn_layers() {
@@ -2097,7 +2751,8 @@ impl LoadedModel {
             );
         }
         if self.spec.is_hybrid() {
-            let elements = self.spec.shortconv_l_cache.saturating_sub(1) * self.spec.d_model;
+            let elements = self.spec.recurrent_conv_elements();
+            let ssm_elements = self.spec.recurrent_ssm_elements();
             for conv_ord in 0..self.spec.n_conv_layers() {
                 let buffer = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(
                     rows.saturating_mul(elements).saturating_mul(4),
@@ -2112,6 +2767,21 @@ impl LoadedModel {
                     },
                 );
                 conv_buffers.push(buffer);
+                if ssm_elements > 0 {
+                    let ssm_buffer = Rc::new(RefCell::new(AlignedBuffer::new_zeroed(
+                        rows.saturating_mul(ssm_elements).saturating_mul(4),
+                        64,
+                    )));
+                    mutable_inputs.insert(
+                        format!("ssm_in_{conv_ord}"),
+                        MutableBinding {
+                            dtype: DType::F32,
+                            shape: Shape::new(&[rows as u64, ssm_elements as u64])?,
+                            buffer: ssm_buffer.clone(),
+                        },
+                    );
+                    ssm_buffers.push(ssm_buffer);
+                }
             }
         }
         let step = CompiledStep::compile(&graph, &plan, backend, &mutable_inputs)?;
@@ -2122,6 +2792,7 @@ impl LoadedModel {
                 bindings,
                 step,
                 conv_buffers,
+                ssm_buffers,
             },
         );
         Ok(())
@@ -2140,7 +2811,8 @@ impl LoadedModel {
         }
         self.compile_batch(gguf, backend, rows.len())?;
         if self.spec.is_hybrid() {
-            let elements = self.spec.shortconv_l_cache.saturating_sub(1) * self.spec.d_model;
+            let elements = self.spec.recurrent_conv_elements();
+            let ssm_elements = self.spec.recurrent_ssm_elements();
             let batch = self.batches.get_mut(&rows.len()).expect("compiled batch");
             for (conv_ord, packed) in batch.conv_buffers.iter().enumerate() {
                 let mut packed = packed.borrow_mut();
@@ -2153,6 +2825,19 @@ impl LoadedModel {
                     let source = source.borrow();
                     let start = batch_row * elements * 4;
                     packed.as_mut_slice()[start..start + elements * 4]
+                        .copy_from_slice(source.as_slice());
+                }
+            }
+            for (conv_ord, packed) in batch.ssm_buffers.iter().enumerate() {
+                let mut packed = packed.borrow_mut();
+                for (batch_row, row) in rows.iter().enumerate() {
+                    let state = conv_states[row.sequence]
+                        .as_ref()
+                        .ok_or_else(|| FellmError::other("missing per-sequence recurrent state"))?;
+                    let source = state.ssm_buffer(conv_ord);
+                    let source = source.borrow();
+                    let start = batch_row * ssm_elements * 4;
+                    packed.as_mut_slice()[start..start + ssm_elements * 4]
                         .copy_from_slice(source.as_slice());
                 }
             }
@@ -2188,14 +2873,19 @@ impl LoadedModel {
         }
         self.cache.tick();
 
-        let n_logical = sequences[0].layer_map(0).num_pages().max(1);
+        let n_logical = rows
+            .iter()
+            .map(|row| sequences[row.sequence].layer_map(0).num_pages())
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let mut block_tables = Vec::with_capacity(rows.len() * self.cache.n_layers() * n_logical);
         for row in rows {
             let sequence = &sequences[row.sequence];
-            if sequence.layer_map(0).num_pages().max(1) != n_logical {
-                return Err(FellmError::other("batch block-table widths differ"));
-            }
-            block_tables.extend(self.cache.physical_block_table(sequence));
+            block_tables.extend(
+                self.cache
+                    .physical_block_table_padded(sequence, n_logical)?,
+            );
         }
         let (device_arena, device_arena_len) = {
             #[cfg(feature = "backend-cuda")]
@@ -2251,9 +2941,11 @@ impl LoadedModel {
             }
             for &id in &batch.bindings.attention {
                 let mut attrs = batch.graph.node(id).attrs;
-                attrs.block_size = crate::kv_fabric::BLOCK_SIZE as u32;
-                attrs.query_len = rows.len() as u32;
-                attrs.custom_op_id = fellm_plugin_abi::attention_dispatch().prefill.as_u32();
+                if batch.graph.node(id).op != Some(OpKind::MlaAttention) {
+                    attrs.block_size = crate::kv_fabric::BLOCK_SIZE as u32;
+                    attrs.query_len = rows.len() as u32;
+                    attrs.custom_op_id = fellm_plugin_abi::attention_dispatch().prefill.as_u32();
+                }
                 batch.step.set_attrs(id, attrs);
             }
             batch.step.bind_input(
@@ -2269,7 +2961,8 @@ impl LoadedModel {
                 .map(|(index, row)| row.compute_logits.then(|| logits.row(index)).transpose())
                 .collect::<Result<Vec<_>>>()?;
             if self.spec.is_hybrid() {
-                let elements = self.spec.shortconv_l_cache.saturating_sub(1) * self.spec.d_model;
+                let elements = self.spec.recurrent_conv_elements();
+                let ssm_elements = self.spec.recurrent_ssm_elements();
                 for (conv_ord, packed) in batch.conv_buffers.iter().enumerate() {
                     let packed = packed.borrow();
                     for (batch_row, row) in rows.iter().enumerate() {
@@ -2280,6 +2973,18 @@ impl LoadedModel {
                         target
                             .as_mut_slice()
                             .copy_from_slice(&packed.as_slice()[start..start + elements * 4]);
+                    }
+                }
+                for (conv_ord, packed) in batch.ssm_buffers.iter().enumerate() {
+                    let packed = packed.borrow();
+                    for (batch_row, row) in rows.iter().enumerate() {
+                        let state = conv_states[row.sequence].as_mut().expect("validated state");
+                        let target = state.ssm_buffer(conv_ord);
+                        let mut target = target.borrow_mut();
+                        let start = batch_row * ssm_elements * 4;
+                        target
+                            .as_mut_slice()
+                            .copy_from_slice(&packed.as_slice()[start..start + ssm_elements * 4]);
                     }
                 }
             }
@@ -2471,12 +3176,17 @@ impl LoadedModel {
         let dispatch = fellm_plugin_abi::attention_dispatch();
         for &id in &self.bindings.attention {
             let mut a = self.step_graph.node(id).attrs;
-            // Attention length = dense retained+new rows (not absolute pos).
+            a.position = pos_u32;
             a.past_len = dense_past;
-            a.block_size = 16;
-            a.query_len = 1;
-            a.kv_len = dense_len as u32;
-            a.custom_op_id = dispatch.decode.as_u32();
+            // Paged full-attention overlays must not clobber MLA fields that reuse
+            // `block_size` (compress ratio), `query_len` (indexer head dim), and
+            // `kv_len` (indexer top-k).
+            if self.step_graph.node(id).op != Some(OpKind::MlaAttention) {
+                a.block_size = 16;
+                a.query_len = 1;
+                a.kv_len = dense_len as u32;
+                a.custom_op_id = dispatch.decode.as_u32();
+            }
             step.set_attrs(id, a);
         }
 
@@ -2500,8 +3210,7 @@ impl LoadedModel {
                 let materialized_at = boundary_profile.then(Instant::now);
                 let result = step.materialize_result(backend, true);
                 if boundary_profile {
-                    tracing::info!(
-                        launch_us = launch_us.unwrap_or_default(),
+                    tracing::debug!(
                         materialize_us = materialized_at
                             .map(|started| started.elapsed().as_micros())
                             .unwrap_or_default(),
@@ -2514,7 +3223,7 @@ impl LoadedModel {
                 let capture = cuda.begin_graph_capture()?;
                 step.enqueue(backend, true)?;
                 decode.graph = Some(capture.finish()?);
-                tracing::info!(
+                tracing::debug!(
                     macro_ops = decode._physical.operations.len(),
                     "captured stable CUDA decode graph"
                 );
@@ -2640,7 +3349,7 @@ pub struct TokenStream<'a> {
     position: usize,
     finished: bool,
     stop_token_ids: Vec<u32>,
-    generated_tokens: Vec<u32>,
+    sampler_state: sampling::SamplerState,
     sampling: sampling::SamplingWorkspace,
     stats: GenStats,
     gen_start: Instant,
@@ -2720,20 +3429,74 @@ impl Iterator for TokenStream<'_> {
                     return Some(Err(error));
                 }
             };
+            if !logits.iter().any(|value| value.is_finite()) {
+                self.finished = true;
+                return Some(Err(FellmError::other(
+                    "logits are not finite; refusing to sample token 0",
+                )));
+            }
+            if crate::activation::ActivationStats::collect(logits).all_zero() {
+                self.finished = true;
+                return Some(Err(FellmError::other(
+                    "all output logits are zero; inference result is invalid",
+                )));
+            }
+            if self.emitted == 0 {
+                let top = sampling::top_logits(logits, 8);
+                let top_fmt: Vec<String> = top
+                    .iter()
+                    .map(|(id, logit)| {
+                        let piece = self
+                            .engine
+                            .tokenizer
+                            .vocabulary_piece(*id)
+                            .unwrap_or("?");
+                        format!("{id}:{logit:.4}:{piece}")
+                    })
+                    .collect();
+                let bos = self.engine.tokenizer.bos().unwrap_or(0) as usize;
+                let eos = self.engine.tokenizer.eos().unwrap_or(1) as usize;
+                tracing::debug!(
+                    vocab = logits.len(),
+                    finite = logits.iter().filter(|v| v.is_finite()).count(),
+                    max = logits
+                        .iter()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .fold(f32::NEG_INFINITY, f32::max),
+                    min = logits
+                        .iter()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .fold(f32::INFINITY, f32::min),
+                    bos_logit = logits.get(bos).copied().unwrap_or(f32::NAN),
+                    eos_logit = logits.get(eos).copied().unwrap_or(f32::NAN),
+                    top = %top_fmt.join(" | "),
+                    "first-step logits"
+                );
+            }
             sampling::sample_with_workspace(
                 logits,
                 sampling::SamplingOptions {
                     temperature: self.params.temperature,
                     top_k: self.params.top_k,
                     top_p: self.params.top_p,
-                    seed: self.params.seed.wrapping_add(u64::from(self.emitted)),
+                    min_p: self.params.min_p,
+                    seed: self
+                        .params
+                        .seed
+                        .wrapping_add(self.sampler_state.draw_index()),
                     repetition_penalty: self.params.repetition_penalty,
-                    recent_tokens: &self.generated_tokens,
+                    frequency_penalty: self.params.frequency_penalty,
+                    presence_penalty: self.params.presence_penalty,
+                    logit_bias: &self.params.logit_bias,
+                    grammar: self.sampler_state.grammar_view(),
+                    recent_tokens: self.sampler_state.history(),
                 },
                 &mut self.sampling,
             )
         };
-        self.generated_tokens.push(tok);
+        self.sampler_state.commit_token(tok);
         self.emitted += 1;
         self.stats.predicted_tokens = self.emitted;
 
@@ -2744,7 +3507,7 @@ impl Iterator for TokenStream<'_> {
         }
         self.last_token_at = Some(now);
 
-        if self.stop_token_ids.contains(&tok) {
+        if self.stop_token_ids.contains(&tok) || self.sampler_state.grammar_is_accepting() {
             self.finished = true;
             return Some(Ok(tok));
         }
@@ -2822,6 +3585,41 @@ fn install_attention_dispatch(providers: &crate::providers::ProviderManager, bac
 
 fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+fn target_feature_output_name(feature: fellm_plugin_abi::TargetFeature) -> String {
+    match feature {
+        fellm_plugin_abi::TargetFeature::EmbeddingOutput => "feature.embedding".into(),
+        fellm_plugin_abi::TargetFeature::LayerHiddenState(layer) => {
+            format!("feature.layer.{layer}")
+        }
+        fellm_plugin_abi::TargetFeature::FinalHiddenState => "feature.final".into(),
+    }
+}
+
+fn copy_hybrid_state(source: &HybridConvState, target: &mut HybridConvState) -> Result<()> {
+    if source.conv.len() != target.conv.len() || source.ssm.len() != target.ssm.len() {
+        return Err(FellmError::other(
+            "hybrid recurrent state topology mismatch",
+        ));
+    }
+    for (source, target) in source.conv.iter().zip(&target.conv) {
+        let source = source.borrow();
+        let mut target = target.borrow_mut();
+        if source.len() != target.len() {
+            return Err(FellmError::other("hybrid convolution state size mismatch"));
+        }
+        target.as_mut_slice().copy_from_slice(source.as_slice());
+    }
+    for (source, target) in source.ssm.iter().zip(&target.ssm) {
+        let source = source.borrow();
+        let mut target = target.borrow_mut();
+        if source.len() != target.len() {
+            return Err(FellmError::other("hybrid matrix state size mismatch"));
+        }
+        target.as_mut_slice().copy_from_slice(source.as_slice());
+    }
+    Ok(())
 }
 
 fn scalar_u32_tensor(v: u32) -> Tensor {

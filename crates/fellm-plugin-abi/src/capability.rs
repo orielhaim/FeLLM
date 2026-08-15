@@ -25,6 +25,8 @@ pub enum CapabilityKind {
     Sampler = 6,
     /// Graph rewrite / fusion transforms.
     GraphTransform = 7,
+    /// Draft/proposal generation for runtime-owned speculative verification.
+    Speculator = 8,
 }
 
 impl CapabilityKind {
@@ -39,6 +41,7 @@ impl CapabilityKind {
             Self::SequenceStatePolicy => "sequence_state_policy",
             Self::Sampler => "sampler",
             Self::GraphTransform => "graph_transform",
+            Self::Speculator => "speculator",
         }
     }
 
@@ -54,6 +57,7 @@ impl CapabilityKind {
             }
             "sampler" | "sampling" => Some(Self::Sampler),
             "graph_transform" | "graph" => Some(Self::GraphTransform),
+            "speculator" | "speculative" | "draft" => Some(Self::Speculator),
             _ => None,
         }
     }
@@ -524,6 +528,8 @@ pub struct ProviderSelection {
     pub kv_policy: Option<String>,
     /// Explicit sampler provider name, if any.
     pub sampler: Option<String>,
+    /// Explicit speculative proposal provider, if any.
+    pub speculator: Option<String>,
     /// Plugin-specific configuration.
     pub config: PluginConfig,
 }
@@ -543,6 +549,7 @@ impl ProviderSelection {
             CapabilityKind::Attention => self.attention = Some(name),
             CapabilityKind::SequenceStatePolicy => self.kv_policy = Some(name),
             CapabilityKind::Sampler => self.sampler = Some(name),
+            CapabilityKind::Speculator => self.speculator = Some(name),
             _ => {
                 // Architecture / kernel / graph are selected by other paths today.
             }
@@ -557,6 +564,7 @@ impl ProviderSelection {
             CapabilityKind::Attention => self.attention.as_deref(),
             CapabilityKind::SequenceStatePolicy => self.kv_policy.as_deref(),
             CapabilityKind::Sampler => self.sampler.as_deref(),
+            CapabilityKind::Speculator => self.speculator.as_deref(),
             _ => None,
         }
     }
@@ -589,6 +597,15 @@ mod tests {
         let need = FeatureSet::from_ids([FeatureId::ATTN_PAGED_KV, FeatureId::ATTN_DECODE]);
         assert!(have.contains_all(&need));
         assert!(!have.contains_all(&FeatureSet::from_ids([FeatureId::ATTN_PREFILL])));
+    }
+
+    #[test]
+    fn parses_speculator_capability() {
+        assert_eq!(
+            CapabilityKind::parse("speculative"),
+            Some(CapabilityKind::Speculator)
+        );
+        assert_eq!(CapabilityKind::Speculator.name(), "speculator");
     }
 
     #[test]

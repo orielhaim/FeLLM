@@ -16,6 +16,8 @@ tracy = ["dep:tracing-tracy"]
 
 [dependencies]
 fellm-architecture-diffusion-gemma = { path = "../../plugins/diffusion_gemma" }
+fellm-dspark = { path = "../../plugins/dspark" }
+fellm-mtp = { path = "../../plugins/mtp" }
 fellm-core.workspace = true
 fellm-gguf.workspace = true
 fellm-tokenizer.workspace = true

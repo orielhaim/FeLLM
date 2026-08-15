@@ -17,7 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OXIDE_NIGHTLY="nightly-2026-04-03"
-CUDA_OXIDE_REV="84e663efe4afdc60833fde8106fbb2e6afa24d84"
+CUDA_OXIDE_REV="1f4d813719012d384f2db12b88efc9314c8bf50c"
 CARGO_OXIDE_MARKER="${HOME}/.cargo/.fellm-cuda-oxide-rev"
 DO_APT=0
 for arg in "$@"; do

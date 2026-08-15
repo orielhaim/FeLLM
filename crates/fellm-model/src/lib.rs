@@ -15,8 +15,9 @@ pub mod rope;
 pub mod tools;
 
 pub use graph::{
-    StepBindings, build_batch_step_graph, build_diffusion_canvas_graph, build_step_graph,
-    collect_step_bindings,
+    StepBindings, build_batch_step_graph, build_batch_step_graph_with_features,
+    build_diffusion_canvas_graph, build_dspark_proposal_graph, build_mtp_step_graph,
+    build_step_graph, build_step_graph_with_features, collect_step_bindings,
 };
 pub use probe::{FfnKind, LayerSpec, MixKind, ModelSpec, RopeScalingType};
 pub use tools::parse_assistant_output;

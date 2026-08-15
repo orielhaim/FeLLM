@@ -4,7 +4,7 @@ use crate::kernels::matmul;
 use fellm_core::dtype::DType;
 use fellm_core::error::{FellmError, Result};
 
-fn matvec_weight(
+pub(super) fn matvec_weight(
     w_bytes: &[u8],
     w_dtype: DType,
     x: &[f32],
@@ -19,7 +19,7 @@ fn matvec_weight(
             matmul::matvec_f32(w, x, y, out_dim, in_dim);
             Ok(())
         }
-        DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q5K | DType::Q6K => {
             matmul::matvec_quant(w_bytes, w_dtype, x, y, out_dim, in_dim)
         }
         other => Err(FellmError::UnsupportedDType(other)),

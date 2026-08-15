@@ -43,10 +43,70 @@ pub fn dequantize_row(dtype: DType, src: &[u8], dst: &mut [f32], n_elements: usi
         DType::Q4_0 => dequantize_q4_0(src, dst, n_elements),
         DType::Q5_0 => dequantize_q5_0(src, dst, n_elements),
         DType::Q8_0 => dequantize_q8_0(src, dst, n_elements),
+        DType::Q2K => dequantize_q2_k(src, dst, n_elements),
         DType::Q4K => dequantize_q4_k(src, dst, n_elements),
+        DType::Q5K => dequantize_q5_k(src, dst, n_elements),
         DType::Q6K => dequantize_q6_k(src, dst, n_elements),
+        DType::IQ2XS | DType::IQ2XXS | DType::IQ3XXS | DType::IQ3S | DType::MXFP4 => {
+            crate::iq::dequantize_row(dtype, src, dst, n_elements)
+        }
         other => Err(FellmError::UnsupportedDType(other)),
     }
+}
+
+// --- Q5_K super-block ---
+// Layout: fp16 d, fp16 dmin, 12 packed scale/min bytes, 32 high-bit bytes,
+// then 128 low-nibble bytes. This follows ggml's block_q5_K exactly.
+fn dequantize_q5_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
+    if !n_elements.is_multiple_of(QK_K) {
+        return Err(FellmError::other("Q5_K: n_elements not multiple of 256"));
+    }
+    let block_bytes = DType::Q5K.bytes_per_block();
+    let n_blocks = n_elements / QK_K;
+    if src.len() < n_blocks * block_bytes {
+        return Err(FellmError::other("Q5_K: src too small"));
+    }
+    for block_index in 0..n_blocks {
+        let base = block_index * block_bytes;
+        let d = f16::from_bits(u16::from_le_bytes([src[base], src[base + 1]])).to_f32();
+        let dmin = f16::from_bits(u16::from_le_bytes([src[base + 2], src[base + 3]])).to_f32();
+        let scales = &src[base + 4..base + 16];
+        let qh = &src[base + 16..base + 48];
+        let qs = &src[base + 48..base + 176];
+        let out = &mut dst[block_index * QK_K..(block_index + 1) * QK_K];
+        let mut scale_index = 0;
+        let mut low_offset = 0;
+        let mut output_offset = 0;
+        let mut low_high_bit = 1_u8;
+        let mut high_high_bit = 2_u8;
+        for _ in 0..4 {
+            let (low_scale, low_min) = get_scale_min_k4(scale_index, scales);
+            let (high_scale, high_min) = get_scale_min_k4(scale_index + 1, scales);
+            let low = &qs[low_offset..low_offset + 32];
+            for index in 0..32 {
+                let quant =
+                    (low[index] & 0x0f) + if qh[index] & low_high_bit != 0 { 16 } else { 0 };
+                out[output_offset + index] =
+                    d * f32::from(low_scale) * f32::from(quant) - dmin * f32::from(low_min);
+            }
+            for index in 0..32 {
+                let quant = (low[index] >> 4)
+                    + if qh[index] & high_high_bit != 0 {
+                        16
+                    } else {
+                        0
+                    };
+                out[output_offset + 32 + index] =
+                    d * f32::from(high_scale) * f32::from(quant) - dmin * f32::from(high_min);
+            }
+            scale_index += 2;
+            low_offset += 32;
+            output_offset += 64;
+            low_high_bit <<= 2;
+            high_high_bit <<= 2;
+        }
+    }
+    Ok(())
 }
 
 // --- Q5_0 ---
@@ -142,6 +202,52 @@ fn dequantize_q8_0(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()>
 //     low  nibbles → 32 consecutive weights with scale/min pair `is`
 //     high nibbles → next 32 consecutive weights with scale/min pair `is+1`
 //   Then advance qs by 32 and is by 2. Four such groups cover 256 weights.
+fn dequantize_q2_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
+    if !n_elements.is_multiple_of(QK_K) {
+        return Err(FellmError::other("Q2_K: n_elements not multiple of 256"));
+    }
+    let block_bytes = DType::Q2K.bytes_per_block();
+    let n_blocks = n_elements / QK_K;
+    if src.len() < n_blocks * block_bytes {
+        return Err(FellmError::other("Q2_K: src too small"));
+    }
+    for block_index in 0..n_blocks {
+        let base = block_index * block_bytes;
+        let scales = &src[base..base + 16];
+        let qs = &src[base + 16..base + 80];
+        let d = f16::from_bits(u16::from_le_bytes([src[base + 80], src[base + 81]])).to_f32();
+        let min = f16::from_bits(u16::from_le_bytes([src[base + 82], src[base + 83]])).to_f32();
+        let out = &mut dst[block_index * QK_K..(block_index + 1) * QK_K];
+        let mut y = 0usize;
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        for _ in 0..2 {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                let sc = scales[is];
+                is += 1;
+                let dl = d * f32::from(sc & 0xF);
+                let ml = min * f32::from(sc >> 4);
+                for l in 0..16 {
+                    out[y + l] = dl * f32::from((qs[q_off + l] >> shift) & 3) - ml;
+                }
+                y += 16;
+                let sc = scales[is];
+                is += 1;
+                let dl = d * f32::from(sc & 0xF);
+                let ml = min * f32::from(sc >> 4);
+                for l in 0..16 {
+                    out[y + l] = dl * f32::from((qs[q_off + 16 + l] >> shift) & 3) - ml;
+                }
+                y += 16;
+                shift += 2;
+            }
+            q_off += 32;
+        }
+    }
+    Ok(())
+}
+
 fn dequantize_q4_k(src: &[u8], dst: &mut [f32], n_elements: usize) -> Result<()> {
     let n_blocks = n_elements / QK_K;
     if !n_elements.is_multiple_of(QK_K) {
@@ -266,6 +372,30 @@ fn dequantize_q6_k_block(block: &[u8], out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q5_k_matches_ggml_reference_fixture() {
+        let source = (0..DType::Q5K.bytes_per_block())
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let mut output = [0.0_f32; QK_K];
+        dequantize_row(DType::Q5K, &source, &mut output, QK_K).unwrap();
+        let expected = [
+            -2_645_366.25,
+            -2_645_472.0,
+            -2_645_389.75,
+            -2_645_432.75,
+            -2_645_350.5,
+            -2_645_456.25,
+            -2_645_374.0,
+            -2_645_417.25,
+        ];
+        assert_eq!(&output[..expected.len()], &expected);
+        assert_eq!(
+            output.iter().map(|&value| f64::from(value)).sum::<f64>(),
+            -438_199_440.1875
+        );
+    }
 
     #[test]
     fn q4_0_roundtrip_zero() {

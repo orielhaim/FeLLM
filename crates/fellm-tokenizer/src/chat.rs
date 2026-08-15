@@ -180,6 +180,19 @@ fn tools_for_template(tools: &[ToolDef]) -> Result<Vec<ToolForTemplate>> {
         .collect()
 }
 
+/// Extra variables forwarded into a GGUF Jinja chat template.
+#[derive(Debug, Clone, Default)]
+pub struct ChatRenderOptions {
+    /// Qwen / llama.cpp `enable_thinking`. `None` leaves the name undefined.
+    pub enable_thinking: Option<bool>,
+}
+
+/// Whether a GGUF chat template exposes the llama.cpp thinking switch.
+#[must_use]
+pub fn chat_template_supports_thinking(template_src: &str) -> bool {
+    template_src.contains("enable_thinking")
+}
+
 /// Render a GGUF / HuggingFace chat template with MiniJinja.
 pub fn render_chat_template(
     template_src: &str,
@@ -188,6 +201,27 @@ pub fn render_chat_template(
     add_generation_prompt: bool,
     bos_token: Option<&str>,
     eos_token: Option<&str>,
+) -> Result<String> {
+    render_chat_template_with_options(
+        template_src,
+        messages,
+        tools,
+        add_generation_prompt,
+        bos_token,
+        eos_token,
+        ChatRenderOptions::default(),
+    )
+}
+
+/// Render a chat template, including optional `enable_thinking`.
+pub fn render_chat_template_with_options(
+    template_src: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    add_generation_prompt: bool,
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+    options: ChatRenderOptions,
 ) -> Result<String> {
     let prepared = prepare_template(template_src);
     let env = make_env();
@@ -203,15 +237,26 @@ pub fn render_chat_template(
         Some(tool_vals)
     };
 
-    let rendered = tmpl
-        .render(context! {
+    let bos = bos_token.unwrap_or("");
+    let eos = eos_token.unwrap_or("");
+    let rendered = match options.enable_thinking {
+        Some(enable_thinking) => tmpl.render(context! {
             messages => msgs,
             add_generation_prompt => add_generation_prompt,
-            bos_token => bos_token.unwrap_or(""),
-            eos_token => eos_token.unwrap_or(""),
+            bos_token => bos,
+            eos_token => eos,
             tools => tools_opt,
-        })
-        .map_err(|e| FellmError::Tokenization(format!("chat template render: {e}")))?;
+            enable_thinking => enable_thinking,
+        }),
+        None => tmpl.render(context! {
+            messages => msgs,
+            add_generation_prompt => add_generation_prompt,
+            bos_token => bos,
+            eos_token => eos,
+            tools => tools_opt,
+        }),
+    }
+    .map_err(|e| FellmError::Tokenization(format!("chat template render: {e}")))?;
     Ok(rendered)
 }
 
@@ -241,5 +286,37 @@ mod tests {
         let tmpl = r#"{%- set ns = namespace(x="hi") -%}{%- generation -%}{{ ns.x }}{%- endgeneration -%}"#;
         let out = render_chat_template(tmpl, &[], &[], false, None, None).unwrap();
         assert_eq!(out, "hi");
+    }
+
+    #[test]
+    fn qwen_enable_thinking_closes_think_block_when_off() {
+        let tmpl = "{% if add_generation_prompt %}{% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\\n\\n</think>\\n\\n' }}{% else %}{{ '<think>\\n' }}{% endif %}{% endif %}";
+        let off = render_chat_template_with_options(
+            tmpl,
+            &[Message::text("user", "hi")],
+            &[],
+            true,
+            None,
+            None,
+            ChatRenderOptions {
+                enable_thinking: Some(false),
+            },
+        )
+        .unwrap();
+        assert_eq!(off, "<think>\n\n</think>\n\n");
+        let on = render_chat_template_with_options(
+            tmpl,
+            &[Message::text("user", "hi")],
+            &[],
+            true,
+            None,
+            None,
+            ChatRenderOptions {
+                enable_thinking: Some(true),
+            },
+        )
+        .unwrap();
+        assert_eq!(on, "<think>\n");
+        assert!(chat_template_supports_thinking(tmpl));
     }
 }

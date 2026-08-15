@@ -14,8 +14,21 @@ pub enum RopeScalingType {
     None,
     /// Linear scaling.
     Linear,
+    /// YaRN / NTK-aware interpolation.
+    Yarn,
     /// Llama-3 piecewise interpolation.
     Llama3,
+}
+
+/// Coordinate pairing used by rotary position embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopePairing {
+    /// Consecutive scalar pairs, used by Llama-style RoPE.
+    Adjacent,
+    /// Rotate the last `rope_dim` elements of each head (DeepSeek MLA).
+    TailAdjacent,
+    /// First-half/second-half pairs, used by NeoX and multimodal RoPE.
+    SplitHalf,
 }
 
 /// Mix (token-mixing) block for one layer.
@@ -38,6 +51,8 @@ pub enum MixKind {
     },
     /// Short convolution recurrent mix.
     ShortConv,
+    /// Qwen3.5-style recurrent Gated DeltaNet.
+    GatedDeltaNet,
 }
 
 /// Feed-forward block for one layer.
@@ -62,6 +77,8 @@ pub struct LayerSpec {
     pub mix: MixKind,
     /// FFN block kind.
     pub ffn: FfnKind,
+    /// DeepSeek V4 attention compression ratio (`0` = raw SWA, `4` = CSA, `128` = HCA).
+    pub compress_ratio: u32,
 }
 
 /// Architecture-agnostic model recipe derived from a GGUF file.
@@ -71,6 +88,8 @@ pub struct ModelSpec {
     pub arch_id: String,
     /// Number of blocks.
     pub n_layers: usize,
+    /// Native next-token-prediction modules appended after the target trunk.
+    pub n_mtp_layers: usize,
     /// Hidden size.
     pub d_model: usize,
     /// Query heads.
@@ -101,6 +120,8 @@ pub struct ModelSpec {
     pub rope_base: f32,
     /// `RoPE` rotation dim.
     pub rope_dim: usize,
+    /// Scalar coordinate pairing within each rotary head.
+    pub rope_pairing: RopePairing,
     /// `RoPE` scaling.
     pub rope_scaling_type: RopeScalingType,
     /// `RoPE` scale factor.
@@ -119,6 +140,16 @@ pub struct ModelSpec {
     pub tied_embeddings: bool,
     /// `ShortConv` window (`l_cache`); 0 if unused.
     pub shortconv_l_cache: usize,
+    /// Gated DeltaNet convolution width (`0` when absent).
+    pub gdn_conv_kernel: usize,
+    /// Gated DeltaNet projected value width.
+    pub gdn_inner_size: usize,
+    /// Gated DeltaNet recurrent state width.
+    pub gdn_state_size: usize,
+    /// Gated DeltaNet value-head count.
+    pub gdn_value_heads: usize,
+    /// Gated DeltaNet key-group count.
+    pub gdn_key_heads: usize,
     /// Per-layer recipe.
     pub layers: Vec<LayerSpec>,
     /// True for the DiffusionGemma encoder/decoder architecture.
@@ -127,32 +158,75 @@ pub struct ModelSpec {
     pub canvas_length: usize,
     /// Final-logit soft cap, or zero when disabled.
     pub final_logit_softcapping: f32,
-    /// Sliding-window size, or zero for non-diffusion models.
+    /// Sliding-window size, or zero for unrestricted attention.
     pub sliding_window: usize,
+    /// Hyper-connection stream count (`0` = standard residual).
+    pub hc_mult: usize,
+    /// Hyper-connection sinkhorn iterations.
+    pub hc_sinkhorn_iters: u32,
+    /// Hyper-connection epsilon.
+    pub hc_eps: f32,
+    /// DeepSeek V4 compressed-KV RoPE base (`0` = unused).
+    pub compress_rope_base: f32,
+    /// Grouped output LoRA group count.
+    pub output_group_count: usize,
+    /// Grouped output LoRA rank.
+    pub output_lora_rank: usize,
+    /// Lightning indexer top-k (`0` = unused).
+    pub indexer_top_k: usize,
+    /// Lightning indexer head count.
+    pub indexer_n_head: usize,
+    /// Lightning indexer per-head width.
+    pub indexer_head_dim: usize,
 }
 
 impl ModelSpec {
+    /// Per-sequence causal-convolution history elements for each recurrent layer.
+    #[must_use]
+    pub fn recurrent_conv_elements(&self) -> usize {
+        if self.gdn_state_size > 0 {
+            self.gdn_conv_kernel.saturating_sub(1)
+                * (self.gdn_inner_size + 2 * self.gdn_key_heads * self.gdn_state_size)
+        } else {
+            self.shortconv_l_cache.saturating_sub(1) * self.d_model
+        }
+    }
+
+    /// Per-sequence matrix-state elements for each Gated DeltaNet layer.
+    #[must_use]
+    pub fn recurrent_ssm_elements(&self) -> usize {
+        self.gdn_value_heads * self.gdn_state_size * self.gdn_state_size
+    }
+
     /// Probe a GGUF file into a [`ModelSpec`].
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let arch_id = gguf.metadata.arch()?.to_string();
         let p = arch_id.as_str();
         let m = &gguf.metadata;
 
-        let n_layers = m.get_u32(&format!("{p}.block_count"))? as usize;
+        let total_layers = m.get_u32(&format!("{p}.block_count"))? as usize;
+        let n_mtp_layers = m.get_u32(&format!("{p}.nextn_predict_layers")).unwrap_or(0) as usize;
+        if n_mtp_layers > total_layers {
+            return Err(FellmError::other(format!(
+                "{p}.nextn_predict_layers ({n_mtp_layers}) exceeds block_count ({total_layers})"
+            )));
+        }
+        let n_layers = total_layers - n_mtp_layers;
         let d_model = m.get_u32(&format!("{p}.embedding_length"))? as usize;
         let n_heads = m.get_u32(&format!("{p}.attention.head_count"))? as usize;
         if n_heads == 0 {
             return Err(FellmError::other("attention.head_count is 0"));
         }
         let is_diffusion = arch_id == "diffusion-gemma";
-        let head_dim = if is_diffusion {
-            m.get_u32(&format!("{p}.attention.key_length"))
-                .unwrap_or((d_model / n_heads) as u32) as usize
-        } else {
-            d_model / n_heads
-        };
+        // Query/key head width is not required to equal hidden_size / heads.
+        // Qwen3 is a common counterexample (2560 hidden, 32 heads, 128-wide
+        // heads). GGUF's explicit key_length is authoritative for every
+        // architecture; division is only the legacy metadata fallback.
+        let head_dim = m
+            .get_u32(&format!("{p}.attention.key_length"))
+            .unwrap_or((d_model / n_heads) as u32) as usize;
 
-        let kv_meta = read_kv_heads(m, p, n_layers, n_heads)?;
+        let kv_meta = read_kv_heads(m, p, total_layers, n_heads)?;
         let n_kv_heads = kv_meta.iter().copied().find(|&n| n > 0).unwrap_or(n_heads);
 
         let dense_ffn_dim = m.get_u32(&format!("{p}.feed_forward_length")).unwrap_or(0) as usize;
@@ -168,12 +242,15 @@ impl ModelSpec {
         let leading_dense = m
             .get_u32(&format!("{p}.leading_dense_block_count"))
             .unwrap_or(0) as usize;
-        let norm_topk_prob = get_boolish(m.get(&format!("{p}.norm_topk_prob"))).unwrap_or(true);
         let routed_scaling_factor = m
             .get_f32(&format!("{p}.routed_scaling_factor"))
+            .or_else(|_| m.get_f32(&format!("{p}.expert_weights_scale")))
             .unwrap_or(1.0);
+        let norm_topk_prob = get_boolish(m.get(&format!("{p}.expert_weights_norm")))
+            .or_else(|| get_boolish(m.get(&format!("{p}.norm_topk_prob"))))
+            .unwrap_or(true);
         let use_expert_bias =
-            (0..n_layers).any(|i| gguf.has_tensor(&format!("blk.{i}.exp_probs_b.bias")));
+            (0..total_layers).any(|i| gguf.has_tensor(&format!("blk.{i}.exp_probs_b.bias")));
 
         let norm_eps = m
             .get_f32(&format!("{p}.attention.layer_norm_rms_epsilon"))
@@ -192,11 +269,39 @@ impl ModelSpec {
         );
         let tied_embeddings = !gguf.has_tensor("output.weight");
         let shortconv_l_cache = m.get_u32(&format!("{p}.shortconv.l_cache")).unwrap_or(0) as usize;
+        let gdn_conv_kernel = m.get_u32(&format!("{p}.ssm.conv_kernel")).unwrap_or(0) as usize;
+        let gdn_inner_size = m.get_u32(&format!("{p}.ssm.inner_size")).unwrap_or(0) as usize;
+        let gdn_state_size = m.get_u32(&format!("{p}.ssm.state_size")).unwrap_or(0) as usize;
+        let gdn_value_heads = m.get_u32(&format!("{p}.ssm.time_step_rank")).unwrap_or(0) as usize;
+        let gdn_key_heads = m.get_u32(&format!("{p}.ssm.group_count")).unwrap_or(0) as usize;
 
         let canvas_length = m.get_u32("diffusion.canvas_length").unwrap_or(256) as usize;
         let final_logit_softcapping = m
             .get_f32(&format!("{p}.final_logit_softcapping"))
             .unwrap_or(0.0);
+        let compress_ratios = m
+            .get_i32_array(&format!("{p}.attention.compress_ratios"))
+            .ok()
+            .map(|v| v.iter().map(|x| *x as u32).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let compress_rope_base = m
+            .get_f32(&format!("{p}.attention.compress_rope_freq_base"))
+            .unwrap_or(0.0);
+        let output_group_count = m
+            .get_u32(&format!("{p}.attention.output_group_count"))
+            .unwrap_or(8) as usize;
+        let output_lora_rank = m
+            .get_u32(&format!("{p}.attention.output_lora_rank"))
+            .unwrap_or(1024) as usize;
+        let indexer_top_k = m
+            .get_u32(&format!("{p}.attention.indexer.top_k"))
+            .unwrap_or(0) as usize;
+        let indexer_n_head = m
+            .get_u32(&format!("{p}.attention.indexer.head_count"))
+            .unwrap_or(0) as usize;
+        let indexer_head_dim = m
+            .get_u32(&format!("{p}.attention.indexer.key_length"))
+            .unwrap_or(0) as usize;
         let sliding_window = m
             .get_u32(&format!("{p}.attention.sliding_window"))
             .unwrap_or(0) as usize;
@@ -207,6 +312,16 @@ impl ModelSpec {
         let key_length = m
             .get_u32(&format!("{p}.attention.key_length"))
             .unwrap_or(head_dim as u32) as usize;
+        let rope_pairing = if p == "deepseek4" {
+            RopePairing::TailAdjacent
+        } else if m
+            .get_i32_array(&format!("{p}.rope.dimension_sections"))
+            .is_ok()
+        {
+            RopePairing::SplitHalf
+        } else {
+            RopePairing::Adjacent
+        };
         let key_length_swa = m
             .get_u32(&format!("{p}.attention.key_length_swa"))
             .unwrap_or(key_length as u32) as usize;
@@ -222,14 +337,29 @@ impl ModelSpec {
         let mut conv_ord = 0usize;
 
         for i in 0..n_layers {
-            let has_attn = gguf.has_tensor(&format!("blk.{i}.attn_q.weight"));
+            let has_attn = gguf.has_tensor(&format!("blk.{i}.attn_q.weight"))
+                || gguf.has_tensor(&format!("blk.{i}.attn_q_a.weight"));
             let has_shortconv = gguf.has_tensor(&format!("blk.{i}.shortconv.in_proj.weight"));
+            let has_gdn = gguf.has_tensor(&format!("blk.{i}.attn_qkv.weight"))
+                && gguf.has_tensor(&format!("blk.{i}.ssm_conv1d.weight"));
             let has_dense = gguf.has_tensor(&format!("blk.{i}.ffn_gate.weight"));
             let has_moe = gguf.has_tensor(&format!("blk.{i}.ffn_gate_inp.weight"))
                 || gguf.has_tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
                 || gguf.has_tensor(&format!("blk.{i}.ffn_gate_up_exps.weight"));
 
-            let mix = if has_shortconv && !has_attn {
+            let mix = if has_gdn && !has_attn {
+                if gdn_conv_kernel == 0
+                    || gdn_inner_size == 0
+                    || gdn_state_size == 0
+                    || gdn_value_heads == 0
+                    || gdn_key_heads == 0
+                {
+                    return Err(FellmError::other(format!(
+                        "layer {i}: Gated DeltaNet tensors require complete {p}.ssm metadata"
+                    )));
+                }
+                MixKind::GatedDeltaNet
+            } else if has_shortconv && !has_attn {
                 MixKind::ShortConv
             } else if has_attn {
                 let n_kv = kv_meta.get(i).copied().unwrap_or(n_kv_heads).max(1);
@@ -237,8 +367,9 @@ impl ModelSpec {
                 let is_sliding = sliding_pattern
                     .as_ref()
                     .and_then(|pattern| pattern.get(i).copied())
-                    .unwrap_or(false);
-                let value_reuses_key = !gguf.has_tensor(&format!("blk.{i}.attn_v.weight"));
+                    .unwrap_or(sliding_window > 0);
+                let value_reuses_key = !gguf.has_tensor(&format!("blk.{i}.attn_v.weight"))
+                    || gguf.has_tensor(&format!("blk.{i}.attn_kv.weight"));
                 let layer_head_dim = if is_diffusion {
                     if value_reuses_key || !is_sliding {
                         key_length
@@ -297,6 +428,11 @@ impl ModelSpec {
                     conv_ord += 1;
                     (None, o)
                 }
+                MixKind::GatedDeltaNet => {
+                    let o = Some(conv_ord);
+                    conv_ord += 1;
+                    (None, o)
+                }
             };
 
             layers.push(LayerSpec {
@@ -305,6 +441,7 @@ impl ModelSpec {
                 conv_ordinal,
                 mix,
                 ffn,
+                compress_ratio: compress_ratios.get(i).copied().unwrap_or(0),
             });
         }
 
@@ -314,9 +451,32 @@ impl ModelSpec {
             )));
         }
 
+        for i in n_layers..total_layers {
+            for suffix in [
+                "nextn.eh_proj.weight",
+                "nextn.enorm.weight",
+                "nextn.hnorm.weight",
+            ] {
+                if !gguf.has_tensor(&format!("blk.{i}.{suffix}")) {
+                    return Err(FellmError::other(format!(
+                        "MTP module {i} is missing blk.{i}.{suffix}"
+                    )));
+                }
+            }
+        }
+
+        let hc_mult = m.get_u32(&format!("{p}.hyper_connection.count")).unwrap_or(0) as usize;
+        let hc_sinkhorn_iters = m
+            .get_u32(&format!("{p}.hyper_connection.sinkhorn_iterations"))
+            .unwrap_or(20);
+        let hc_eps = m
+            .get_f32(&format!("{p}.hyper_connection.epsilon"))
+            .unwrap_or(1e-6);
+
         Ok(Self {
             arch_id,
             n_layers,
+            n_mtp_layers,
             d_model,
             n_heads,
             n_kv_heads,
@@ -332,6 +492,7 @@ impl ModelSpec {
             norm_eps,
             rope_base,
             rope_dim,
+            rope_pairing,
             rope_scaling_type,
             rope_scaling_factor,
             rope_original_ctx,
@@ -341,11 +502,25 @@ impl ModelSpec {
             vocab_size,
             tied_embeddings,
             shortconv_l_cache,
+            gdn_conv_kernel,
+            gdn_inner_size,
+            gdn_state_size,
+            gdn_value_heads,
+            gdn_key_heads,
             layers,
             is_diffusion,
             canvas_length,
             final_logit_softcapping,
             sliding_window,
+            hc_mult,
+            hc_sinkhorn_iters,
+            hc_eps,
+            compress_rope_base,
+            output_group_count,
+            output_lora_rank,
+            indexer_top_k,
+            indexer_n_head,
+            indexer_head_dim,
         })
     }
 
@@ -358,12 +533,17 @@ impl ModelSpec {
             .count()
     }
 
+    /// Physical GGUF block indices owned by the native MTP speculator.
+    pub fn mtp_layer_indices(&self) -> std::ops::Range<usize> {
+        self.n_layers..self.n_layers + self.n_mtp_layers
+    }
+
     /// Number of `ShortConv` layers.
     #[must_use]
     pub fn n_conv_layers(&self) -> usize {
         self.layers
             .iter()
-            .filter(|l| matches!(l.mix, MixKind::ShortConv))
+            .filter(|l| matches!(l.mix, MixKind::ShortConv | MixKind::GatedDeltaNet))
             .count()
     }
 
@@ -380,7 +560,7 @@ impl ModelSpec {
             .iter()
             .map(|l| match l.mix {
                 MixKind::Attention { n_kv_heads, .. } => n_kv_heads,
-                MixKind::ShortConv => 0,
+                MixKind::ShortConv | MixKind::GatedDeltaNet => 0,
             })
             .collect()
     }
@@ -432,7 +612,7 @@ fn read_rope_scaling(
 
     let kind = match scaling_type_str.as_deref() {
         Some("llama3") => RopeScalingType::Llama3,
-        Some("linear") => RopeScalingType::Linear,
+        Some("yarn") => RopeScalingType::Yarn,
         Some("none") | None => {
             if original_ctx > 0 && factor > 1.0 {
                 RopeScalingType::Llama3
@@ -462,6 +642,7 @@ fn parse_gating_func(v: Option<&MetaValue>, numeric: Option<u32>) -> u32 {
     match v {
         Some(MetaValue::String(s)) if s.eq_ignore_ascii_case("sigmoid") => 2,
         Some(MetaValue::String(s)) if s.eq_ignore_ascii_case("softmax") => 1,
+        Some(MetaValue::String(s)) if s.eq_ignore_ascii_case("sqrtsoftplus") => 4,
         _ => 1,
     }
 }

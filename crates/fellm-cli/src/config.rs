@@ -32,6 +32,13 @@ pub struct MemoryConfig {
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub model: Option<PathBuf>,
+    pub speculative_draft: Option<PathBuf>,
+    pub speculator: Option<String>,
+    pub speculator_model: Option<PathBuf>,
+    pub speculative: Option<String>,
+    pub speculative_max_tokens: Option<usize>,
+    pub speculative_min_gain: Option<f64>,
+    pub speculative_draft_backend: Option<String>,
     pub prompt: Option<String>,
     pub system: Option<String>,
     pub completion: Option<bool>,
@@ -39,6 +46,10 @@ pub struct RunConfig {
     pub temperature: Option<f32>,
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub logit_bias: Option<Vec<String>>,
     pub seed: Option<u64>,
     pub repetition_penalty: Option<f32>,
     pub ctx_size: Option<usize>,
@@ -74,6 +85,8 @@ impl FellmConfig {
                     .map_err(|error| format!("invalid config {}: {error}", path.display()))?;
                 let base = path.parent().unwrap_or_else(|| Path::new("."));
                 resolve_relative(&mut config.run.model, base);
+                resolve_relative(&mut config.run.speculative_draft, base);
+                resolve_relative(&mut config.run.speculator_model, base);
                 resolve_relative(&mut config.run.plugin_dir, base);
                 resolve_relative(&mut config.plugins.plugin_dir, base);
                 Ok(config)

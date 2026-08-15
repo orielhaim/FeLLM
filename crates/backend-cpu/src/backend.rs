@@ -42,18 +42,28 @@ pub struct CpuBackend {
 }
 
 struct CpuWeightStorage {
-    provider: Arc<dyn fellm_memory::TransferProvider>,
+    providers: std::collections::HashMap<std::path::PathBuf, Arc<dyn fellm_memory::TransferProvider>>,
     slot_bytes: usize,
     objects: std::collections::HashMap<u64, fellm_memory::StorageObject>,
     weight_objects: std::collections::HashMap<u64, u64>,
+    sparse: std::collections::HashMap<u64, SparseWeight>,
     pending: std::collections::HashMap<u64, std::thread::JoinHandle<Result<CpuRead>>>,
     resident: Vec<Option<CpuRead>>,
     available: Vec<fellm_core::storage::AlignedBuffer>,
     physical_reads: u64,
     physical_bytes: u64,
+    expert_slice_reads: u64,
+    expert_slice_bytes: u64,
     overlap: bool,
     provider_kind: fellm_memory::StorageProviderKind,
     read_nanos: u64,
+}
+
+#[derive(Clone)]
+struct SparseWeight {
+    path: std::path::PathBuf,
+    offset: u64,
+    len: u64,
 }
 
 struct CpuRead {
@@ -73,6 +83,10 @@ pub struct CpuStorageMetrics {
     pub buffered_storage_bytes: u64,
     pub direct_storage_bytes: u64,
     pub io_compute_overlap_percent: f64,
+    pub expert_slice_reads: u64,
+    pub expert_slice_bytes: u64,
+    pub resident_dense_bytes: u64,
+    pub avg_read_bytes: f64,
 }
 
 impl CpuBackend {
@@ -104,7 +118,7 @@ impl CpuBackend {
         let threads = requested_threads
             .unwrap_or(automatic_threads)
             .clamp(1, logical);
-        tracing::info!(
+        tracing::debug!(
             cpu_threads = threads,
             automatic = requested_threads.is_none(),
             "selected CPU execution pool"
@@ -168,36 +182,46 @@ impl CpuBackend {
         buffer_bytes: usize,
         overlap: bool,
     ) -> Result<()> {
-        let path = weights
-            .first()
-            .map(|weight| weight.home.path.clone())
-            .ok_or_else(|| FellmError::other("CPU storage weight catalog is empty"))?;
-        let provider: Arc<dyn fellm_memory::TransferProvider> = match provider_kind {
-            fellm_memory::StorageProviderKind::Mmap => {
-                let file = std::fs::File::open(&path).map_err(FellmError::Io)?;
-                Arc::new(fellm_memory::MmapProvider::open(&file)?)
+        let mut providers = std::collections::HashMap::<
+            std::path::PathBuf,
+            Arc<dyn fellm_memory::TransferProvider>,
+        >::new();
+        for weight in weights {
+            let path = weight.home.path.clone();
+            if providers.contains_key(&path) {
+                continue;
             }
-            fellm_memory::StorageProviderKind::PageCache
-            | fellm_memory::StorageProviderKind::Buffered => {
-                Arc::new(fellm_memory::FileProvider::open(&path)?)
-            }
-            fellm_memory::StorageProviderKind::Direct => {
-                #[cfg(any(target_os = "linux", windows))]
-                {
-                    Arc::new(fellm_memory::DirectFileProvider::open(&path)?)
+            let provider: Arc<dyn fellm_memory::TransferProvider> = match provider_kind {
+                fellm_memory::StorageProviderKind::Mmap => {
+                    let file = std::fs::File::open(&path).map_err(FellmError::Io)?;
+                    Arc::new(fellm_memory::MmapProvider::open(&file)?)
                 }
-                #[cfg(not(any(target_os = "linux", windows)))]
-                {
-                    return Err(FellmError::other("native direct I/O unavailable"));
+                fellm_memory::StorageProviderKind::PageCache
+                | fellm_memory::StorageProviderKind::Buffered => {
+                    Arc::new(fellm_memory::FileProvider::open(&path)?)
                 }
-            }
-            fellm_memory::StorageProviderKind::IoUring => {
-                return Err(FellmError::other("io_uring provider is not operational"));
-            }
-            fellm_memory::StorageProviderKind::Gds => {
-                return Err(FellmError::other("GDS cannot feed CPU execution"));
-            }
-        };
+                fellm_memory::StorageProviderKind::Direct => {
+                    #[cfg(any(target_os = "linux", windows))]
+                    {
+                        Arc::new(fellm_memory::DirectFileProvider::open(&path)?)
+                    }
+                    #[cfg(not(any(target_os = "linux", windows)))]
+                    {
+                        return Err(FellmError::other("native direct I/O unavailable"));
+                    }
+                }
+                fellm_memory::StorageProviderKind::IoUring => {
+                    return Err(FellmError::other("io_uring provider is not operational"));
+                }
+                fellm_memory::StorageProviderKind::Gds => {
+                    return Err(FellmError::other("GDS cannot feed CPU execution"));
+                }
+            };
+            providers.insert(path, provider);
+        }
+        if providers.is_empty() {
+            return Err(FellmError::other("CPU storage weight catalog is empty"));
+        }
         let object_map = objects
             .objects()
             .iter()
@@ -214,6 +238,19 @@ impl CpuBackend {
                     .map(move |member| (member.weight.0, object.id.0))
             })
             .collect();
+        let mut sparse = std::collections::HashMap::new();
+        for weight in weights {
+            if fellm_memory::is_moe_expert_bank(&weight.name) {
+                sparse.insert(
+                    weight.id.0,
+                    SparseWeight {
+                        path: weight.home.path.clone(),
+                        offset: weight.home.offset,
+                        len: weight.home.len,
+                    },
+                );
+            }
+        }
         let maximum = object_map
             .values()
             .map(|object| object.extent.len)
@@ -222,10 +259,11 @@ impl CpuBackend {
         let slot_bytes = buffer_bytes.max(maximum).next_multiple_of(4096);
         let slots = buffer_count.max(2);
         *self.weight_storage.lock().expect("CPU weight storage lock") = Some(CpuWeightStorage {
-            provider,
+            providers,
             slot_bytes,
             objects: object_map,
             weight_objects,
+            sparse,
             pending: std::collections::HashMap::new(),
             resident: (0..slots).map(|_| None).collect(),
             available: (0..slots)
@@ -233,11 +271,13 @@ impl CpuBackend {
                 .collect(),
             physical_reads: 0,
             physical_bytes: 0,
+            expert_slice_reads: 0,
+            expert_slice_bytes: 0,
             overlap,
             provider_kind,
             read_nanos: 0,
         });
-        tracing::info!(
+        tracing::debug!(
             storage_provider = provider_kind.name(),
             storage_queue_depth = slots,
             storage_staging_bytes = slots.saturating_mul(slot_bytes),
@@ -289,6 +329,18 @@ impl CpuBackend {
                         as f64
                     / state.read_nanos as f64
             },
+            expert_slice_reads: state.expert_slice_reads,
+            expert_slice_bytes: state.expert_slice_bytes,
+            resident_dense_bytes: state
+                .resident
+                .iter()
+                .filter_map(|slot| slot.as_ref().map(|read| read.valid_len as u64))
+                .sum(),
+            avg_read_bytes: if state.physical_reads == 0 {
+                0.0
+            } else {
+                state.physical_bytes as f64 / state.physical_reads as f64
+            },
         }
     }
 
@@ -306,7 +358,21 @@ impl Default for CpuBackend {
 fn is_supported_matvec_weight_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::F32 | DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K
+        DType::F32
+            | DType::BF16
+            | DType::Q4_0
+            | DType::Q5_0
+            | DType::Q8_0
+            | DType::F16
+            | DType::Q2K
+            | DType::Q4K
+            | DType::Q5K
+            | DType::Q6K
+            | DType::IQ2XXS
+            | DType::IQ2XS
+            | DType::IQ3XXS
+            | DType::IQ3S
+            | DType::MXFP4
     )
 }
 
@@ -351,7 +417,12 @@ impl Backend for CpuBackend {
                             | DType::Q5_0
                             | DType::Q8_0
                             | DType::Q4K
+                            | DType::Q5K
                             | DType::Q6K
+                            | DType::IQ2XS
+                            | DType::IQ3XXS
+                            | DType::IQ3S
+                            | DType::MXFP4
                     ),
                     Some(DType::F32)
                 )
@@ -371,8 +442,10 @@ impl Backend for CpuBackend {
                             | DType::F16
                             | DType::BF16
                             | DType::Q4_0
+                            | DType::Q5_0
                             | DType::Q8_0
                             | DType::Q4K
+                            | DType::Q5K
                             | DType::Q6K
                     )
                 })
@@ -393,43 +466,32 @@ impl Backend for CpuBackend {
                     if is_supported_matvec_weight_dtype(*w0)
                         && is_supported_matvec_weight_dtype(*w1)
             ),
+            OpKind::GatedDeltaNet => {
+                input_dtypes.len() == 10
+                    && input_dtypes[0] == DType::F32
+                    && [1, 2, 3, 4, 9]
+                        .into_iter()
+                        .all(|index| is_supported_matvec_weight_dtype(input_dtypes[index]))
+                    && input_dtypes[5..9].iter().all(|dtype| *dtype == DType::F32)
+                    && output_dtype == DType::F32
+            }
             OpKind::MoE => {
-                if input_dtypes.len() >= 7 {
-                    let activations_ok = input_dtypes.first() == Some(&DType::F32)
-                        && input_dtypes.get(1) == Some(&DType::F32);
-                    let weights_ok = input_dtypes[2..7]
-                        .iter()
-                        .all(|dtype| is_supported_matvec_weight_dtype(*dtype));
-                    let bias_ok = input_dtypes.get(7).is_none_or(|dtype| *dtype == DType::F32);
-                    return if activations_ok && weights_ok && bias_ok {
-                        Some(KernelDescriptor {
-                            op,
-                            input_dtypes: input_dtypes.to_vec(),
-                            output_dtype,
-                            handle: Self::make_handle(op),
-                        })
-                    } else {
-                        None
-                    };
-                }
-                let base_ok = matches!(
-                    (
-                        input_dtypes.first(),
-                        input_dtypes.get(1),
-                        input_dtypes.get(2),
-                        input_dtypes.get(3),
-                        input_dtypes.get(4)
-                    ),
-                    (Some(DType::F32), Some(DType::F32), Some(w0), Some(w1), Some(w2))
-                        if is_supported_matvec_weight_dtype(*w0)
-                            && is_supported_matvec_weight_dtype(*w1)
-                            && is_supported_matvec_weight_dtype(*w2)
-                );
-                let bias_ok = input_dtypes
-                    .get(5)
-                    .map(|dtype| *dtype == DType::F32)
-                    .unwrap_or(true);
-                base_ok && bias_ok
+                let activations_ok = input_dtypes.first() == Some(&DType::F32)
+                    && input_dtypes.get(1).is_some_and(|dtype| {
+                        *dtype == DType::F32 || is_supported_matvec_weight_dtype(*dtype)
+                    });
+                let rest_ok = input_dtypes.iter().skip(2).all(|dtype| {
+                    matches!(*dtype, DType::F32 | DType::I32 | DType::U32)
+                        || is_supported_matvec_weight_dtype(*dtype)
+                });
+                activations_ok && rest_ok && input_dtypes.len() >= 5
+            }
+            OpKind::MlaAttention | OpKind::HyperConnection => {
+                input_dtypes.first() == Some(&DType::F32)
+                    && input_dtypes.iter().all(|dtype| {
+                        *dtype == DType::F32 || is_supported_matvec_weight_dtype(*dtype)
+                    })
+                    && output_dtype == DType::F32
             }
             OpKind::RmsNorm
             | OpKind::Rope
@@ -438,6 +500,8 @@ impl Backend for CpuBackend {
             | OpKind::Attention
             | OpKind::Add
             | OpKind::Mul
+            | OpKind::SigmoidGate
+            | OpKind::InterleavedHeadSelect
             | OpKind::Reshape
             | OpKind::Cast
             | OpKind::Concat
@@ -469,7 +533,7 @@ impl Backend for CpuBackend {
             .get_or(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
         let op = decode_handle(handle)?;
-        let storage = self.weight_storage.lock().expect("CPU weight storage lock");
+        let mut storage = self.weight_storage.lock().expect("CPU weight storage lock");
         if storage.is_none() {
             let mapped = inputs
                 .iter()
@@ -478,9 +542,33 @@ impl Backend for CpuBackend {
             self.mmap_execution_bytes
                 .fetch_add(mapped, Ordering::Relaxed);
         }
+        let mut aligned_copies = smallvec::SmallVec::<[fellm_core::storage::AlignedBuffer; 4]>::new();
         let mut prepared = smallvec::SmallVec::<[TensorRef; 8]>::new();
         for input in inputs {
             let mut view = *input;
+            if let Some(state) = storage.as_ref()
+                && state.sparse.contains_key(&input.logical_id)
+            {
+                prepared.push(view);
+                continue;
+            }
+            if input.data.is_null() {
+                if storage.is_none() {
+                    return Err(FellmError::other(format!(
+                        "CPU storage-backed weight {} has no storage installed",
+                        input.logical_id
+                    )));
+                }
+                if storage
+                    .as_ref()
+                    .is_none_or(|state| !state.weight_objects.contains_key(&input.logical_id))
+                {
+                    return Err(FellmError::other(format!(
+                        "CPU storage-backed weight {} is not in any published object",
+                        input.logical_id
+                    )));
+                }
+            }
             if let Some(state) = storage.as_ref()
                 && let Some(&object_id) = state.weight_objects.get(&input.logical_id)
             {
@@ -506,13 +594,23 @@ impl Backend for CpuBackend {
                             input.logical_id
                         ))
                     })?;
-                view.data = unsafe { read.buffer.as_slice().as_ptr().add(member.offset as usize) };
+                let src = unsafe { read.buffer.as_slice().as_ptr().add(member.offset as usize) };
                 view.byte_len = member.len;
+                if (src as usize) % 64 == 0 {
+                    view.data = src;
+                } else {
+                    let mut copy =
+                        fellm_core::storage::AlignedBuffer::new_zeroed(member.len as usize, 64);
+                    copy.as_mut_slice()[..member.len as usize]
+                        .copy_from_slice(unsafe { std::slice::from_raw_parts(src, member.len as usize) });
+                    view.data = copy.as_slice().as_ptr();
+                    aligned_copies.push(copy);
+                }
             }
             prepared.push(view);
         }
         let inputs = prepared.as_slice();
-        match op {
+        let result = match op {
             OpKind::MatMul => launch_matmul(attrs, inputs, outputs),
             OpKind::GateUpSwiGlu => launch_gate_up_swiglu(inputs, outputs),
             OpKind::Embedding => launch_embedding(inputs, outputs),
@@ -523,18 +621,25 @@ impl Backend for CpuBackend {
             OpKind::Attention => launch_attention(self, attrs, inputs, outputs),
             OpKind::Add => launch_add(inputs, outputs, self.simd),
             OpKind::Mul => launch_mul(inputs, outputs, self.simd),
+            OpKind::SigmoidGate => launch_sigmoid_gate(inputs, outputs),
             OpKind::Reshape => launch_reshape(inputs, outputs),
             OpKind::Cast => launch_cast(attrs, inputs, outputs),
             OpKind::Concat => launch_concat(inputs, outputs),
             OpKind::Sample => launch_sample(attrs, inputs, outputs),
             OpKind::KvWrite => launch_kv_write(attrs, inputs, outputs),
             OpKind::ShortConv => launch_shortconv(attrs, inputs, outputs),
-            OpKind::MoE => launch_moe(attrs, inputs, outputs),
+            OpKind::GatedDeltaNet => launch_gated_delta_net(attrs, inputs, outputs),
+            OpKind::InterleavedHeadSelect => launch_interleaved_head_select(attrs, inputs, outputs),
+            OpKind::MlaAttention => launch_mla_attention(attrs, inputs, outputs),
+            OpKind::HyperConnection => launch_hyper_connection(attrs, inputs, outputs),
+            OpKind::MoE => launch_moe(attrs, inputs, outputs, storage.as_mut()),
             OpKind::WeightedEmbedding => launch_weighted_embedding(inputs, outputs),
             _ => Err(FellmError::other(
                 "custom operation is not implemented by CPU backend",
             )),
-        }
+        };
+        drop(aligned_copies);
+        result
     }
 
     fn prefetch_weight_group(
@@ -559,15 +664,17 @@ impl Backend for CpuBackend {
             }
         }
         if required && !objects.is_empty() {
-            // Reserve the complete execution bundle before loading any member. Every constant
-            // remains published until the single kernel consuming the bundle has returned.
+            let needed = objects.iter().copied().collect::<std::collections::HashSet<_>>();
             for resident in &mut state.resident {
+                if matches!(resident, Some(read) if needed.contains(&read.object)) {
+                    continue;
+                }
                 if let Some(read) = resident.take() {
                     state.available.push(read.buffer);
                 }
             }
         }
-        for object_id in objects {
+        for object_id in objects.iter().copied() {
             if state
                 .resident
                 .iter()
@@ -582,10 +689,11 @@ impl Backend for CpuBackend {
                     .ok_or_else(|| FellmError::other("CPU prefetch object missing"))?
                     .extent
                     .clone();
-                if required
-                    && state.available.is_empty()
-                    && let Some(stale_id) = state.pending.keys().copied().next()
-                {
+                if required && state.available.is_empty() {
+                    let stale_id = state.pending.keys().copied().find(|id| {
+                        !objects.contains(id)
+                    });
+                    if let Some(stale_id) = stale_id {
                     let stale = state.pending.remove(&stale_id).expect("pending key exists");
                     let stale = stale.join().map_err(|_| {
                         FellmError::other("CPU speculative storage reader panicked")
@@ -595,9 +703,19 @@ impl Backend for CpuBackend {
                         state.physical_bytes.saturating_add(stale.valid_len as u64);
                     state.read_nanos = state.read_nanos.saturating_add(stale.read_nanos);
                     state.available.push(stale.buffer);
+                    }
                 }
                 if let Some(mut buffer) = state.available.pop() {
-                    let provider = Arc::clone(&state.provider);
+                    let provider = state
+                        .providers
+                        .get(&extent.path)
+                        .cloned()
+                        .ok_or_else(|| {
+                            FellmError::other(format!(
+                                "no storage provider for {}",
+                                extent.path.display()
+                            ))
+                        })?;
                     let valid_len = extent.len as usize;
                     let handle = std::thread::Builder::new()
                         .name(format!("fellm-cpu-storage-{}", object_id))
@@ -607,18 +725,17 @@ impl Backend for CpuBackend {
                                 .read_at(extent.offset, &mut buffer.as_mut_slice()[..valid_len])
                                 .map_err(|error| {
                                     FellmError::other(format!(
-                                        "storage object {object_id} offset={} len={}: {error}",
-                                        extent.offset, extent.len
+                                        "storage object {object_id} path={} offset={} len={}: {error}",
+                                        extent.path.display(),
+                                        extent.offset,
+                                        extent.len
                                     ))
                                 })?;
                             Ok(CpuRead {
                                 object: object_id,
                                 buffer,
                                 valid_len,
-                                read_nanos: started
-                                    .elapsed()
-                                    .as_nanos()
-                                    .min(u128::from(u64::MAX))
+                                read_nanos: started.elapsed().as_nanos().min(u128::from(u64::MAX))
                                     as u64,
                             })
                         })
@@ -674,27 +791,8 @@ impl Backend for CpuBackend {
 }
 
 fn decode_handle(h: KernelHandle) -> Result<OpKind> {
-    match h.0 {
-        x if x == u64::from(OpKind::Add.raw()) => Ok(OpKind::Add),
-        x if x == u64::from(OpKind::Mul.raw()) => Ok(OpKind::Mul),
-        x if x == u64::from(OpKind::MatMul.raw()) => Ok(OpKind::MatMul),
-        x if x == u64::from(OpKind::RmsNorm.raw()) => Ok(OpKind::RmsNorm),
-        x if x == u64::from(OpKind::Rope.raw()) => Ok(OpKind::Rope),
-        x if x == u64::from(OpKind::SiluGate.raw()) => Ok(OpKind::SiluGate),
-        x if x == u64::from(OpKind::Softmax.raw()) => Ok(OpKind::Softmax),
-        x if x == u64::from(OpKind::Attention.raw()) => Ok(OpKind::Attention),
-        x if x == u64::from(OpKind::Embedding.raw()) => Ok(OpKind::Embedding),
-        x if x == u64::from(OpKind::Concat.raw()) => Ok(OpKind::Concat),
-        x if x == u64::from(OpKind::Reshape.raw()) => Ok(OpKind::Reshape),
-        x if x == u64::from(OpKind::Cast.raw()) => Ok(OpKind::Cast),
-        x if x == u64::from(OpKind::Sample.raw()) => Ok(OpKind::Sample),
-        x if x == u64::from(OpKind::KvWrite.raw()) => Ok(OpKind::KvWrite),
-        x if x == u64::from(OpKind::ShortConv.raw()) => Ok(OpKind::ShortConv),
-        x if x == u64::from(OpKind::MoE.raw()) => Ok(OpKind::MoE),
-        x if x == u64::from(OpKind::WeightedEmbedding.raw()) => Ok(OpKind::WeightedEmbedding),
-        x if x == u64::from(OpKind::GateUpSwiGlu.raw()) => Ok(OpKind::GateUpSwiGlu),
-        _ => Err(FellmError::other(format!("bad kernel handle {h:?}"))),
-    }
+    let raw = u32::try_from(h.0).map_err(|_| FellmError::other(format!("bad kernel handle {h:?}")))?;
+    OpKind::from_u32(raw).ok_or_else(|| FellmError::other(format!("bad kernel handle {h:?}")))
 }
 
 fn as_f32_slice(t: &TensorRef) -> Result<&[f32]> {
@@ -725,6 +823,39 @@ fn as_bytes_slice(t: &TensorRef) -> &[u8] {
 fn as_u32_slice(t: &TensorRef) -> Result<&[u32]> {
     let bytes = as_bytes_slice(t);
     bytemuck::try_cast_slice(bytes).map_err(|e| FellmError::other(format!("u32 cast: {e:?}")))
+}
+
+fn as_i32_slice(t: &TensorRef) -> Result<&[i32]> {
+    let bytes = as_bytes_slice(t);
+    bytemuck::try_cast_slice(bytes).map_err(|e| FellmError::other(format!("i32 cast: {e:?}")))
+}
+
+/// Optional trailing `(tid2eid, token_id)` pair: a frozen token-id → expert-id table.
+fn moe_forced_experts<'a>(
+    inputs: &'a [TensorRef],
+    n_expert_used: usize,
+) -> Result<(usize, Option<Vec<i32>>)> {
+    if inputs.len() < 2 {
+        return Ok((inputs.len(), None));
+    }
+    let map = &inputs[inputs.len() - 2];
+    let tok = &inputs[inputs.len() - 1];
+    if map.dtype() != Some(DType::I32) || tok.dtype() != Some(DType::U32) {
+        return Ok((inputs.len(), None));
+    }
+    let table = as_i32_slice(map)?;
+    let ids = as_u32_slice(tok)?;
+    let token = *ids.first().ok_or_else(|| FellmError::other("moe: empty token_id"))?;
+    let used = n_expert_used.max(1);
+    let start = token as usize * used;
+    let end = start.saturating_add(used);
+    if end > table.len() {
+        return Err(FellmError::other(format!(
+            "moe: token {token} expert map out of range (table={}, used={used})",
+            table.len()
+        )));
+    }
+    Ok((inputs.len() - 2, Some(table[start..end].to_vec())))
 }
 
 fn launch_matmul(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
@@ -768,7 +899,18 @@ fn launch_matmul(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut
             let ws = as_f32_slice(w)?;
             matmul::matmul_f32_batch(ws, x_slice, y_slice, rows, out_dim, in_dim)?;
         }
-        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+        DType::F16 | DType::BF16 => {
+            matmul::matmul_dense16_batch(
+                as_bytes_slice(w),
+                w_dtype,
+                x_slice,
+                y_slice,
+                rows,
+                out_dim,
+                in_dim,
+            )?;
+        }
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q5K | DType::Q6K => {
             let wb = as_bytes_slice(w);
             if rows > 1 {
                 matmul::matmul_quant_batch(wb, w_dtype, x_slice, y_slice, rows, out_dim, in_dim)?;
@@ -822,7 +964,7 @@ fn launch_gate_up_swiglu(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Res
         static COMBINED_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    if gate_dtype == up_dtype && matches!(gate_dtype, DType::Q4K | DType::Q6K) {
+    if gate_dtype == up_dtype && matches!(gate_dtype, DType::Q4K | DType::Q5K | DType::Q6K) {
         return COMBINED_SCRATCH.with(|combined_cell| {
             let mut combined = combined_cell.borrow_mut();
             if combined.len() < rows * 2 {
@@ -862,7 +1004,7 @@ fn launch_gate_up_swiglu(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Res
             DType::F32 => {
                 matmul::matmul_f32_batch(as_f32_slice(&inputs[0])?, x, gate, 1, rows, cols)?
             }
-            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q5K | DType::Q6K => {
                 matmul::matvec_quant(as_bytes_slice(&inputs[0]), gate_dtype, x, gate, rows, cols)?
             }
             other => return Err(FellmError::UnsupportedDType(other)),
@@ -871,7 +1013,7 @@ fn launch_gate_up_swiglu(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Res
             DType::F32 => {
                 matmul::matmul_f32_batch(as_f32_slice(&inputs[1])?, x, out, 1, rows, cols)?
             }
-            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q5K | DType::Q6K => {
                 matmul::matvec_quant(as_bytes_slice(&inputs[1]), up_dtype, x, out, rows, cols)?
             }
             other => return Err(FellmError::UnsupportedDType(other)),
@@ -1014,13 +1156,15 @@ fn launch_rope(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut])
                     &x_in[row * row_width..(row + 1) * row_width],
                 );
             }
-            crate::kernels::rope::rope_inplace_with_freqs(
+            crate::kernels::rope::rope_inplace_with_freqs_ex(
                 values,
                 attrs.n_heads as usize,
                 attrs.head_dim as usize,
                 attrs.rope_dim as usize,
                 position,
                 inv_freqs,
+                attrs.rope_pairing == 1,
+                attrs.rope_pairing == 2,
             );
         }
     }
@@ -1036,6 +1180,43 @@ fn launch_silu_gate(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<(
     let up = as_f32_slice(&inputs[1])?;
     let y = as_f32_slice_mut(y_out)?;
     silu_gate(gate, up, y);
+    Ok(())
+}
+
+fn launch_interleaved_head_select(
+    attrs: &OpAttrs,
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    if inputs.len() != 1 || outputs.len() != 1 {
+        return Err(FellmError::other("interleaved_head_select: bad arity"));
+    }
+    let input = as_f32_slice(&inputs[0])?;
+    let output = as_f32_slice_mut(&mut outputs[0])?;
+    let heads = attrs.n_heads as usize;
+    let width = attrs.head_dim as usize;
+    let source_row = heads * width * 2;
+    let output_row = heads * width;
+    let lane = attrs.kv_slot as usize;
+    if heads == 0
+        || width == 0
+        || lane > 1
+        || !input.len().is_multiple_of(source_row)
+        || output.len() != input.len() / 2
+    {
+        return Err(FellmError::other("interleaved_head_select: shape mismatch"));
+    }
+    for (source, target) in input
+        .chunks_exact(source_row)
+        .zip(output.chunks_exact_mut(output_row))
+    {
+        for head in 0..heads {
+            let source_start = (head * 2 + lane) * width;
+            let target_start = head * width;
+            target[target_start..target_start + width]
+                .copy_from_slice(&source[source_start..source_start + width]);
+        }
+    }
     Ok(())
 }
 
@@ -1383,6 +1564,23 @@ fn launch_mul(inputs: &[TensorRef], outputs: &mut [TensorMut], simd: PulpDispatc
     Ok(())
 }
 
+fn launch_sigmoid_gate(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+    if inputs.len() < 2 || outputs.is_empty() {
+        return Err(FellmError::other("sigmoid_gate: bad arity"));
+    }
+    let (y_out, _) = outputs.split_first_mut().expect("checked");
+    let value = as_f32_slice(&inputs[0])?;
+    let gate = as_f32_slice(&inputs[1])?;
+    let output = as_f32_slice_mut(y_out)?;
+    if value.len() != gate.len() || value.len() != output.len() {
+        return Err(FellmError::other("sigmoid_gate: shape mismatch"));
+    }
+    for ((output, &value), &gate) in output.iter_mut().zip(value).zip(gate) {
+        *output = value * (1.0 / (1.0 + (-gate).exp()));
+    }
+    Ok(())
+}
+
 fn launch_reshape(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
     if inputs.is_empty() || outputs.is_empty() {
         return Err(FellmError::other("reshape: bad arity"));
@@ -1475,17 +1673,35 @@ fn launch_concat(inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> 
     }
     let (y_out, _) = outputs.split_first_mut().unwrap();
     let dst = as_f32_slice_mut(y_out)?;
-    let mut offset = 0usize;
-    for inp in inputs {
-        let s = as_f32_slice(inp)?;
-        dst[offset..offset + s.len()].copy_from_slice(s);
-        offset += s.len();
+    if inputs.is_empty() {
+        return Err(FellmError::other("concat: no inputs"));
     }
-    if offset != dst.len() {
+    let rows = inputs[0].dims_slice()[..inputs[0].dims_slice().len().saturating_sub(1)]
+        .iter()
+        .product::<u64>() as usize;
+    let rows = rows.max(1);
+    let widths = inputs
+        .iter()
+        .map(|input| input.dims_slice().last().copied().unwrap_or(1) as usize)
+        .collect::<Vec<_>>();
+    let total_width = widths.iter().sum::<usize>();
+    if dst.len() != rows * total_width {
         return Err(FellmError::other(format!(
-            "concat: length mismatch (wrote {offset}, dst {})",
+            "concat: shape mismatch (rows={rows}, width={total_width}, dst={})",
             dst.len()
         )));
+    }
+    for row in 0..rows {
+        let mut column = 0;
+        for (input, &width) in inputs.iter().zip(&widths) {
+            let values = as_f32_slice(input)?;
+            if values.len() != rows * width {
+                return Err(FellmError::other("concat: input shape mismatch"));
+            }
+            dst[row * total_width + column..row * total_width + column + width]
+                .copy_from_slice(&values[row * width..(row + 1) * width]);
+            column += width;
+        }
     }
     Ok(())
 }
@@ -1647,18 +1863,139 @@ fn launch_shortconv(
     Ok(())
 }
 
-fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+fn launch_gated_delta_net(
+    attrs: &OpAttrs,
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    use crate::kernels::gated_delta_net::{
+        GatedDeltaNetDimensions, GatedDeltaNetWeights, gated_delta_net_decode,
+    };
+    if inputs.len() != 10 || outputs.len() < 3 {
+        return Err(FellmError::other("gated_delta_net: bad arity"));
+    }
+    let (model_output, states) = outputs.split_first_mut().unwrap();
+    let (conv_output, ssm_outputs) = states.split_first_mut().unwrap();
+    let ssm_output = ssm_outputs
+        .first_mut()
+        .ok_or_else(|| FellmError::other("gated_delta_net: missing recurrent state"))?;
+    let x = as_f32_slice(&inputs[0])?;
+    let output = as_f32_slice_mut(model_output)?;
+    let conv_state = as_f32_slice_mut(conv_output)?;
+    let recurrent_state = as_f32_slice_mut(ssm_output)?;
+    let dtype = |index: usize| {
+        inputs[index]
+            .dtype()
+            .ok_or_else(|| FellmError::other("gated_delta_net: invalid weight dtype"))
+    };
+    let dimensions = GatedDeltaNetDimensions {
+        model: attrs.n_embd as usize,
+        inner: attrs.gdn_inner_size as usize,
+        key_heads: attrs.n_kv_heads as usize,
+        value_heads: attrs.n_heads as usize,
+        state_size: attrs.gdn_state_size as usize,
+        conv_kernel: attrs.gdn_conv_kernel as usize,
+        norm_epsilon: attrs.eps,
+    };
+    let weights = GatedDeltaNetWeights {
+        qkv: (as_bytes_slice(&inputs[1]), dtype(1)?),
+        z: (as_bytes_slice(&inputs[2]), dtype(2)?),
+        beta: (as_bytes_slice(&inputs[3]), dtype(3)?),
+        alpha: (as_bytes_slice(&inputs[4]), dtype(4)?),
+        dt_bias: as_f32_slice(&inputs[5])?,
+        decay: as_f32_slice(&inputs[6])?,
+        conv: as_f32_slice(&inputs[7])?,
+        norm: as_f32_slice(&inputs[8])?,
+        output: (as_bytes_slice(&inputs[9]), dtype(9)?),
+    };
+    let conv_elements = dimensions.conv_kernel.saturating_sub(1)
+        * (dimensions.inner + 2 * dimensions.key_heads * dimensions.state_size);
+    let ssm_elements = dimensions.value_heads * dimensions.state_size * dimensions.state_size;
+    if dimensions.model == 0
+        || !x.len().is_multiple_of(dimensions.model)
+        || output.len() != x.len()
+        || conv_state.len() != x.len() / dimensions.model * conv_elements
+        || recurrent_state.len() != x.len() / dimensions.model * ssm_elements
+    {
+        return Err(FellmError::other("gated_delta_net: batched shape mismatch"));
+    }
+    for (((x_row, output_row), conv_row), ssm_row) in x
+        .chunks_exact(dimensions.model)
+        .zip(output.chunks_exact_mut(dimensions.model))
+        .zip(conv_state.chunks_exact_mut(conv_elements))
+        .zip(recurrent_state.chunks_exact_mut(ssm_elements))
+    {
+        gated_delta_net_decode(x_row, &weights, conv_row, ssm_row, output_row, dimensions)?;
+    }
+    Ok(())
+}
+
+fn read_sparse_expert(
+    storage: &mut CpuWeightStorage,
+    bank: &SparseWeight,
+    expert: usize,
+    bytes_per: usize,
+) -> Result<Vec<u8>> {
+    let offset = bank.offset.saturating_add((expert * bytes_per) as u64);
+    if offset.saturating_add(bytes_per as u64) > bank.offset.saturating_add(bank.len) {
+        return Err(FellmError::other("moe: expert slice exceeds bank"));
+    }
+    let provider = storage
+        .providers
+        .get(&bank.path)
+        .cloned()
+        .ok_or_else(|| {
+            FellmError::other(format!(
+                "no storage provider for expert bank {}",
+                bank.path.display()
+            ))
+        })?;
+    let mut buf = vec![0u8; bytes_per];
+    let started = std::time::Instant::now();
+    provider
+        .read_at(offset, &mut buf)
+        .map_err(|error| FellmError::other(format!("expert slice read: {error}")))?;
+    let nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    storage.physical_reads = storage.physical_reads.saturating_add(1);
+    storage.physical_bytes = storage.physical_bytes.saturating_add(bytes_per as u64);
+    storage.expert_slice_reads = storage.expert_slice_reads.saturating_add(1);
+    storage.expert_slice_bytes = storage.expert_slice_bytes.saturating_add(bytes_per as u64);
+    storage.read_nanos = storage.read_nanos.saturating_add(nanos);
+    Ok(buf)
+}
+
+fn launch_moe(
+    attrs: &OpAttrs,
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+    mut storage: Option<&mut CpuWeightStorage>,
+) -> Result<()> {
     // inputs: [x, gate_inp, gate_exps, up_exps, down_exps, optional bias]
     // outputs: [y]
     if inputs.len() < 5 || outputs.is_empty() {
         return Err(FellmError::other("moe: bad arity"));
     }
+    let n_expert_used_hint = attrs.n_expert_used.max(1) as usize;
+    let (n_core, forced) = moe_forced_experts(inputs, n_expert_used_hint)?;
+    let inputs = &inputs[..n_core];
+    let forced_experts = forced.as_deref();
     let (y_out, _) = outputs.split_first_mut().unwrap();
     let x = as_f32_slice(&inputs[0])?;
-    let gate_inp = as_f32_slice(&inputs[1])?;
+    let gate_dtype = inputs[1]
+        .dtype()
+        .ok_or_else(|| FellmError::other("moe: gate dtype"))?;
+    let mut gate_owned;
+    let gate_inp: &[f32] = if gate_dtype == DType::F32 {
+        as_f32_slice(&inputs[1])?
+    } else {
+        let n = inputs[1].dims_slice().iter().product::<u64>() as usize;
+        gate_owned = vec![0.0f32; n.max(1)];
+        crate::dequant::dequantize_row(gate_dtype, as_bytes_slice(&inputs[1]), &mut gate_owned, n)?;
+        &gate_owned
+    };
     let y = as_f32_slice_mut(y_out)?;
 
-    if inputs.len() >= 7 {
+    if inputs.len() >= 7 && inputs[4].dims_slice().len() == 2 {
         let packed_dims = inputs[2].dims_slice();
         let down_dims = inputs[3].dims_slice();
         let shared_dims = inputs[4].dims_slice();
@@ -1800,7 +2137,10 @@ fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) 
     let down_exps_dtype = inputs[4]
         .dtype()
         .ok_or_else(|| FellmError::other("moe: down expert dtype"))?;
-    let bias = if inputs.len() > 5 {
+    let shexp = inputs.len() >= 8 && inputs[5].dims_slice().len() == 2;
+    let bias = if shexp && inputs.len() > 8 {
+        Some(as_f32_slice(&inputs[8])?)
+    } else if !shexp && inputs.len() > 5 {
         Some(as_f32_slice(&inputs[5])?)
     } else {
         None
@@ -1808,6 +2148,112 @@ fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) 
 
     if !x.len().is_multiple_of(n_embd) || y.len() != x.len() {
         return Err(FellmError::other("moe: batched shape mismatch"));
+    }
+    if let Some(storage) = storage.as_mut()
+        && storage.sparse.contains_key(&inputs[2].logical_id)
+    {
+        let gate_bank = storage
+            .sparse
+            .get(&inputs[2].logical_id)
+            .cloned()
+            .ok_or_else(|| FellmError::other("moe: missing gate expert bank"))?;
+        let up_bank = storage
+            .sparse
+            .get(&inputs[3].logical_id)
+            .cloned()
+            .ok_or_else(|| FellmError::other("moe: missing up expert bank"))?;
+        let down_bank = storage
+            .sparse
+            .get(&inputs[4].logical_id)
+            .cloned()
+            .ok_or_else(|| FellmError::other("moe: missing down expert bank"))?;
+        let gate_bpe = gate_exps_dtype.byte_size(n_ff * n_embd);
+        let up_bpe = up_exps_dtype.byte_size(n_ff * n_embd);
+        let down_bpe = down_exps_dtype.byte_size(n_embd * n_ff);
+        for (x_row, y_row) in x.chunks_exact(n_embd).zip(y.chunks_exact_mut(n_embd)) {
+            let selected = crate::kernels::moe::moe_route(
+                x_row,
+                gate_inp,
+                bias,
+                n_experts,
+                n_expert_used,
+                n_embd,
+                attrs.expert_gating_func,
+                attrs.routed_scaling_factor,
+                attrs.norm_topk_prob != 0,
+                forced_experts,
+            )?;
+            let mut gate_bufs = Vec::with_capacity(selected.len());
+            let mut up_bufs = Vec::with_capacity(selected.len());
+            let mut down_bufs = Vec::with_capacity(selected.len());
+            let mut jobs = Vec::new();
+            for &(expert, _) in &selected {
+                jobs.push((&gate_bank, expert, gate_bpe));
+                jobs.push((&up_bank, expert, up_bpe));
+                jobs.push((&down_bank, expert, down_bpe));
+            }
+            jobs.sort_by_key(|job| job.0.offset.saturating_add((job.1 * job.2) as u64));
+            let mut loaded = std::collections::HashMap::<(std::path::PathBuf, u64, usize), Vec<u8>>::new();
+            for (bank, expert, bytes_per) in jobs {
+                let buf = read_sparse_expert(storage, bank, expert, bytes_per)?;
+                loaded.insert((bank.path.clone(), bank.offset, expert), buf);
+            }
+            for &(expert, _) in &selected {
+                gate_bufs.push(
+                    loaded
+                        .remove(&(gate_bank.path.clone(), gate_bank.offset, expert))
+                        .ok_or_else(|| FellmError::other("moe: gate slice"))?,
+                );
+                up_bufs.push(
+                    loaded
+                        .remove(&(up_bank.path.clone(), up_bank.offset, expert))
+                        .ok_or_else(|| FellmError::other("moe: up slice"))?,
+                );
+                down_bufs.push(
+                    loaded
+                        .remove(&(down_bank.path.clone(), down_bank.offset, expert))
+                        .ok_or_else(|| FellmError::other("moe: down slice"))?,
+                );
+            }
+            let gate_refs: Vec<&[u8]> = gate_bufs.iter().map(Vec::as_slice).collect();
+            let up_refs: Vec<&[u8]> = up_bufs.iter().map(Vec::as_slice).collect();
+            let down_refs: Vec<&[u8]> = down_bufs.iter().map(Vec::as_slice).collect();
+            crate::kernels::moe::moe_apply_selected(
+                x_row,
+                &selected,
+                &gate_refs,
+                gate_exps_dtype,
+                &up_refs,
+                up_exps_dtype,
+                &down_refs,
+                down_exps_dtype,
+                y_row,
+                n_ff,
+                n_embd,
+            )?;
+            if shexp {
+                let shexp_ff = inputs[5].dims_slice()[0] as usize;
+                crate::kernels::moe::add_shared_expert(
+                    x_row,
+                    as_bytes_slice(&inputs[5]),
+                    inputs[5]
+                        .dtype()
+                        .ok_or_else(|| FellmError::other("moe: shexp gate dtype"))?,
+                    as_bytes_slice(&inputs[6]),
+                    inputs[6]
+                        .dtype()
+                        .ok_or_else(|| FellmError::other("moe: shexp up dtype"))?,
+                    as_bytes_slice(&inputs[7]),
+                    inputs[7]
+                        .dtype()
+                        .ok_or_else(|| FellmError::other("moe: shexp down dtype"))?,
+                    y_row,
+                    shexp_ff,
+                    n_embd,
+                )?;
+            }
+        }
+        return Ok(());
     }
     for (x_row, y_row) in x.chunks_exact(n_embd).zip(y.chunks_exact_mut(n_embd)) {
         crate::kernels::moe::moe_decode(
@@ -1828,6 +2274,168 @@ fn launch_moe(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) 
             attrs.expert_gating_func,
             attrs.routed_scaling_factor,
             attrs.norm_topk_prob != 0,
+            forced_experts,
+        )?;
+        if shexp {
+            let shexp_ff = inputs[5].dims_slice()[0] as usize;
+            crate::kernels::moe::add_shared_expert(
+                x_row,
+                as_bytes_slice(&inputs[5]),
+                inputs[5]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe: shexp gate dtype"))?,
+                as_bytes_slice(&inputs[6]),
+                inputs[6]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe: shexp up dtype"))?,
+                as_bytes_slice(&inputs[7]),
+                inputs[7]
+                    .dtype()
+                    .ok_or_else(|| FellmError::other("moe: shexp down dtype"))?,
+                y_row,
+                shexp_ff,
+                n_embd,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn launch_hyper_connection(attrs: &OpAttrs, inputs: &[TensorRef], outputs: &mut [TensorMut]) -> Result<()> {
+    if inputs.len() < 4 || outputs.is_empty() {
+        return Err(FellmError::other("hyper_connection: arity"));
+    }
+    let y = as_f32_slice_mut(&mut outputs[0])?;
+    let x = as_f32_slice(&inputs[0])?;
+    let residual = if attrs.kv_slot == 1 && inputs.len() > 4 {
+        Some(as_f32_slice(&inputs[4])?)
+    } else {
+        None
+    };
+    crate::kernels::hyper_connection::hyper_connection(
+        x,
+        residual,
+        as_bytes_slice(&inputs[1]),
+        inputs[1]
+            .dtype()
+            .ok_or_else(|| FellmError::other("deepseek4 hc fn dtype"))?,
+        as_f32_slice(&inputs[2])?,
+        as_f32_slice(&inputs[3])?,
+        y,
+        attrs.n_embd.max(1) as usize,
+        attrs.gdn_state_size.max(1) as usize,
+        attrs.kv_slot,
+        attrs.gdn_conv_kernel.max(1),
+        attrs.eps,
+        attrs.eps.max(1e-6),
+    )
+}
+
+fn launch_mla_attention(
+    attrs: &OpAttrs,
+    inputs: &[TensorRef],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    if inputs.len() < 11 || outputs.is_empty() {
+        return Err(FellmError::other("mla_attention: arity"));
+    }
+    let y = as_f32_slice_mut(&mut outputs[0])?;
+    let k_bytes = unsafe {
+        core::slice::from_raw_parts_mut(inputs[10].data as *mut u8, inputs[10].byte_len as usize)
+    };
+    let k_out: &mut [f32] = bytemuck::try_cast_slice_mut(k_bytes)
+        .map_err(|e| FellmError::other(format!("mla k cast: {e:?}")))?;
+    let mut empty_c = [];
+    let c_out: &mut [f32] = if inputs.len() > 11 {
+        let c_bytes = unsafe {
+            core::slice::from_raw_parts_mut(inputs[11].data as *mut u8, inputs[11].byte_len as usize)
+        };
+        bytemuck::try_cast_slice_mut(c_bytes)
+            .map_err(|e| FellmError::other(format!("mla c cast: {e:?}")))?
+    } else {
+        &mut empty_c
+    };
+    let pair = |idx: usize| inputs.get(idx).and_then(|t| t.dtype().map(|d| (as_bytes_slice(t), d)));
+    let extras = crate::kernels::mla::MlaExtras {
+        compress_kv: pair(12),
+        compress_gate: pair(13),
+        compress_ape: inputs.get(14).and_then(|t| as_f32_slice(t).ok()),
+        compress_norm: inputs.get(15).and_then(|t| as_f32_slice(t).ok()),
+        compress_state_dim: inputs
+            .get(12)
+            .map(|t| t.dims_slice().first().copied().unwrap_or(0) as usize)
+            .unwrap_or(0),
+        indexer_q_b: pair(16),
+        indexer_proj: pair(17),
+        indexer_comp_kv: pair(18),
+        indexer_comp_gate: pair(19),
+        indexer_comp_ape: inputs.get(20).and_then(|t| as_f32_slice(t).ok()),
+        indexer_comp_norm: inputs.get(21).and_then(|t| as_f32_slice(t).ok()),
+        indexer_state_dim: inputs
+            .get(18)
+            .map(|t| t.dims_slice().first().copied().unwrap_or(0) as usize)
+            .unwrap_or(0),
+        indexer_heads: attrs.n_kv_heads as usize,
+        indexer_head_dim: attrs.query_len as usize,
+        indexer_top_k: attrs.kv_len as usize,
+    };
+    let x = as_f32_slice(&inputs[0])?;
+    let d_model = attrs.n_embd.max(1) as usize;
+    let rows = (x.len() / d_model.max(1)).max(1);
+    let paged = paged_ctx::snapshot_paged_context();
+    for row in 0..rows {
+        let (position, past_len) = if rows == 1 {
+            (attrs.position, attrs.past_len)
+        } else {
+            let position = paged
+                .as_ref()
+                .and_then(|ctx| ctx.row_rope_positions.get(row).copied())
+                .unwrap_or_else(|| attrs.position.saturating_add(row as u32));
+            (position, position)
+        };
+        crate::kernels::mla::mla_decode(
+            &x[row * d_model..(row + 1) * d_model],
+            as_bytes_slice(&inputs[1]),
+            inputs[1]
+                .dtype()
+                .ok_or_else(|| FellmError::other("q_a dtype"))?,
+            as_f32_slice(&inputs[2])?,
+            as_bytes_slice(&inputs[3]),
+            inputs[3]
+                .dtype()
+                .ok_or_else(|| FellmError::other("q_b dtype"))?,
+            as_bytes_slice(&inputs[4]),
+            inputs[4]
+                .dtype()
+                .ok_or_else(|| FellmError::other("kv dtype"))?,
+            as_f32_slice(&inputs[5])?,
+            as_bytes_slice(&inputs[6]),
+            inputs[6]
+                .dtype()
+                .ok_or_else(|| FellmError::other("wo_a dtype"))?,
+            as_bytes_slice(&inputs[7]),
+            inputs[7]
+                .dtype()
+                .ok_or_else(|| FellmError::other("wo_b dtype"))?,
+            as_f32_slice(&inputs[8])?,
+            as_f32_slice(&inputs[9])?,
+            k_out,
+            c_out,
+            &mut y[row * d_model..(row + 1) * d_model],
+            d_model,
+            attrs.n_heads.max(1) as usize,
+            attrs.head_dim.max(1) as usize,
+            attrs.rope_dim.max(1) as usize,
+            attrs.gdn_inner_size.max(1) as usize,
+            attrs.gdn_state_size.max(1) as usize,
+            attrs.shortconv_l_cache.max(1) as usize,
+            position,
+            past_len,
+            attrs.attention_window as usize,
+            attrs.eps,
+            attrs.block_size as usize,
+            extras,
+            attrs.layer_ord,
         )?;
     }
     Ok(())

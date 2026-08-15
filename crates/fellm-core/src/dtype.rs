@@ -39,8 +39,24 @@ pub enum DType {
     Q6K = 14,
     /// GGUF `Q8_K`.
     Q8K = 15,
+    /// GGUF `IQ2_XXS`.
+    IQ2XXS = 16,
+    /// GGUF `IQ2_XS`.
+    IQ2XS = 17,
+    /// GGUF `IQ3_XXS`.
+    IQ3XXS = 18,
+    /// GGUF `IQ1_S`.
+    IQ1S = 19,
+    /// GGUF `IQ4_NL`.
+    IQ4NL = 20,
+    /// GGUF `IQ3_S`.
+    IQ3S = 21,
+    /// GGUF `IQ2_S`.
+    IQ2S = 22,
+    /// GGUF `IQ4_XS`.
+    IQ4XS = 23,
 
-    // Integer / bool
+    // Integer / bool (ggml file codes)
     /// Signed 8-bit.
     I8 = 24,
     /// Signed 16-bit.
@@ -49,20 +65,25 @@ pub enum DType {
     I32 = 26,
     /// Signed 64-bit.
     I64 = 27,
-    /// Unsigned 8-bit.
-    U8 = 28,
-    /// Unsigned 16-bit.
-    U16 = 29,
-    /// Unsigned 32-bit.
-    U32 = 30,
-    /// Unsigned 64-bit.
-    U64 = 31,
-    /// Bool as 1 byte.
-    Bool = 32,
+    /// IEEE 754 double-precision.
+    F64 = 28,
+    /// GGUF `IQ1_M`.
+    IQ1M = 29,
+    /// bfloat16 (ggml `GGML_TYPE_BF16`).
+    BF16 = 30,
+    /// GGUF `MXFP4`.
+    MXFP4 = 39,
 
-    // Extra float
-    /// bfloat16.
-    BF16 = 33,
+    /// Unsigned 8-bit (runtime-only; not a GGUF payload type).
+    U8 = 200,
+    /// Unsigned 16-bit (runtime-only).
+    U16 = 201,
+    /// Unsigned 32-bit token / index buffers (runtime-only).
+    U32 = 202,
+    /// Unsigned 64-bit (runtime-only).
+    U64 = 203,
+    /// Bool as 1 byte (runtime-only).
+    Bool = 204,
 }
 
 impl DType {
@@ -83,16 +104,27 @@ impl DType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            16 => Self::IQ2XXS,
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            19 => Self::IQ1S,
+            20 => Self::IQ4NL,
+            21 => Self::IQ3S,
+            22 => Self::IQ2S,
+            23 => Self::IQ4XS,
             24 => Self::I8,
             25 => Self::I16,
             26 => Self::I32,
             27 => Self::I64,
-            28 => Self::U8,
-            29 => Self::U16,
-            30 => Self::U32,
-            31 => Self::U64,
-            32 => Self::Bool,
-            33 => Self::BF16,
+            28 => Self::F64,
+            29 => Self::IQ1M,
+            30 => Self::BF16,
+            39 => Self::MXFP4,
+            200 => Self::U8,
+            201 => Self::U16,
+            202 => Self::U32,
+            203 => Self::U64,
+            204 => Self::Bool,
             other => return Err(FellmError::UnknownDType(other)),
         })
     }
@@ -104,7 +136,22 @@ impl DType {
     pub const fn elements_per_block(self) -> usize {
         match self {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ3XXS
+            | Self::IQ1S
+            | Self::IQ3S
+            | Self::IQ2S
+            | Self::IQ4XS
+            | Self::IQ1M => 256,
+            Self::IQ4NL => 32,
+            Self::MXFP4 => 32,
             _ => 1,
         }
     }
@@ -114,9 +161,9 @@ impl DType {
     pub const fn bytes_per_block(self) -> usize {
         match self {
             Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F64 | Self::I64 | Self::U64 => 8,
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
             Self::I8 | Self::U8 | Self::Bool => 1,
-            Self::I64 | Self::U64 => 8,
             // Legacy 4-bit quants: 2 bytes scale (fp16) + 16 bytes weights = 18
             Self::Q4_0 => 18,
             // Q4_1: 2 bytes scale + 2 bytes min + 16 bytes weights = 20
@@ -142,6 +189,16 @@ impl DType {
             Self::Q6K => 210,
             // Q8_K: 4 (d as f32) + 256 (weights) + 32 (bsums as i16 pairs -> 16*2 = 32) = 292
             Self::Q8K => 292,
+            Self::IQ2XXS => 66,
+            Self::IQ2XS => 74,
+            Self::IQ3XXS => 98,
+            Self::IQ1S => 50,
+            Self::IQ4NL => 18,
+            Self::IQ3S => 110,
+            Self::IQ2S => 82,
+            Self::IQ4XS => 136,
+            Self::IQ1M => 56,
+            Self::MXFP4 => 17,
         }
     }
 
@@ -162,6 +219,16 @@ impl DType {
                 | Self::Q5K
                 | Self::Q6K
                 | Self::Q8K
+                | Self::IQ2XXS
+                | Self::IQ2XS
+                | Self::IQ3XXS
+                | Self::IQ1S
+                | Self::IQ4NL
+                | Self::IQ3S
+                | Self::IQ2S
+                | Self::IQ4XS
+                | Self::IQ1M
+                | Self::MXFP4
         )
     }
 
@@ -199,6 +266,17 @@ impl core::fmt::Display for DType {
             Self::Q5K => "q5_k",
             Self::Q6K => "q6_k",
             Self::Q8K => "q8_k",
+            Self::IQ2XXS => "iq2_xxs",
+            Self::IQ2XS => "iq2_xs",
+            Self::IQ3XXS => "iq3_xxs",
+            Self::IQ1S => "iq1_s",
+            Self::IQ4NL => "iq4_nl",
+            Self::IQ3S => "iq3_s",
+            Self::IQ2S => "iq2_s",
+            Self::IQ4XS => "iq4_xs",
+            Self::IQ1M => "iq1_m",
+            Self::MXFP4 => "mxfp4",
+            Self::F64 => "f64",
             Self::I8 => "i8",
             Self::I16 => "i16",
             Self::I32 => "i32",

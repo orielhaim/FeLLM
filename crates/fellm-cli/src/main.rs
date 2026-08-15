@@ -8,7 +8,9 @@ use fellm_gguf::GgufFile;
 use fellm_plugin_abi::c_abi::HostContext;
 use fellm_plugin_abi::capability::{CapabilityKind, PluginConfig, ProviderSelection};
 use fellm_plugin_host::PluginHost;
-use fellm_runtime::{BackendPreference, BackendSelect, Engine, EngineSettings, GenParams};
+use fellm_runtime::{
+    BackendPreference, BackendSelect, ChatRenderOptions, Engine, EngineSettings, GenParams,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +43,27 @@ enum Cmd {
 struct RunArgs {
     /// Path to a GGUF file.
     model: Option<PathBuf>,
+    /// Compatible smaller GGUF model used as an ordinary independent drafter.
+    #[arg(long = "speculative-draft")]
+    speculative_draft: Option<PathBuf>,
+    /// Native or checkpoint-backed speculator (`mtp`, `dspark`).
+    #[arg(long)]
+    speculator: Option<String>,
+    /// Optional checkpoint/model owned by the selected speculator.
+    #[arg(long = "speculator-model")]
+    speculator_model: Option<PathBuf>,
+    /// Maximum dynamically selected speculative proposal length.
+    #[arg(long = "speculative-max-tokens")]
+    speculative_max_tokens: Option<usize>,
+    /// Disable speculation when estimated speedup is below this fraction.
+    #[arg(long = "speculative-min-gain")]
+    speculative_min_gain: Option<f64>,
+    /// Independent backend placement for the draft model.
+    #[arg(long = "speculative-draft-backend")]
+    speculative_draft_backend: Option<String>,
+    /// Speculative method: `auto`, `mtp`, `dspark`, or `off`.
+    #[arg(long)]
+    speculative: Option<String>,
     /// Prompt / user message string.
     #[arg(long)]
     prompt: Option<String>,
@@ -62,6 +85,18 @@ struct RunArgs {
     /// top-p (>= 1.0 disables).
     #[arg(long)]
     top_p: Option<f32>,
+    /// Minimum probability relative to the most likely token (0 disables).
+    #[arg(long)]
+    min_p: Option<f32>,
+    /// Count-scaled token frequency penalty.
+    #[arg(long)]
+    frequency_penalty: Option<f32>,
+    /// One-time token presence penalty.
+    #[arg(long)]
+    presence_penalty: Option<f32>,
+    /// Sparse token logit adjustment as TOKEN_ID=BIAS; repeatable.
+    #[arg(long = "logit-bias", value_name = "TOKEN_ID=BIAS")]
+    logit_bias: Vec<String>,
     /// RNG seed.
     #[arg(long)]
     seed: Option<u64>,
@@ -150,8 +185,18 @@ struct RunArgs {
     /// Maximum router decisions retained independently for offline cache simulation.
     #[arg(long)]
     router_trace_capacity: Option<usize>,
+    /// Disable CPU weight partitions even when the planner would use them.
     #[arg(long)]
     disable_cpu_partitions: Option<bool>,
+    /// Enable GGUF chat-template thinking (`enable_thinking=true`), like llama.cpp `--think`.
+    #[arg(long, conflicts_with = "no_think")]
+    think: bool,
+    /// Disable thinking when the template supports it (`enable_thinking=false`).
+    #[arg(long = "no-think", conflicts_with = "think")]
+    no_think: bool,
+    /// Echo the prompt on stdout before generated tokens.
+    #[arg(long = "echo-prompt")]
+    echo_prompt: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -237,6 +282,13 @@ fn main() {
 
 struct ResolvedRunArgs {
     model: PathBuf,
+    speculative_draft: Option<PathBuf>,
+    speculator: Option<String>,
+    speculator_model: Option<PathBuf>,
+    speculative_max_tokens: usize,
+    speculative_min_gain: f64,
+    speculative_draft_backend: Option<String>,
+    speculative: Option<String>,
     prompt: String,
     system: Option<String>,
     completion: bool,
@@ -244,6 +296,10 @@ struct ResolvedRunArgs {
     temperature: f32,
     top_k: u32,
     top_p: f32,
+    min_p: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    logit_bias: Vec<(u32, f32)>,
     seed: u64,
     repetition_penalty: f32,
     ctx_size: usize,
@@ -263,7 +319,39 @@ struct ResolvedRunArgs {
     plugin_config: Vec<String>,
     plugin_dir: Option<PathBuf>,
     cpu_fallback: bool,
+    think: bool,
+    no_think: bool,
+    echo_prompt: bool,
     memory_fabric: fellm_runtime::MemoryFabricConfig,
+}
+
+fn parse_logit_bias(values: Vec<String>) -> fellm_core::error::Result<Vec<(u32, f32)>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let (token, bias) = value.split_once('=').ok_or_else(|| {
+                fellm_core::error::FellmError::other(format!(
+                    "logit bias must be TOKEN_ID=BIAS, got '{value}'"
+                ))
+            })?;
+            let token = token.parse::<u32>().map_err(|error| {
+                fellm_core::error::FellmError::other(format!(
+                    "invalid logit-bias token '{token}': {error}"
+                ))
+            })?;
+            let bias = bias.parse::<f32>().map_err(|error| {
+                fellm_core::error::FellmError::other(format!(
+                    "invalid logit-bias value '{bias}': {error}"
+                ))
+            })?;
+            if !bias.is_finite() {
+                return Err(fellm_core::error::FellmError::other(
+                    "logit bias must be finite",
+                ));
+            }
+            Ok((token, bias))
+        })
+        .collect()
 }
 
 fn resolve_run(
@@ -287,6 +375,11 @@ fn resolve_run(
     } else {
         cli.plugin_config
     };
+    let logit_bias = parse_logit_bias(if cli.logit_bias.is_empty() {
+        file.logit_bias.unwrap_or_default()
+    } else {
+        cli.logit_bias
+    })?;
     let storage_provider = cli
         .storage_provider
         .or(memory.storage_provider)
@@ -294,6 +387,21 @@ fn resolve_run(
         .parse()?;
     Ok(ResolvedRunArgs {
         model,
+        speculative_draft: cli.speculative_draft.or(file.speculative_draft),
+        speculator: cli.speculator.or(file.speculator),
+        speculator_model: cli.speculator_model.or(file.speculator_model),
+        speculative_max_tokens: cli
+            .speculative_max_tokens
+            .or(file.speculative_max_tokens)
+            .unwrap_or(4),
+        speculative_min_gain: cli
+            .speculative_min_gain
+            .or(file.speculative_min_gain)
+            .unwrap_or(0.05),
+        speculative_draft_backend: cli
+            .speculative_draft_backend
+            .or(file.speculative_draft_backend),
+        speculative: cli.speculative.or(file.speculative),
         prompt,
         system: cli.system.or(file.system),
         completion: value!(completion, false),
@@ -301,6 +409,10 @@ fn resolve_run(
         temperature: value!(temperature, 0.2),
         top_k: value!(top_k, 80),
         top_p: value!(top_p, 1.0),
+        min_p: value!(min_p, 0.0),
+        frequency_penalty: value!(frequency_penalty, 0.0),
+        presence_penalty: value!(presence_penalty, 0.0),
+        logit_bias,
         seed: value!(seed, 0),
         repetition_penalty: value!(repetition_penalty, 1.05),
         ctx_size: cli
@@ -327,6 +439,9 @@ fn resolve_run(
         plugin_config,
         plugin_dir: cli.plugin_dir.or(file.plugin_dir),
         cpu_fallback: cli.cpu_fallback.or(file.cpu_fallback).unwrap_or(true),
+        think: cli.think,
+        no_think: cli.no_think,
+        echo_prompt: cli.echo_prompt,
         memory_fabric: fellm_runtime::MemoryFabricConfig {
             device_memory_limit: cli.device_memory_limit.or(memory.device_memory_limit),
             host_memory_limit: cli.host_memory_limit.or(memory.host_memory_limit),
@@ -363,6 +478,13 @@ mod config_precedence_tests {
     fn empty_cli() -> RunArgs {
         RunArgs {
             model: None,
+            speculative_draft: None,
+            speculator: None,
+            speculator_model: None,
+            speculative_max_tokens: None,
+            speculative_min_gain: None,
+            speculative_draft_backend: None,
+            speculative: None,
             prompt: None,
             system: None,
             completion: None,
@@ -370,6 +492,10 @@ mod config_precedence_tests {
             temperature: None,
             top_k: None,
             top_p: None,
+            min_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: Vec::new(),
             seed: None,
             repetition_penalty: None,
             ctx_size: None,
@@ -400,6 +526,9 @@ mod config_precedence_tests {
             storage_overlap: None,
             router_trace_capacity: None,
             disable_cpu_partitions: None,
+            think: false,
+            no_think: false,
+            echo_prompt: false,
         }
     }
 
@@ -440,7 +569,11 @@ fn init_tracing(filter: &str) {
     }
 
     #[cfg(not(feature = "tracy"))]
-    fmt().with_env_filter(filter).with_target(false).init();
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
 }
 
 fn build_selection(args: &ResolvedRunArgs) -> fellm_core::error::Result<ProviderSelection> {
@@ -459,6 +592,37 @@ fn build_selection(args: &ResolvedRunArgs) -> fellm_core::error::Result<Provider
 }
 
 fn run(args: ResolvedRunArgs) -> fellm_core::error::Result<()> {
+    if args.speculative.as_deref() == Some("off")
+        && (args.speculative_draft.is_some() || args.speculator.is_some())
+    {
+        return Err(fellm_core::error::FellmError::other(
+            "--speculative off cannot be combined with a speculator or draft model",
+        ));
+    }
+    if args.speculative_draft.is_some()
+        && matches!(args.speculator.as_deref(), Some("mtp" | "dspark"))
+    {
+        return Err(fellm_core::error::FellmError::other(
+            "choose either --speculative-draft or --speculator, not both",
+        ));
+    }
+    let mut speculator_kind = args.speculator.clone();
+    if args.speculative.as_deref() == Some("auto") && speculator_kind.is_none() {
+        let gguf = GgufFile::open(&args.model)?;
+        let spec = fellm_runtime::ModelSpec::from_gguf(&gguf)?;
+        if spec.n_mtp_layers > 0 {
+            speculator_kind = Some("mtp".into());
+        } else if args.speculator_model.is_some() {
+            speculator_kind = Some("dspark".into());
+        }
+    } else if let Some(kind) = args.speculative.as_deref() {
+        if kind != "auto" && kind != "off" && speculator_kind.is_none() {
+            speculator_kind = Some(kind.to_owned());
+        }
+    }
+    if speculator_kind.as_deref() == Some("off") {
+        speculator_kind = None;
+    }
     let preference = BackendPreference::parse(&args.backend)?;
     let select = BackendSelect::new(preference, args.cpu_fallback);
     let providers = build_selection(&args)?;
@@ -480,6 +644,42 @@ fn run(args: ResolvedRunArgs) -> fellm_core::error::Result<()> {
         .providers(providers)
         .kv_cache(kv_cache);
     settings.memory_fabric = args.memory_fabric;
+    if speculator_kind.as_deref() == Some("mtp") {
+        settings = settings.target_features([fellm_plugin_abi::TargetFeature::FinalHiddenState]);
+    }
+    let mut dspark_checkpoint = None;
+    let mut dspark_support_gguf = None;
+    if speculator_kind.as_deref() == Some("dspark") {
+        let path = args.speculator_model.as_ref().ok_or_else(|| {
+            fellm_core::error::FellmError::other(
+                "--speculator dspark requires --speculator-model <checkpoint-directory-or-gguf>",
+            )
+        })?;
+        if path.is_dir() {
+            let checkpoint = Arc::new(fellm_dspark::DsparkCheckpoint::open(path)?);
+            settings = settings.target_features(
+                checkpoint
+                    .config
+                    .required_features()
+                    .into_iter()
+                    .map(|tap| tap.feature),
+            );
+            dspark_checkpoint = Some(checkpoint);
+        } else {
+            let support = fellm_gguf::GgufFile::open(path)?;
+            let layers = support
+                .metadata
+                .get_u32_array("dspark.target_layer_ids")
+                .map(|values| values.to_vec())
+                .unwrap_or_else(|_| vec![40, 41, 42]);
+            settings = settings.target_features(
+                layers
+                    .into_iter()
+                    .map(fellm_plugin_abi::TargetFeature::LayerHiddenState),
+            );
+            dspark_support_gguf = Some(path.clone());
+        }
+    }
 
     if let Some(dir) = &args.plugin_dir {
         settings = settings.plugin_dir(dir.clone());
@@ -494,31 +694,220 @@ fn run(args: ResolvedRunArgs) -> fellm_core::error::Result<()> {
 
     let mut engine = Engine::open_with_architecture(
         &args.model,
-        settings,
+        settings.clone(),
         Some(Arc::new(DiffusionGemmaPlugin)),
     )?;
 
-    if let Some(prep) = engine.providers().prepared() {
-        eprintln!(
-            "providers: attention={} (id={}) kv-policy={} (id={})",
-            prep.attention_name, prep.attention_id.0, prep.kv_policy_name, prep.kv_policy_id.0
-        );
+    if args.think && args.no_think {
+        return Err(fellm_core::error::FellmError::other(
+            "--think and --no-think cannot be used together",
+        ));
     }
-
     let params = GenParams {
         max_tokens: args.max_tokens,
         temperature: args.temperature,
         top_k: args.top_k,
         top_p: args.top_p,
+        min_p: args.min_p,
         seed: args.seed,
         repetition_penalty: args.repetition_penalty,
+        frequency_penalty: args.frequency_penalty,
+        presence_penalty: args.presence_penalty,
+        logit_bias: Arc::from(args.logit_bias),
         priority: 0,
+        enable_thinking: if args.think {
+            Some(true)
+        } else if args.no_think {
+            Some(false)
+        } else {
+            None
+        },
+        ..GenParams::default()
     };
 
     let use_chat = !args.completion && engine.tokenizer().chat_template().is_some();
 
-    print!("{}", args.prompt);
-    std::io::stdout().flush().ok();
+    let chat_options = ChatRenderOptions {
+        enable_thinking: params.enable_thinking.or_else(|| {
+            engine.tokenizer().supports_thinking().then_some(false)
+        }),
+    };
+    let encode_chat = |engine: &Engine,
+                       prompt: &str,
+                       system: Option<&str>|
+     -> fellm_core::error::Result<Vec<u32>> {
+        let mut messages = Vec::new();
+        if let Some(system) = system {
+            messages.push(fellm_runtime::Message::text("system", system.to_string()));
+        }
+        messages.push(fellm_runtime::Message::text("user", prompt.to_string()));
+        let prepared = engine.prepare_chat_messages(&messages);
+        let rendered = engine
+            .tokenizer()
+            .apply_chat_template_with_options(&prepared, &[], true, chat_options.clone())?
+            .unwrap_or_else(|| prompt.to_string());
+        engine.tokenizer().encode(&rendered, true)
+    };
+
+    if let Some(speculator_kind) = &speculator_kind {
+        if speculator_kind != "mtp" && speculator_kind != "dspark" {
+            return Err(fellm_core::error::FellmError::other(format!(
+                "unknown speculator '{speculator_kind}' (expected mtp or dspark)"
+            )));
+        }
+        if speculator_kind == "mtp" && args.speculator_model.is_some() {
+            return Err(fellm_core::error::FellmError::other(
+                "native MTP uses tensors embedded in the target; --speculator-model is not applicable",
+            ));
+        }
+        let prompt_ids = if use_chat {
+            encode_chat(&engine, &args.prompt, args.system.as_deref())?
+        } else {
+            engine.tokenizer().encode(&args.prompt, true)?
+        };
+        let speculator_backend = if let Some(backend) = &args.speculative_draft_backend {
+            BackendSelect::new(BackendPreference::parse(backend)?, args.cpu_fallback)
+        } else {
+            select
+        };
+        let speculator: Box<dyn fellm_plugin_abi::Speculator> = match speculator_kind.as_str() {
+            "mtp" => Box::new(fellm_mtp::MtpSpeculator::from_model(
+                engine.gguf(),
+                engine.spec(),
+                speculator_backend,
+                engine.n_ctx(),
+                args.speculative_max_tokens as u32,
+            )?),
+            "dspark" => {
+                if let Some(checkpoint) = dspark_checkpoint {
+                    Box::new(fellm_dspark::DsparkSpeculator::from_checkpoint(
+                        checkpoint,
+                        speculator_backend,
+                        engine.n_ctx(),
+                    )?)
+                } else {
+                    let path = dspark_support_gguf.expect("DSpark GGUF path prepared");
+                    Box::new(fellm_dspark::DsparkSpeculator::from_support_gguf(
+                        path,
+                        engine.gguf(),
+                        engine.spec(),
+                        speculator_backend,
+                        engine.n_ctx(),
+                    )?)
+                }
+            }
+            _ => unreachable!("validated speculator kind"),
+        };
+        if args.echo_prompt {
+            print!("{}", args.prompt);
+        }
+        std::io::stdout().flush().ok();
+        let started = std::time::Instant::now();
+        let mut runtime = fellm_runtime::PluginSpeculativeRuntime::new(
+            engine,
+            speculator,
+            fellm_runtime::GenericDraftConfig {
+                maximum_proposal_length: args.speculative_max_tokens,
+                initial_proposal_length: args.speculative_max_tokens.min(3),
+                minimum_gain: args.speculative_min_gain,
+            },
+        )?;
+        let tokens = runtime.generate_ids(&prompt_ids, params)?;
+        let stop_ids = runtime.target().stop_token_ids_pub();
+        let mut bytes = Vec::new();
+        for token in &tokens {
+            if !stop_ids.contains(token) {
+                bytes.extend_from_slice(&runtime.target().tokenizer().decode_token(*token)?);
+            }
+        }
+        println!("{}", String::from_utf8_lossy(&bytes));
+        let metrics = runtime.metrics();
+        eprintln!(
+            "speculative: method={} rounds={} proposed={} verified={} accepted={} emitted={} acceptance={:.2}% accepted_p50={} accepted_p95={} k0={:.2}% draft_ms={:.2} verify_ms={:.2} sampling_ms={:.2} elapsed={:.2}ms",
+            speculator_kind,
+            metrics.rounds,
+            metrics.proposed,
+            metrics.verified,
+            metrics.accepted,
+            metrics.emitted,
+            metrics.accepted as f64 / metrics.proposed.max(1) as f64 * 100.0,
+            metrics.accepted_length_percentile(0.50),
+            metrics.accepted_length_percentile(0.95),
+            metrics.disabled_rounds as f64 / metrics.rounds.max(1) as f64 * 100.0,
+            metrics.draft_time.as_secs_f64() * 1000.0,
+            metrics.verification_time.as_secs_f64() * 1000.0,
+            metrics.sampling_time.as_secs_f64() * 1000.0,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        runtime.target().publish_memory_fabric_metrics();
+        return Ok(());
+    }
+
+    if let Some(draft_path) = &args.speculative_draft {
+        let mut draft_settings = settings;
+        if let Some(backend) = &args.speculative_draft_backend {
+            draft_settings.backend =
+                BackendSelect::new(BackendPreference::parse(backend)?, args.cpu_fallback);
+        }
+        let draft = Engine::open_with_architecture(
+            draft_path,
+            draft_settings,
+            Some(Arc::new(DiffusionGemmaPlugin)),
+        )?;
+        let prompt_ids = if use_chat {
+            encode_chat(&engine, &args.prompt, args.system.as_deref())?
+        } else {
+            engine.tokenizer().encode(&args.prompt, true)?
+        };
+        if args.echo_prompt {
+            print!("{}", args.prompt);
+        }
+        std::io::stdout().flush().ok();
+        let started = std::time::Instant::now();
+        let mut runtime = fellm_runtime::GenericDraftRuntime::new(
+            engine,
+            draft,
+            fellm_runtime::GenericDraftConfig {
+                maximum_proposal_length: args.speculative_max_tokens,
+                initial_proposal_length: args.speculative_max_tokens.min(3),
+                minimum_gain: args.speculative_min_gain,
+            },
+        )?;
+        let tokens = runtime.generate_ids(&prompt_ids, params)?;
+        let mut bytes = Vec::new();
+        let stop_ids = runtime.target().stop_token_ids_pub();
+        for token in &tokens {
+            if !stop_ids.contains(token) {
+                bytes.extend_from_slice(&runtime.target().tokenizer().decode_token(*token)?);
+            }
+        }
+        println!("{}", String::from_utf8_lossy(&bytes));
+        let metrics = runtime.metrics();
+        eprintln!(
+            "speculative: method=draft rounds={} proposed={} verified={} accepted={} emitted={} acceptance={:.2}% accepted_p50={} accepted_p95={} k0={:.2}% draft_ms={:.2} verify_ms={:.2} sampling_ms={:.2} elapsed={:.2}ms",
+            metrics.rounds,
+            metrics.proposed,
+            metrics.verified,
+            metrics.accepted,
+            metrics.emitted,
+            metrics.accepted as f64 / metrics.proposed.max(1) as f64 * 100.0,
+            metrics.accepted_length_percentile(0.50),
+            metrics.accepted_length_percentile(0.95),
+            metrics.disabled_rounds as f64 / metrics.rounds.max(1) as f64 * 100.0,
+            metrics.draft_time.as_secs_f64() * 1000.0,
+            metrics.verification_time.as_secs_f64() * 1000.0,
+            metrics.sampling_time.as_secs_f64() * 1000.0,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        runtime.target().publish_memory_fabric_metrics();
+        runtime.draft().publish_memory_fabric_metrics();
+        return Ok(());
+    }
+
+    if args.echo_prompt {
+        print!("{}", args.prompt);
+        std::io::stdout().flush().ok();
+    }
 
     let mut stdout = std::io::stdout().lock();
     let stop_ids = {
@@ -599,7 +988,7 @@ fn flush_valid_utf8_prefix(buf: &mut Vec<u8>) -> String {
 }
 
 fn inspect(args: InspectArgs) -> fellm_core::error::Result<()> {
-    let g = GgufFile::open(&args.model)?;
+    let g = GgufFile::open_storage_native(&args.model)?;
     println!("architecture     : {}", g.metadata.arch().unwrap_or("?"));
     println!("tensor_data_off  : {}", g.tensor_data_offset());
     println!("alignment        : {}", g.alignment());

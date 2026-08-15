@@ -118,9 +118,9 @@ impl Default for Q4KBlockCache {
     }
 }
 
-/// Decode the 12-byte packed Q4_K scales+mins into 8 scale and 8 min bytes.
+/// Decode the 12-byte packed Q4_K/Q5_K scales+mins into 8 scale and 8 min bytes.
 #[inline]
-fn decode_scales_mins(scales12: &[u8]) -> ([u8; 8], [u8; 8]) {
+pub(crate) fn decode_scales_mins(scales12: &[u8]) -> ([u8; 8], [u8; 8]) {
     debug_assert!(scales12.len() >= 12);
     let mut utmp = [0u32; 4];
     utmp[0] = u32::from_le_bytes([scales12[0], scales12[1], scales12[2], scales12[3]]);
@@ -145,7 +145,7 @@ fn decode_scales_mins(scales12: &[u8]) -> ([u8; 8], [u8; 8]) {
 
 /// Same as [`decode_scales_mins`] but returns the four utmp words (ggml layout).
 #[inline]
-fn decode_utmp(scales12: &[u8]) -> [u32; 4] {
+pub(crate) fn decode_utmp(scales12: &[u8]) -> [u32; 4] {
     let mut utmp = [0u32; 4];
     utmp[0] = u32::from_le_bytes([scales12[0], scales12[1], scales12[2], scales12[3]]);
     utmp[1] = u32::from_le_bytes([scales12[4], scales12[5], scales12[6], scales12[7]]);
@@ -327,7 +327,7 @@ pub fn vec_dot_q4_k_q8_k_scalar(q4_block: &[u8], q8: &Q8KBlock) -> f32 {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-mod x86_avx2 {
+pub(crate) mod x86_avx2 {
     use super::*;
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{__m256, __m256i};

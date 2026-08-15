@@ -75,9 +75,26 @@ impl StorageObjectIndex {
             .max()
             .unwrap_or(useful_start);
         let start = useful_start / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT;
-        let end = useful_end.div_ceil(DIRECT_ALIGNMENT) * DIRECT_ALIGNMENT;
+        let aligned_end = useful_end.div_ceil(DIRECT_ALIGNMENT) * DIRECT_ALIGNMENT;
+        let file_len = std::fs::metadata(&first.home.path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if useful_end > file_len && file_len > 0 {
+            return Err(FellmError::other(format!(
+                "corrupt/truncated GGUF shard:\ntensor {} requires bytes {useful_start}..{useful_end},\nbut shard {} is only {file_len} bytes",
+                run.last().map(|weight| weight.name.as_str()).unwrap_or("?"),
+                first.home.path.display()
+            )));
+        }
         let id = StorageObjectId(objects.len() as u64);
         let mut useful_bytes = 0u64;
+        let names: Vec<&str> = run.iter().map(|weight| weight.name.as_str()).collect();
+        let raw_offsets: Vec<u64> = run.iter().map(|weight| weight.home.offset).collect();
+        let byte_sizes: Vec<u64> = run.iter().map(|weight| weight.byte_len).collect();
+        let tensor_ends: Vec<u64> = run
+            .iter()
+            .map(|weight| weight.home.offset.saturating_add(weight.home.len))
+            .collect();
         let members = run
             .drain(..)
             .map(|weight| {
@@ -90,8 +107,35 @@ impl StorageObjectIndex {
                 }
             })
             .collect();
-        if end < start {
+        if useful_end < start {
             return Err(FellmError::other("storage object extent overflow"));
+        }
+        tracing::trace!(
+            object_id = id.0,
+            tensors = ?names,
+            tensor_raw_offsets = ?raw_offsets,
+            tensor_byte_sizes = ?byte_sizes,
+            tensor_ends = ?tensor_ends,
+            coalesced_logical_start = useful_start,
+            coalesced_logical_end = useful_end,
+            aligned_physical_start = start,
+            aligned_physical_end = aligned_end,
+            shard_payload_base = start,
+            resolved_file_start = start,
+            resolved_file_end = useful_end,
+            actual_file_size = file_len,
+            alignment_padding = aligned_end.saturating_sub(useful_end),
+            "storage object extent"
+        );
+        if aligned_end > file_len && file_len > 0 {
+            tracing::debug!(
+                object_id = id.0,
+                aligned_physical_end = aligned_end,
+                logical_end = useful_end,
+                file_size = file_len,
+                padding = aligned_end.saturating_sub(useful_end),
+                "clipping Direct I/O alignment padding that would extend past EOF"
+            );
         }
         objects.push(StorageObject {
             id,
@@ -99,7 +143,7 @@ impl StorageObjectIndex {
                 provider: first.home.provider.clone(),
                 path: first.home.path.clone(),
                 offset: start,
-                len: end - start,
+                len: useful_end - start,
                 alignment: DIRECT_ALIGNMENT,
             },
             members,
@@ -141,6 +185,23 @@ impl StorageObjectIndex {
     #[must_use]
     pub fn useful_bytes(&self) -> u64 {
         self.objects.iter().map(|object| object.useful_bytes).sum()
+    }
+
+    /// Distinct physical objects referenced by any one execution group.
+    #[must_use]
+    pub fn max_objects_per_group(&self, groups: &[ExecutionGroup]) -> usize {
+        groups
+            .iter()
+            .map(|group| {
+                group
+                    .weights
+                    .iter()
+                    .filter_map(|id| self.weight_to_object.get(id).copied())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            })
+            .max()
+            .unwrap_or(1)
     }
 }
 
@@ -187,9 +248,30 @@ mod tests {
         let object = index.object_for_weight(WeightId(2)).unwrap();
         assert_eq!(object.members.len(), 2);
         assert_eq!(object.extent.offset, 4096);
-        assert_eq!(object.extent.len, 4096);
+        assert_eq!(object.extent.len, 3072);
         assert_eq!(object.extent.alignment, 4096);
         assert_eq!(object.useful_bytes, 2048);
         assert!(index.metadata_bytes() < 2048);
+    }
+
+    #[test]
+    fn logical_extent_does_not_include_eof_alignment_padding() {
+        let weights = [weight(1, 4096, 1000)];
+        let groups = [ExecutionGroup {
+            id: 0,
+            weights: vec![WeightId(1)],
+            byte_len: 1000,
+            first_op: 0,
+            last_op: 0,
+            reuse_count: 1,
+            cpu_compute_time: None,
+        }];
+        let index =
+            StorageObjectIndex::from_execution_groups(&weights, &groups, 2048, 8192).unwrap();
+        let object = index.object_for_weight(WeightId(1)).unwrap();
+        assert_eq!(object.extent.offset, 4096);
+        assert_eq!(object.extent.len, 1000);
+        assert_eq!(object.members[0].offset, 0);
+        assert_eq!(object.members[0].len, 1000);
     }
 }

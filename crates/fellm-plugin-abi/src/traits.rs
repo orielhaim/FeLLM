@@ -343,6 +343,18 @@ pub trait Backend: Send + Sync + 'static {
         None
     }
 
+    /// Maximum bytes of immutable constants that may be staged as one
+    /// execution group. `None` means the backend has no bounded group limit.
+    fn weight_group_capacity_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// Reserve enough bounded staging for one immutable-weight execution
+    /// group. Backends without tiered device weights may ignore this request.
+    fn ensure_weight_group_capacity_bytes(&self, _minimum: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Resolve a kernel.
     fn resolve_kernel(
         &self,

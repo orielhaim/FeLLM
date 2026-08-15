@@ -10,7 +10,7 @@ use fellm_plugin_abi::c_abi::{
     PluginManifestJsonFn, PluginPrefetchWeightsFn, PluginRegisterArchitecturesFn,
     PluginRegisterCapabilitiesFn, PluginRegisterDeviceTensorFn, PluginRegisterKernelsFn,
     PluginSetWeightCacheBudgetFn, PluginShutdownFn, PluginUpdateStepParamsFn,
-    PluginWeightCacheMetrics, PluginWeightCacheMetricsFn, symbols,
+    PluginWeightCacheMetrics, PluginWeightCacheMetricsFn, PluginWeightGroupCapacityFn, symbols,
 };
 use libloading::Library;
 use std::collections::HashSet;
@@ -61,7 +61,7 @@ impl PluginCatalog {
                     plugins.push(plugin);
                 }
                 Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "skip non-FeLLM dynamic library");
+                    tracing::debug!(path = %path.display(), %error, "skip non-FeLLM dynamic library");
                 }
             }
         }
@@ -106,6 +106,7 @@ pub struct LoadedPlugin {
     update_step_params: Option<PluginUpdateStepParamsFn>,
     register_device_tensor: Option<PluginRegisterDeviceTensorFn>,
     set_weight_cache_budget: Option<PluginSetWeightCacheBudgetFn>,
+    weight_group_capacity: Option<PluginWeightGroupCapacityFn>,
     prefetch_weights: Option<PluginPrefetchWeightsFn>,
     weight_cache_metrics: Option<PluginWeightCacheMetricsFn>,
     device_stream: Option<PluginDeviceStreamFn>,
@@ -194,12 +195,16 @@ impl PluginHost {
                 && !out.data.is_null()
                 && out.byte_len >= 4
             {
-                let ptr = out.data as *const f32;
-                for plugin in &self.plugins {
-                    if let Some(invalidate) = plugin.invalidate_f32 {
-                        unsafe { invalidate(ptr, out.byte_len as usize) };
-                    }
-                }
+                self.invalidate_f32_host(out.data as *const f32, out.byte_len as usize);
+            }
+        }
+    }
+
+    /// Mark a host f32 allocation's CUDA mirror stale (or refresh from host).
+    pub fn invalidate_f32_host(&self, ptr: *const f32, nbytes: usize) {
+        for plugin in &self.plugins {
+            if let Some(invalidate) = plugin.invalidate_f32 {
+                unsafe { invalidate(ptr, nbytes) };
             }
         }
     }
@@ -252,6 +257,16 @@ impl PluginHost {
             }
         }
         Ok(())
+    }
+
+    /// Smallest active plugin limit for one immutable-weight execution group.
+    #[must_use]
+    pub fn weight_group_capacity_bytes(&self) -> Option<u64> {
+        self.plugins
+            .iter()
+            .filter_map(|plugin| plugin.weight_group_capacity.map(|query| unsafe { query() }))
+            .filter(|&bytes| bytes != 0)
+            .min()
     }
 
     /// Enqueue an architecture-neutral future execution group's immutable weights.
@@ -323,12 +338,12 @@ impl PluginHost {
         let catalog = PluginCatalog::discover_dir(&path)?;
         for plugin in catalog.plugins() {
             match self.activate_path(plugin, ctx) {
-                Ok(()) => tracing::info!(
+                Ok(()) => tracing::debug!(
                     path = %plugin.path.display(),
                     id = %plugin.manifest.id,
                     "activated plugin"
                 ),
-                Err(error) => tracing::warn!(
+                Err(error) => tracing::debug!(
                     path = %plugin.path.display(),
                     id = %plugin.manifest.id,
                     %error,
@@ -383,6 +398,8 @@ impl PluginHost {
             unsafe { lib.get(symbols::REGISTER_DEVICE_TENSOR).ok().map(|s| *s) };
         let set_weight_cache_budget =
             unsafe { lib.get(symbols::SET_WEIGHT_CACHE_BUDGET).ok().map(|s| *s) };
+        let weight_group_capacity =
+            unsafe { lib.get(symbols::WEIGHT_GROUP_CAPACITY).ok().map(|s| *s) };
         let prefetch_weights = unsafe { lib.get(symbols::PREFETCH_WEIGHTS).ok().map(|s| *s) };
         let weight_cache_metrics =
             unsafe { lib.get(symbols::WEIGHT_CACHE_METRICS).ok().map(|s| *s) };
@@ -409,6 +426,7 @@ impl PluginHost {
             update_step_params,
             register_device_tensor,
             set_weight_cache_budget,
+            weight_group_capacity,
             prefetch_weights,
             weight_cache_metrics,
             device_stream,

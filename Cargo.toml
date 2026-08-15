@@ -4,6 +4,8 @@ members = [
   "crates/*",
   "plugins/example_cpu_op",
   "plugins/diffusion_gemma",
+  "plugins/dspark",
+  "plugins/mtp",
   "plugins/triattention",
 ]
 
@@ -33,6 +35,8 @@ fellm-memory = { path = "crates/fellm-memory", version = "0.1.0" }
 backend-cpu = { path = "crates/backend-cpu", version = "0.1.0" }
 backend-cuda = { path = "crates/backend-cuda", version = "0.1.0" }
 fellm-triattention = { path = "plugins/triattention", version = "0.1.0" }
+fellm-mtp = { path = "plugins/mtp", version = "0.1.0" }
+fellm-dspark = { path = "plugins/dspark", version = "0.1.0" }
 libloading = "0.9"
 
 # External
@@ -63,7 +67,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+toml = "1.1"
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",

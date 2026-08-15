@@ -7,6 +7,7 @@ pub mod op;
 pub mod paged_ctx;
 pub mod physical_plan;
 pub mod sequence_state;
+pub mod speculator;
 pub mod tensor_ref;
 pub mod traits;
 
@@ -47,6 +48,11 @@ pub use sequence_state::{
     RetentionPlan, RetentionStats, SequenceAttentionState, SequenceStatePolicy, StateOwnership,
     compact_layer_to_entries, gather_kv_by_positions,
 };
+pub use speculator::{
+    CapturedTargetFeature, CommittedTargetToken, FeatureTap, ProposalNode, ProposalScores,
+    ProposalTopology, Speculator, SpeculatorCompatibility, SpeculatorContext, SpeculatorProposal,
+    SpeculatorRoundOutcome, TargetFeature, VocabularyMapping,
+};
 pub use tensor_ref::{TensorMut, TensorRef};
 pub use traits::{
     Architecture, ArchitectureConfig, ArchitectureProvider, Backend, BackendCapabilities,
@@ -75,6 +81,6 @@ pub struct AbiVersion {
 /// The ABI version this crate advertises. Bump on breaking changes.
 pub const ABI_VERSION: AbiVersion = AbiVersion {
     major: 0,
-    minor: 8,
+    minor: 9,
     patch: 0,
 };

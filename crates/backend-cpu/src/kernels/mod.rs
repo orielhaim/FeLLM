@@ -1,5 +1,8 @@
 pub mod attention;
+pub mod hyper_connection;
+pub mod mla;
 pub mod embedding;
+pub mod gated_delta_net;
 pub mod matmul;
 pub mod moe;
 pub mod norm;
@@ -10,3 +13,4 @@ pub mod simd_f32;
 pub mod softmax;
 pub mod swiglu;
 pub mod vec_dot_q4k;
+pub mod vec_dot_q5k;

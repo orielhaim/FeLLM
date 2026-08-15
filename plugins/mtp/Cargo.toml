@@ -1,0 +1,22 @@
+[package]
+name = "fellm-mtp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+fellm-core.workspace = true
+fellm-gguf.workspace = true
+fellm-graph.workspace = true
+fellm-model.workspace = true
+fellm-plugin-abi.workspace = true
+fellm-runtime.workspace = true
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"
+
+[lints]
+workspace = true

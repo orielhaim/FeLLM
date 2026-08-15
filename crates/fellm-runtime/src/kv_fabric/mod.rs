@@ -47,6 +47,127 @@ mod tests {
     }
 
     #[test]
+    fn provisional_suffix_commit_and_rollback_reclaim_pages() {
+        let mut fabric = fabric(16, 2);
+        let mut sequence = fabric.new_sequence(128);
+        for position in 0..16 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        let baseline_free = fabric.free_count();
+
+        let mut rollback = fabric.begin_transaction(&sequence);
+        for position in 16..48 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        assert!(fabric.free_count() < baseline_free);
+        fabric
+            .rollback_transaction(&mut sequence, &mut rollback)
+            .unwrap();
+        assert_eq!(sequence.len_tokens, 16);
+        assert_eq!(fabric.free_count(), baseline_free);
+        assert!(
+            fabric
+                .rollback_transaction(&mut sequence, &mut rollback)
+                .is_err()
+        );
+
+        let mut commit = fabric.begin_transaction(&sequence);
+        for position in 16..48 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        fabric
+            .commit_transaction(&mut sequence, &mut commit, 16)
+            .unwrap();
+        assert_eq!(sequence.len_tokens, 32);
+        assert_eq!(fabric.free_count(), baseline_free - 2);
+    }
+
+    #[test]
+    fn invalid_commit_remains_rollbackable_and_all_prefix_lengths_reuse_pages() {
+        let mut fabric = fabric(16, 2);
+        let mut sequence = fabric.new_sequence(128);
+        for position in 0..16 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        sequence.absolute_pos = 16;
+        let baseline_free = fabric.free_count();
+
+        let mut invalid = fabric.begin_transaction(&sequence);
+        for position in 16..24 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        assert!(
+            fabric
+                .commit_transaction(&mut sequence, &mut invalid, 9)
+                .is_err()
+        );
+        fabric
+            .rollback_transaction(&mut sequence, &mut invalid)
+            .unwrap();
+        assert_eq!((sequence.len_tokens, sequence.absolute_pos), (16, 16));
+        assert_eq!(fabric.free_count(), baseline_free);
+
+        for accepted in [0, 4, 8] {
+            let mut transaction = fabric.begin_transaction(&sequence);
+            for position in 16..24 {
+                fabric.ensure_writable(&mut sequence, position).unwrap();
+            }
+            if accepted == 0 {
+                fabric
+                    .rollback_transaction(&mut sequence, &mut transaction)
+                    .unwrap();
+            } else {
+                fabric
+                    .commit_transaction(&mut sequence, &mut transaction, accepted)
+                    .unwrap();
+            }
+            assert_eq!(sequence.len_tokens, 16 + accepted);
+            fabric.truncate_sequence(&mut sequence, 16).unwrap();
+            sequence.absolute_pos = 16;
+            assert_eq!(fabric.free_count(), baseline_free);
+        }
+    }
+
+    #[test]
+    fn commit_restores_absolute_cursor_to_accepted_prefix() {
+        let mut fabric = fabric(16, 2);
+        let mut sequence = fabric.new_sequence(128);
+        for position in 0..8 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        sequence.absolute_pos = 8;
+        let mut transaction = fabric.begin_transaction(&sequence);
+        for position in 8..12 {
+            fabric.ensure_writable(&mut sequence, position).unwrap();
+        }
+        sequence.absolute_pos = 12;
+        fabric
+            .commit_transaction(&mut sequence, &mut transaction, 2)
+            .unwrap();
+        assert_eq!((sequence.len_tokens, sequence.absolute_pos), (10, 10));
+    }
+
+    #[test]
+    fn ragged_block_tables_are_rectangular_without_aliasing_live_pages() {
+        let mut fabric = fabric(32, 2);
+        let mut short = fabric.new_sequence(128);
+        let mut long = fabric.new_sequence(128);
+        fabric.ensure_writable(&mut short, 0).unwrap();
+        fabric.ensure_writable(&mut long, 32).unwrap();
+
+        let short_table = fabric.physical_block_table_padded(&short, 3).unwrap();
+        let long_table = fabric.physical_block_table_padded(&long, 3).unwrap();
+        assert_eq!(short_table.len(), 6);
+        assert_eq!(long_table.len(), 6);
+        for layer in 0..2 {
+            let short_layer = &short_table[layer * 3..layer * 3 + 3];
+            assert_eq!(short_layer, &[short_layer[0]; 3]);
+            let expected = fabric.physical_block_table_layer(&long, layer);
+            assert_eq!(&long_table[layer * 3..layer * 3 + 3], expected);
+        }
+    }
+
+    #[test]
     fn logical_pages_not_physical_identity() {
         let mut fab = fabric(16, 1);
         let mut seq = fab.new_sequence(64);

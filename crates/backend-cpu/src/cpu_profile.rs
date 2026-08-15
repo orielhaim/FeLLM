@@ -204,7 +204,7 @@ fn detect_x86(logical: usize) -> CpuHardwareProfile {
         simd_f32_lanes,
     };
     p.kv_tile = p.kv_tile_for(128, usize::MAX);
-    tracing::info!(
+    tracing::debug!(
         l2_kib = l2 / 1024,
         l3_kib = l3 / 1024,
         physical_cores = physical,
@@ -252,7 +252,7 @@ fn detect_aarch64(logical: usize) -> CpuHardwareProfile {
         simd_f32_lanes: 4,
     };
     p.kv_tile = p.kv_tile_for(128, usize::MAX);
-    tracing::info!(
+    tracing::debug!(
         l2_kib = l2 / 1024,
         l3_kib = l3 / 1024,
         physical_cores = physical,

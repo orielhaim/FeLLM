@@ -33,3 +33,13 @@ pub use types::{
     StorageObjectMember, StorageSlotState, TransferCapabilities, TransferKind, WeightDescriptor,
     WeightId, WeightPlacement,
 };
+
+/// True when a GGUF tensor is a routed MoE expert bank that should not be streamed whole.
+#[must_use]
+pub fn is_moe_expert_bank(name: &str) -> bool {
+    let name = name.strip_suffix(".weight").unwrap_or(name);
+    name.ends_with("gate_exps")
+        || name.ends_with("up_exps")
+        || name.ends_with("down_exps")
+        || name.ends_with("gate_up_exps")
+}

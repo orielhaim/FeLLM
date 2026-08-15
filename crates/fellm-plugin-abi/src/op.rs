@@ -51,6 +51,16 @@ impl OpKind {
     pub const WeightedEmbedding: Self = Self(16);
     /// Packed gate/up quantized projection with SwiGLU epilogue.
     pub const GateUpSwiGlu: Self = Self(17);
+    /// `output = value * sigmoid(gate)` used by gated attention heads.
+    pub const SigmoidGate: Self = Self(18);
+    /// Stateful Qwen3.5 Gated DeltaNet sequence mixer.
+    pub const GatedDeltaNet: Self = Self(19);
+    /// Select query or gate lanes from a per-head interleaved projection.
+    pub const InterleavedHeadSelect: Self = Self(20);
+    /// Multi-head latent attention with optional compressed KV and sinks.
+    pub const MlaAttention: Self = Self(21);
+    /// Hyper-connection residual mix (pre / post / head).
+    pub const HyperConnection: Self = Self(22);
 
     const CUSTOM_TAG: u32 = 0x8000_0000;
 
@@ -87,7 +97,7 @@ impl OpKind {
     /// Reconstruct from the C-ABI `u32` discriminant.
     #[must_use]
     pub fn from_u32(v: u32) -> Option<Self> {
-        if v <= Self::GateUpSwiGlu.raw() || v & Self::CUSTOM_TAG != 0 {
+        if v <= Self::HyperConnection.raw() || v & Self::CUSTOM_TAG != 0 {
             Some(Self(v))
         } else {
             None
@@ -116,6 +126,11 @@ impl OpKind {
             Self::MoE => "moe",
             Self::WeightedEmbedding => "weighted_embedding",
             Self::GateUpSwiGlu => "gate_up_swiglu",
+            Self::SigmoidGate => "sigmoid_gate",
+            Self::GatedDeltaNet => "gated_delta_net",
+            Self::InterleavedHeadSelect => "interleaved_head_select",
+            Self::MlaAttention => "mla_attention",
+            Self::HyperConnection => "hyper_connection",
             _ if self.is_custom() => "custom",
             _ => "unknown",
         }
@@ -134,6 +149,8 @@ pub struct OpAttrs {
     pub rope_base: f32,
     /// RoPE dimension (number of head dims that get rotated).
     pub rope_dim: u32,
+    /// RoPE coordinate pairing: `0` adjacent, `1` split-half.
+    pub rope_pairing: u32,
     /// Number of attention heads.
     pub n_heads: u32,
     /// Number of KV heads (GQA).
@@ -190,6 +207,12 @@ pub struct OpAttrs {
     pub softcap: f32,
     /// Namespaced custom operation id for extension dispatch.
     pub custom_op_id: u32,
+    /// Gated DeltaNet projected value width.
+    pub gdn_inner_size: u32,
+    /// Gated DeltaNet recurrent vector width.
+    pub gdn_state_size: u32,
+    /// Gated DeltaNet causal convolution width.
+    pub gdn_conv_kernel: u32,
 }
 
 impl OpAttrs {
@@ -213,6 +236,6 @@ mod tests {
         assert_eq!(OpKind::from_u32(a.raw()), Some(a));
         assert_eq!(a.name(), "custom");
         assert_eq!(OpKind::from_u32(17), Some(OpKind::GateUpSwiGlu));
-        assert!(OpKind::from_u32(18).is_none());
+        assert_eq!(OpKind::from_u32(21), Some(OpKind::MlaAttention));
     }
 }

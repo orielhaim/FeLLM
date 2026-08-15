@@ -173,6 +173,7 @@ impl CapabilityRegistry {
             5 => CapabilityKind::SequenceStatePolicy,
             6 => CapabilityKind::Sampler,
             7 => CapabilityKind::GraphTransform,
+            8 => CapabilityKind::Speculator,
             _ => return -2,
         };
         let mut provides = FeatureSet::new();

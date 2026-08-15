@@ -119,10 +119,16 @@ impl MemoryFabric {
                     | fellm_memory::StorageProviderRequest::IoUring
             );
         if cpu_storage_native {
-            let slot_bytes = model
-                .groups
-                .iter()
-                .map(|group| group.byte_len)
+            let dense_group_bytes = model.groups.iter().map(|group| {
+                group
+                    .weights
+                    .iter()
+                    .filter_map(|id| weights.iter().find(|weight| weight.id == *id))
+                    .filter(|weight| !fellm_memory::is_moe_expert_bank(&weight.name))
+                    .map(|weight| weight.byte_len)
+                    .sum::<u64>()
+            });
+            let slot_bytes = dense_group_bytes
                 .max()
                 .unwrap_or(4 << 20)
                 .saturating_add(128 << 10)
@@ -139,13 +145,32 @@ impl MemoryFabric {
                 placement.class = fellm_memory::ResidencyClass::StorageStream;
             }
         }
+        let dense_weights = weights
+            .iter()
+            .filter(|weight| !fellm_memory::is_moe_expert_bank(&weight.name))
+            .cloned()
+            .collect::<Vec<_>>();
         let storage_objects = fellm_memory::StorageObjectIndex::from_execution_groups(
-            &weights,
+            &dense_weights,
             &model.groups,
             64 * 1024,
             plan.host_buffer_bytes.max(1),
         )
         .map_err(|_| fellm_memory::PlanningError::NoHostStaging)?;
+        if cpu_storage_native {
+            let bundle = storage_objects
+                .max_objects_per_group(&model.groups)
+                .max(2);
+            let slots = bundle.saturating_add(1).max(2).min(255);
+            plan.host_buffer_count = slots as u8;
+            plan.host_buffer_bytes = plan.host_buffer_bytes.max(1);
+            plan.budget.host_staging = plan.host_buffer_bytes.saturating_mul(slots as u64);
+            plan.storage_queue_depth = if config.storage_overlap {
+                slots.min(8) as u16
+            } else {
+                1
+            };
+        }
         let metrics = FabricMetrics {
             backing_storage_bytes: model.weight_bytes,
             resident_device_bytes: plan.budget.weights_device,
@@ -169,7 +194,7 @@ impl MemoryFabric {
                     };
                     (input.label.contains("exps")
                         && tensor.shape().dims().first().copied() == Some(expert_count))
-                    .then(|| tensor.as_bytes().len() as u64)
+                    .then(|| tensor.layout().byte_size() as u64)
                 })
                 .sum::<u64>();
             let bytes_per_expert = bank_bytes.div_ceil(expert_count).max(1);
@@ -280,7 +305,7 @@ impl MemoryFabric {
                     || old.residency != new.residency
             });
         if changed {
-            tracing::info!(
+            tracing::debug!(
                 hot = placements
                     .iter()
                     .filter(|placement| {
@@ -372,9 +397,7 @@ impl MemoryFabric {
     ) -> fellm_core::error::Result<fellm_memory::StorageProviderKind> {
         let plan = self.snapshot().plan;
         let direct_io_aligned = self.storage_objects.objects().iter().all(|object| {
-            object.extent.offset.is_multiple_of(4096)
-                && object.extent.len.is_multiple_of(4096)
-                && object.extent.alignment >= 4096
+            object.extent.offset.is_multiple_of(4096) && object.extent.alignment >= 4096
         });
         let committed = self
             .hardware
@@ -407,13 +430,17 @@ impl MemoryFabric {
     /// Resolve an execution tensor to its stable GGUF weight identity by storage extent.
     #[must_use]
     pub fn weight_id_for_tensor(&self, tensor: &fellm_core::tensor::Tensor) -> Option<WeightId> {
-        let (offset, len) = tensor
-            .mmap_extent()
-            .map(|(offset, len)| (offset as u64, len))
-            .or_else(|| tensor.file_extent().map(|(_, offset, len)| (offset, len)))?;
+        if let Some((path, offset, len)) = tensor.file_extent() {
+            return self.weights.iter().find(|weight| {
+                weight.home.path == *path
+                    && weight.home.offset == offset
+                    && weight.byte_len == len as u64
+            }).map(|weight| weight.id);
+        }
+        let (offset, len) = tensor.mmap_extent()?;
         self.weights
             .iter()
-            .find(|weight| weight.home.offset == offset && weight.byte_len == len as u64)
+            .find(|weight| weight.home.offset == offset as u64 && weight.byte_len == len as u64)
             .map(|weight| weight.id)
     }
 
@@ -518,7 +545,7 @@ impl MemoryFabric {
         {
             ops.truncate(limit);
         }
-        tracing::info!(
+        tracing::debug!(
             operation_count = ops.len(),
             first_op = ops.first().copied(),
             last_op = ops.last().copied(),
@@ -580,22 +607,22 @@ fn profile_model(
 ) -> (ModelProfile, Vec<WeightDescriptor>) {
     let mut total = 0u64;
     let mut weights = Vec::new();
-    for tensor in gguf.tensors() {
-        let bytes = tensor.dtype.byte_size(tensor.shape.num_elements()) as u64;
-        let absolute_offset = gguf
-            .tensor_data_offset()
-            .saturating_add(tensor.relative_offset);
-        let weight_id = WeightId(absolute_offset.saturating_add(1));
+    for info in gguf.tensors() {
+        let Ok(tensor) = gguf.tensor(&info.name) else {
+            continue;
+        };
+        let Some((path, offset, len)) = tensor.file_extent() else {
+            continue;
+        };
+        let bytes = len as u64;
         total = total.saturating_add(bytes);
         weights.push(WeightDescriptor {
-            id: weight_id,
-            name: tensor.name.clone(),
+            id: WeightId(tensor.logical_id()),
+            name: info.name.clone(),
             home: fellm_memory::StorageExtent {
                 provider: "gguf".into(),
-                path: gguf
-                    .source_path()
-                    .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf),
-                offset: absolute_offset,
+                path: path.clone(),
+                offset,
                 len: bytes,
                 alignment: gguf.alignment(),
             },
@@ -607,7 +634,11 @@ fn profile_model(
         .iter()
         .map(|weight| {
             (
-                (weight.home.offset as usize, weight.byte_len as usize),
+                (
+                    weight.home.path.clone(),
+                    weight.home.offset,
+                    weight.byte_len as usize,
+                ),
                 weight.id,
             )
         })
@@ -624,14 +655,14 @@ fn profile_model(
             let OpValue::Constant(tensor) = &graph.node(input).value else {
                 continue;
             };
-            let Some(extent) = tensor
-                .mmap_extent()
-                .map(|(offset, len)| (offset as u64, len))
-                .or_else(|| tensor.file_extent().map(|(_, offset, len)| (offset, len)))
-            else {
+            let key = if let Some((path, offset, len)) = tensor.file_extent() {
+                (path.clone(), offset, len)
+            } else if let Some((offset, len)) = tensor.mmap_extent() {
+                (std::path::PathBuf::new(), offset as u64, len)
+            } else {
                 continue;
             };
-            let Some(&id) = by_extent.get(&(extent.0 as usize, extent.1)) else {
+            let Some(&id) = by_extent.get(&key) else {
                 continue;
             };
             if !consumed.contains(&id) {

@@ -623,6 +623,23 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn weight_group_capacity_bytes(&self) -> Option<u64> {
+        self.plugins.weight_group_capacity_bytes()
+    }
+
+    fn ensure_weight_group_capacity_bytes(&self, minimum: u64) -> Result<()> {
+        const PIPELINE_SLOTS: u32 = 3;
+        let capacity = self
+            .plugins
+            .weight_group_capacity_bytes()
+            .unwrap_or(0)
+            .max(minimum);
+        self.plugins.set_weight_cache_budget(
+            capacity.saturating_mul(u64::from(PIPELINE_SLOTS)),
+            PIPELINE_SLOTS,
+        )
+    }
+
     fn prefetch_weight_group(
         &self,
         group_id: u64,

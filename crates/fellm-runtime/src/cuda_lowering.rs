@@ -111,6 +111,14 @@ fn recognize_macro_ops(
     for &id in &plan.order {
         let node = graph.node(id);
         let label = node.label.as_str();
+        // Macro recognition is opportunistic. Architectures may legitimately
+        // reuse these semantic suffixes for fused/unary operations; those must
+        // remain ordinary graph nodes instead of being indexed as dense GEMMs.
+        if (label.ends_with(".q_proj") && graph.inputs_slice(id).len() < 2)
+            || (label.ends_with(".residual2") && graph.inputs_slice(id).len() < 2)
+        {
+            continue;
+        }
         let (kind, input_nodes, output_nodes) = if label == "tok_embed" {
             (MacroOpKind::Embedding, graph.inputs_of(id), vec![id])
         } else if label.ends_with(".attn_norm_op") || label.ends_with(".ffn_norm_op") {
@@ -125,6 +133,9 @@ fn recognize_macro_ops(
             let q_inputs = graph.inputs_slice(id);
             let k_inputs = graph.inputs_slice(k);
             let v_inputs = graph.inputs_slice(v);
+            if k_inputs.is_empty() || v_inputs.is_empty() {
+                continue;
+            }
             (
                 MacroOpKind::QkvMmvq,
                 vec![q_inputs[1], q_inputs[0], k_inputs[0], v_inputs[0]],

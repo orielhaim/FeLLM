@@ -441,6 +441,38 @@ impl KvSequence {
     }
 }
 
+/// Runtime-owned provisional KV suffix, finalized exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvTransaction {
+    pub(crate) start_len: usize,
+    pub(crate) start_absolute_pos: usize,
+    pub(crate) active: bool,
+}
+
+impl KvTransaction {
+    pub(crate) fn begin(sequence: &KvSequence) -> Self {
+        Self {
+            start_len: sequence.len_tokens,
+            start_absolute_pos: sequence.absolute_pos,
+            active: true,
+        }
+    }
+
+    #[must_use]
+    pub fn start_len(&self) -> usize {
+        self.start_len
+    }
+
+    #[must_use]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub(crate) fn finalize(&mut self) -> bool {
+        std::mem::replace(&mut self.active, false)
+    }
+}
+
 /// Semantic identity for content-addressed shared KV.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SharedKvKey {

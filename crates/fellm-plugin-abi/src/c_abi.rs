@@ -15,7 +15,7 @@ pub const PLUGIN_NAME_MAX: usize = 64;
 /// Maximum ops a single plugin may register in one call.
 pub const PLUGIN_MAX_OPS: usize = 32;
 /// Maximum input dtypes recorded per registered op.
-pub const PLUGIN_MAX_INPUT_DTYPES: usize = 8;
+pub const PLUGIN_MAX_INPUT_DTYPES: usize = 16;
 
 /// Maximum length of a registered architecture identifier, including NUL.
 pub const ARCHITECTURE_ID_MAX: usize = PLUGIN_NAME_MAX;
@@ -202,6 +202,9 @@ pub type PluginRegisterDeviceTensorFn =
 /// Optional Memory Fabric entry: set the bounded device weight working-set budget.
 pub type PluginSetWeightCacheBudgetFn =
     unsafe extern "C" fn(bytes: u64, buffer_count: u32) -> c_int;
+/// Optional Memory Fabric entry: return the configured byte capacity of one
+/// immutable-weight execution group (`0` when no bounded staging is active).
+pub type PluginWeightGroupCapacityFn = unsafe extern "C" fn() -> u64;
 /// Optional Memory Fabric entry: enqueue future immutable weights.
 pub type PluginPrefetchWeightsFn =
     unsafe extern "C" fn(group_id: u64, weights: *const crate::TensorRef, count: usize) -> c_int;
@@ -336,6 +339,8 @@ pub mod symbols {
     pub const REGISTER_DEVICE_TENSOR: &[u8] = b"_fellm_plugin_register_device_tensor\0";
     /// `_fellm_plugin_set_weight_cache_budget` (optional)
     pub const SET_WEIGHT_CACHE_BUDGET: &[u8] = b"_fellm_plugin_set_weight_cache_budget\0";
+    /// `_fellm_plugin_weight_group_capacity` (optional)
+    pub const WEIGHT_GROUP_CAPACITY: &[u8] = b"_fellm_plugin_weight_group_capacity\0";
     /// `_fellm_plugin_prefetch_weights` (optional)
     pub const PREFETCH_WEIGHTS: &[u8] = b"_fellm_plugin_prefetch_weights\0";
     /// `_fellm_plugin_weight_cache_metrics` (optional)

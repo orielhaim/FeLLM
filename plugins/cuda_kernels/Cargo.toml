@@ -22,6 +22,6 @@ fellm-plugin-abi = { path = "../../crates/fellm-plugin-abi" }
 fellm-core = { path = "../../crates/fellm-core" }
 half = "2.7"
 
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "e403def6f0b04642e6abbae11883b1136256fa4e" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "e403def6f0b04642e6abbae11883b1136256fa4e" }
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "e403def6f0b04642e6abbae11883b1136256fa4e" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }

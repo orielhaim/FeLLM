@@ -65,6 +65,126 @@ impl GemmaWorkerScratch {
     }
 }
 
+fn sqrt_softplus(v: f32) -> f32 {
+    let softplus = if v > 20.0 {
+        v
+    } else if v < -20.0 {
+        v.exp()
+    } else {
+        (1.0 + v.exp()).ln()
+    };
+    softplus.max(0.0).sqrt()
+}
+
+fn gate_scores(logits: Vec<f32>, gating_func: u32) -> Vec<(usize, f32)> {
+    match gating_func {
+        2 => logits
+            .into_iter()
+            .enumerate()
+            .map(|(e, v)| (e, 1.0 / (1.0 + (-v).exp())))
+            .collect(),
+        4 => logits
+            .into_iter()
+            .enumerate()
+            .map(|(e, v)| (e, sqrt_softplus(v)))
+            .collect(),
+        _ => {
+            let max_logit = logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+            let mut denom = 0.0f32;
+            let mut scores = Vec::with_capacity(logits.len());
+            for (e, logit) in logits.into_iter().enumerate() {
+                let score = (logit - max_logit).exp();
+                denom += score;
+                scores.push((e, score));
+            }
+            if denom > 0.0 {
+                for (_, score) in &mut scores {
+                    *score /= denom;
+                }
+            }
+            scores
+        }
+    }
+}
+
+fn finish_selected(
+    mut selected: Vec<(usize, f32)>,
+    n_experts: usize,
+    n_expert_used: usize,
+    routed_scaling_factor: f32,
+    norm_topk_prob: bool,
+) -> Vec<(usize, f32)> {
+    let k = n_expert_used.min(n_experts).min(selected.len());
+    selected.truncate(k);
+    fellm_plugin_abi::record_expert_route(selected.iter().map(|(expert, _)| *expert as u32));
+    if norm_topk_prob {
+        let sum = selected.iter().map(|(_, score)| *score).sum::<f32>();
+        if sum > 0.0 {
+            for (_, score) in &mut selected {
+                *score /= sum;
+            }
+        }
+    }
+    let scale = if routed_scaling_factor == 0.0 {
+        1.0
+    } else {
+        routed_scaling_factor
+    };
+    for (_, score) in &mut selected {
+        *score *= scale;
+    }
+    selected
+}
+
+fn select_routed_experts(
+    logits: Vec<f32>,
+    gating_func: u32,
+    n_experts: usize,
+    n_expert_used: usize,
+    routed_scaling_factor: f32,
+    norm_topk_prob: bool,
+    forced: Option<&[i32]>,
+) -> Result<Vec<(usize, f32)>> {
+    let scored = gate_scores(logits, gating_func);
+    let selected = if let Some(ids) = forced {
+        let mut picked = Vec::with_capacity(ids.len());
+        for &raw in ids {
+            if raw < 0 {
+                return Err(FellmError::other(format!(
+                    "moe: token-id expert map has negative expert {raw}"
+                )));
+            }
+            let expert = raw as usize;
+            if expert >= n_experts {
+                return Err(FellmError::other(format!(
+                    "moe: token-id expert {expert} >= {n_experts}"
+                )));
+            }
+            let score = scored
+                .iter()
+                .find(|(e, _)| *e == expert)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0);
+            picked.push((expert, score));
+        }
+        picked
+    } else {
+        let mut scored = scored;
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored
+    };
+    Ok(finish_selected(
+        selected,
+        n_experts,
+        n_expert_used,
+        routed_scaling_factor,
+        norm_topk_prob,
+    ))
+}
+
 fn expert_slice(
     w_bytes: &[u8],
     w_dtype: DType,
@@ -91,10 +211,21 @@ fn matvec_weight(
         DType::F32 => {
             let w: &[f32] = bytemuck::try_cast_slice(w_bytes)
                 .map_err(|e| FellmError::other(format!("moe: f32 cast: {e:?}")))?;
+            if w.len() != out_dim.saturating_mul(in_dim) || x.len() != in_dim || y.len() != out_dim
+            {
+                return Err(FellmError::other(format!(
+                    "moe f32 matvec: w={} out={out_dim} in={in_dim} x={} y={}",
+                    w.len(),
+                    x.len(),
+                    y.len()
+                )));
+            }
             matmul::matvec_f32(w, x, y, out_dim, in_dim);
             Ok(())
         }
-        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q2K | DType::Q4K | DType::Q5K | DType::Q6K
+        | DType::IQ2XXS | DType::IQ2XS | DType::IQ3XXS | DType::IQ3S | DType::MXFP4 | DType::BF16
+        | DType::F16 => {
             matmul::matvec_quant(w_bytes, w_dtype, x, y, out_dim, in_dim)
         }
         other => Err(FellmError::UnsupportedDType(other)),
@@ -119,7 +250,9 @@ fn matmul_weight_batch(
                 .map_err(|e| FellmError::other(format!("moe: f32 cast: {e:?}")))?;
             matmul::matmul_f32_batch(weights, x, y, rows, out_dim, in_dim)
         }
-        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q2K | DType::Q4K | DType::Q5K | DType::Q6K
+        | DType::IQ2XXS | DType::IQ2XS | DType::IQ3XXS | DType::IQ3S | DType::MXFP4 | DType::BF16
+        | DType::F16 => {
             matmul::matmul_quant_batch(w_bytes, w_dtype, x, y, rows, out_dim, in_dim)
         }
         other => Err(FellmError::UnsupportedDType(other)),
@@ -144,11 +277,106 @@ fn matmul_weight_batch_serial(
                 .map_err(|e| FellmError::other(format!("moe: f32 cast: {e:?}")))?;
             matmul::matmul_f32_batch_serial(weights, x, y, rows, out_dim, in_dim)
         }
-        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Q2K | DType::Q4K | DType::Q5K | DType::Q6K
+        | DType::IQ2XXS | DType::IQ2XS | DType::IQ3XXS | DType::IQ3S | DType::MXFP4 | DType::BF16
+        | DType::F16 => {
             matmul::matmul_quant_batch_serial(w_bytes, w_dtype, x, y, rows, out_dim, in_dim)
         }
         other => Err(FellmError::UnsupportedDType(other)),
     }
+}
+
+/// Score and select the routed experts for one token without touching expert banks.
+pub fn moe_route(
+    x: &[f32],
+    gate_inp: &[f32],
+    bias: Option<&[f32]>,
+    n_experts: usize,
+    n_expert_used: usize,
+    n_embd: usize,
+    gating_func: u32,
+    routed_scaling_factor: f32,
+    norm_topk_prob: bool,
+    forced_experts: Option<&[i32]>,
+) -> Result<Vec<(usize, f32)>> {
+    if n_experts == 0 || n_expert_used == 0 || n_embd == 0 {
+        return Err(FellmError::other("moe: bad dimensions"));
+    }
+    if x.len() != n_embd {
+        return Err(FellmError::other("moe: x len mismatch"));
+    }
+    if gate_inp.len() != n_experts * n_embd {
+        return Err(FellmError::other(format!(
+            "moe: router len {} != {}",
+            gate_inp.len(),
+            n_experts * n_embd
+        )));
+    }
+    if let Some(b) = bias
+        && b.len() < n_experts
+    {
+        return Err(FellmError::other("moe: bias shorter than n_experts"));
+    }
+    let mut logits = vec![0.0f32; n_experts];
+    matmul::matvec_f32(gate_inp, x, &mut logits, n_experts, n_embd);
+    if let Some(b) = bias {
+        for e in 0..n_experts {
+            logits[e] += b[e];
+        }
+    }
+    select_routed_experts(
+        logits,
+        gating_func,
+        n_experts,
+        n_expert_used,
+        routed_scaling_factor,
+        norm_topk_prob,
+        forced_experts,
+    )
+}
+
+/// Apply already-selected experts. `gate/up/down` are one-expert packed slices.
+pub fn moe_apply_selected(
+    x: &[f32],
+    selected: &[(usize, f32)],
+    gate_slices: &[&[u8]],
+    gate_dtype: DType,
+    up_slices: &[&[u8]],
+    up_dtype: DType,
+    down_slices: &[&[u8]],
+    down_dtype: DType,
+    y: &mut [f32],
+    n_ff: usize,
+    n_embd: usize,
+) -> Result<()> {
+    if selected.len() != gate_slices.len()
+        || selected.len() != up_slices.len()
+        || selected.len() != down_slices.len()
+    {
+        return Err(FellmError::other("moe: selected slice count"));
+    }
+    y.fill(0.0);
+    let mut gate = vec![0.0f32; n_ff];
+    let mut up = vec![0.0f32; n_ff];
+    let mut hidden = vec![0.0f32; n_ff];
+    let mut expert_out = vec![0.0f32; n_embd];
+    for (i, &(_, score)) in selected.iter().enumerate() {
+        matvec_weight(gate_slices[i], gate_dtype, x, &mut gate, n_ff, n_embd)?;
+        matvec_weight(up_slices[i], up_dtype, x, &mut up, n_ff, n_embd)?;
+        silu_gate(&gate, &up, &mut hidden);
+        matvec_weight(
+            down_slices[i],
+            down_dtype,
+            &hidden,
+            &mut expert_out,
+            n_embd,
+            n_ff,
+        )?;
+        for (dst, &v) in y.iter_mut().zip(&expert_out) {
+            *dst += score * v;
+        }
+    }
+    Ok(())
 }
 
 /// Run one-token MoE.
@@ -171,6 +399,7 @@ pub fn moe_decode(
     gating_func: u32,
     routed_scaling_factor: f32,
     norm_topk_prob: bool,
+    forced_experts: Option<&[i32]>,
 ) -> Result<()> {
     if n_experts == 0 || n_expert_used == 0 || n_ff == 0 || n_embd == 0 {
         return Err(FellmError::other("moe: bad dimensions"));
@@ -195,58 +424,19 @@ pub fn moe_decode(
         return Err(FellmError::other("moe: bias shorter than n_experts"));
     }
 
-    let mut logits = vec![0.0f32; n_experts];
-    matmul::matvec_f32(gate_inp, x, &mut logits, n_experts, n_embd);
-    if let Some(b) = bias {
-        for e in 0..n_experts {
-            logits[e] += b[e];
-        }
-    }
-
-    let mut scored = match gating_func {
-        2 => logits
-            .into_iter()
-            .enumerate()
-            .map(|(e, v)| (e, 1.0 / (1.0 + (-v).exp())))
-            .collect::<Vec<_>>(),
-        _ => {
-            let max_logit = logits
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, |a, b| a.max(b));
-            let mut denom = 0.0f32;
-            let mut scores = Vec::with_capacity(n_experts);
-            for (e, logit) in logits.into_iter().enumerate() {
-                let score = (logit - max_logit).exp();
-                denom += score;
-                scores.push((e, score));
-            }
-            if denom > 0.0 {
-                for (_, score) in &mut scores {
-                    *score /= denom;
-                }
-            }
-            scores
-        }
-    };
-
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let k = n_expert_used.min(n_experts);
-    let selected = &mut scored[..k];
-    fellm_plugin_abi::record_expert_route(selected.iter().map(|(expert, _)| *expert as u32));
-    if norm_topk_prob {
-        let sum = selected.iter().map(|(_, score)| *score).sum::<f32>();
-        if sum > 0.0 {
-            for (_, score) in selected.iter_mut() {
-                *score /= sum;
-            }
-        }
-    }
-    let scale = if routed_scaling_factor == 0.0 {
-        1.0
-    } else {
-        routed_scaling_factor
-    };
+    let selected = moe_route(
+        x,
+        gate_inp,
+        bias,
+        n_experts,
+        n_expert_used,
+        n_embd,
+        gating_func,
+        routed_scaling_factor,
+        norm_topk_prob,
+        forced_experts,
+    )?;
+    let k = selected.len();
 
     y.fill(0.0);
     let mut hidden = vec![0.0f32; k * n_ff];
@@ -272,9 +462,8 @@ pub fn moe_decode(
                 n_embd,
                 n_ff,
             )?;
-            let weight = score * scale;
             for i in 0..n_embd {
-                y[i] += weight * expert_out[i];
+                y[i] += score * expert_out[i];
             }
         }
         return Ok(());
@@ -326,12 +515,37 @@ pub fn moe_decode(
     }
 
     for (e, &(_, score)) in selected.iter().enumerate() {
-        let weight = score * scale;
         for i in 0..n_embd {
-            y[i] += weight * expert_out[e * n_embd + i];
+            y[i] += score * expert_out[e * n_embd + i];
         }
     }
 
+    Ok(())
+}
+
+pub fn add_shared_expert(
+    x: &[f32],
+    gate_w: &[u8],
+    gate_dtype: DType,
+    up_w: &[u8],
+    up_dtype: DType,
+    down_w: &[u8],
+    down_dtype: DType,
+    y: &mut [f32],
+    n_ff: usize,
+    n_embd: usize,
+) -> Result<()> {
+    let mut gate = vec![0.0f32; n_ff];
+    let mut up = vec![0.0f32; n_ff];
+    let mut hidden = vec![0.0f32; n_ff];
+    let mut out = vec![0.0f32; n_embd];
+    matvec_weight(gate_w, gate_dtype, x, &mut gate, n_ff, n_embd)?;
+    matvec_weight(up_w, up_dtype, x, &mut up, n_ff, n_embd)?;
+    silu_gate(&gate, &up, &mut hidden);
+    matvec_weight(down_w, down_dtype, &hidden, &mut out, n_embd, n_ff)?;
+    for (dst, src) in y.iter_mut().zip(out) {
+        *dst += src;
+    }
     Ok(())
 }
 
@@ -790,7 +1004,7 @@ pub fn moe_decode_gemma_batch(
                 .iter()
                 .filter(|assignments| assignments.len() == 1)
                 .count();
-            tracing::info!(
+            tracing::debug!(
                 target = "fellm::profile",
                 tokens,
                 n_experts,
@@ -859,6 +1073,7 @@ mod tests {
             2,
             1.0,
             true,
+            None,
         )
         .unwrap();
 

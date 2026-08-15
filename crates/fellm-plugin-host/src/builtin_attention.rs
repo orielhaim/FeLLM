@@ -86,7 +86,7 @@ impl AttentionProvider for HostTiledAttentionProvider {
 
     fn supports(&self, workload: &AttentionWorkload, _device: &DeviceCapabilityView) -> bool {
         workload.head_dim > 0
-            && workload.head_dim <= 256
+            && workload.head_dim <= 512
             && workload.n_heads > 0
             && workload.n_kv_heads > 0
             && workload.n_heads.is_multiple_of(workload.n_kv_heads.max(1))
@@ -255,7 +255,7 @@ impl AttentionProvider for CudaAttentionProvider {
             // Still "supports" for structural tests; auto-select scores lower on CPU.
         }
         workload.head_dim > 0
-            && workload.head_dim <= 256
+            && workload.head_dim <= 512
             && workload.n_heads > 0
             && workload.n_kv_heads > 0
     }

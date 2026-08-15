@@ -25,8 +25,12 @@ pub struct TensorInfo {
     pub dtype: DType,
     /// Shape (row-major, GGUF stores in reverse — we normalize).
     pub shape: Shape,
-    /// Offset in bytes relative to the start of `tensor_data`.
+    /// Offset in bytes relative to the start of `tensor_data` in the owning shard.
     pub relative_offset: u64,
+    /// Shard file that contains this tensor payload. `None` uses [`GgufFile::source_path`].
+    pub shard_path: Option<std::path::PathBuf>,
+    /// Absolute tensor-data origin of [`Self::shard_path`]. `None` uses [`GgufFile::tensor_data_offset`].
+    pub shard_data_offset: Option<u64>,
 }
 
 /// A loaded GGUF file.
@@ -49,8 +53,16 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
-    /// Open a GGUF file from disk.
+    /// Open a GGUF file, automatically assembling llama.cpp-style split shards.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let shards = discover_gguf_shards(path.as_ref())?;
+        if shards.len() > 1 || file_too_large_to_map(&shards[0]) {
+            return Self::open_storage_native(path);
+        }
+        Self::open_mapped(&shards[0])
+    }
+
+    fn open_mapped(path: &Path) -> Result<Self> {
         #[cfg(target_os = "linux")]
         if std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
@@ -61,7 +73,7 @@ impl GgufFile {
                 "WSL model is on a Windows-mounted filesystem; use the Linux filesystem for substantially faster model paging"
             );
         }
-        let file = File::open(path.as_ref())?;
+        let file = File::open(path)?;
         // SAFETY: the file remains open for the lifetime of the mapping,
         // and we treat the bytes as immutable throughout.
         let mmap = unsafe { Mmap::map(&file)? };
@@ -74,15 +86,47 @@ impl GgufFile {
             let _ = mmap.advise(memmap2::Advice::WillNeed);
         }
         let mut gguf = Self::from_mmap(Arc::new(mmap))?;
-        gguf.source_path = Some(path.as_ref().to_path_buf());
+        gguf.source_path = Some(path.to_path_buf());
+        gguf.validate_payloads()?;
         Ok(gguf)
     }
 
     /// Open only the bounded GGUF metadata/index. Weight payloads remain file extents and no
-    /// model-wide virtual mapping is created.
+    /// model-wide virtual mapping is created. Split GGUF shards in the same directory are merged.
     pub fn open_storage_native<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let shards = discover_gguf_shards(path.as_ref())?;
+        let mut merged: Option<Self> = None;
+        for (index, shard) in shards.iter().enumerate() {
+            let part = Self::open_storage_native_one(shard)?;
+            validate_split_metadata(&part, index, shards.len(), shard)?;
+            match merged.as_mut() {
+                None => merged = Some(part),
+                Some(acc) => {
+                    for mut info in part.tensor_infos {
+                        info.shard_path = Some(shard.clone());
+                        info.shard_data_offset = Some(part.tensor_data_offset);
+                        acc.tensor_infos.push(info);
+                    }
+                }
+            }
+        }
+        let mut gguf = merged.ok_or_else(|| FellmError::other("no GGUF shards found"))?;
+        gguf.by_name.clear();
+        for (i, ti) in gguf.tensor_infos.iter().enumerate() {
+            gguf.by_name.insert(ti.name.clone(), i);
+        }
+        gguf.validate_payloads()?;
+        tracing::debug!(
+            shards = shards.len(),
+            tensors = gguf.tensor_infos.len(),
+            "opened storage-native GGUF (split-aware)"
+        );
+        Ok(gguf)
+    }
+
+    fn open_storage_native_one(path: &Path) -> Result<Self> {
         const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
-        let mut file = File::open(path.as_ref())?;
+        let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         let header_len = file_len.min(MAX_HEADER_BYTES) as usize;
         let mut header = vec![0u8; header_len];
@@ -94,12 +138,8 @@ impl GgufFile {
                 MAX_HEADER_BYTES >> 20
             )));
         }
-        gguf.source_path = Some(path.as_ref().to_path_buf());
+        gguf.source_path = Some(path.to_path_buf());
         gguf.metadata_only = true;
-        tracing::info!(
-            metadata_bytes = gguf.tensor_data_offset,
-            "opened storage-native GGUF index without mapping weight payloads"
-        );
         Ok(gguf)
     }
 
@@ -156,6 +196,8 @@ impl GgufFile {
                 dtype,
                 shape,
                 relative_offset,
+                shard_path: None,
+                shard_data_offset: None,
             });
         }
 
@@ -240,7 +282,21 @@ impl GgufFile {
             .get(idx)
             .ok_or_else(|| FellmError::parse(format!("tensor index {idx} out of range")))?;
         let byte_size = ti.dtype.byte_size(ti.shape.num_elements());
-        let absolute = self.tensor_data_offset + ti.relative_offset;
+        let data_offset = ti
+            .shard_data_offset
+            .unwrap_or(self.tensor_data_offset);
+        let labeled_path = ti
+            .shard_path
+            .clone()
+            .or_else(|| self.source_path.clone())
+            .ok_or_else(|| FellmError::other("storage-native GGUF has no source path"))?;
+        let (path, absolute) = resolve_split_payload_location(
+            &labeled_path,
+            &ti.name,
+            data_offset.saturating_add(ti.relative_offset),
+            ti.relative_offset,
+            byte_size,
+        )?;
         let layout = Layout {
             dtype: ti.dtype,
             shape: ti.shape.clone(),
@@ -249,21 +305,67 @@ impl GgufFile {
         };
         let storage =
             if let Some(mmap) = &self.mmap {
-                Storage::Mmap {
-                    mmap: Arc::clone(mmap),
-                    offset: absolute as usize,
-                    len: byte_size,
+                if ti.shard_path.is_some() {
+                    Storage::FileExtent {
+                        path: Arc::new(path),
+                        offset: absolute,
+                        len: byte_size,
+                    }
+                } else {
+                    Storage::Mmap {
+                        mmap: Arc::clone(mmap),
+                        offset: absolute as usize,
+                        len: byte_size,
+                    }
                 }
             } else {
                 Storage::FileExtent {
-                    path: Arc::new(self.source_path.clone().ok_or_else(|| {
-                        FellmError::other("storage-native GGUF has no source path")
-                    })?),
+                    path: Arc::new(path),
                     offset: absolute,
                     len: byte_size,
                 }
             };
         Ok(Tensor::from_storage(layout, Arc::new(storage)))
+    }
+
+    /// Verify every tensor's resolved byte range lies inside its shard file.
+    pub fn validate_payloads(&self) -> Result<()> {
+        for ti in &self.tensor_infos {
+            let byte_size = ti.dtype.byte_size(ti.shape.num_elements());
+            let data_offset = ti.shard_data_offset.unwrap_or(self.tensor_data_offset);
+            let labeled_path = ti
+                .shard_path
+                .as_ref()
+                .or(self.source_path.as_ref())
+                .ok_or_else(|| FellmError::other("storage-native GGUF has no source path"))?;
+            let (path, absolute) = resolve_split_payload_location(
+                labeled_path,
+                &ti.name,
+                data_offset.saturating_add(ti.relative_offset),
+                ti.relative_offset,
+                byte_size,
+            )?;
+            let file_len = if let Some(mmap) = &self.mmap {
+                if ti.shard_path.is_some() {
+                    std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+                } else {
+                    mmap.len() as u64
+                }
+            } else {
+                std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+            };
+            let end = absolute.saturating_add(byte_size as u64);
+            if end > file_len {
+                return Err(truncated_shard_error(
+                    &ti.name,
+                    &path,
+                    absolute,
+                    end,
+                    file_len,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// True if a tensor with this name exists.
@@ -276,6 +378,131 @@ impl GgufFile {
     pub fn tensors(&self) -> impl Iterator<Item = &TensorInfo> {
         self.tensor_infos.iter()
     }
+}
+
+fn file_too_large_to_map(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.len() > 2 * 1024 * 1024 * 1024)
+        .unwrap_or(false)
+}
+
+/// Discover llama.cpp split GGUF siblings (`*-00001-of-00004.gguf`).
+pub fn discover_gguf_shards(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let path = path.to_path_buf();
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(vec![path]);
+    };
+    let Some(stripped) = name.strip_suffix(".gguf").or_else(|| name.strip_suffix(".GGUF")) else {
+        return Ok(vec![path]);
+    };
+    let Some((prefix, rest)) = stripped.rsplit_once("-of-") else {
+        return Ok(vec![path]);
+    };
+    let Some((stem, index)) = prefix.rsplit_once('-') else {
+        return Ok(vec![path]);
+    };
+    if index.len() != 5 || rest.len() != 5 {
+        return Ok(vec![path]);
+    }
+    if !index.chars().all(|c| c.is_ascii_digit()) || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(vec![path]);
+    }
+    let count: u32 = rest
+        .parse()
+        .map_err(|_| FellmError::other("invalid GGUF split count"))?;
+    if count == 0 {
+        return Ok(vec![path]);
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut shards = Vec::with_capacity(count as usize);
+    for i in 1..=count {
+        let candidate = dir.join(format!("{stem}-{i:05}-of-{count:05}.gguf"));
+        if !candidate.is_file() {
+            return Err(FellmError::other(format!(
+                "missing GGUF split shard {}",
+                candidate.display()
+            )));
+        }
+        shards.push(candidate);
+    }
+    Ok(shards)
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn payload_fits(path: &Path, offset: u64, len: usize) -> bool {
+    offset.saturating_add(len as u64) <= file_len(path)
+}
+
+fn truncated_shard_error(
+    tensor: &str,
+    path: &Path,
+    start: u64,
+    end: u64,
+    file_len: u64,
+) -> FellmError {
+    FellmError::other(format!(
+        "corrupt/truncated GGUF shard:\ntensor {tensor} requires bytes {start}..{end},\nbut shard {} is only {file_len} bytes",
+        path.display()
+    ))
+}
+
+fn validate_split_metadata(
+    part: &GgufFile,
+    index: usize,
+    shard_count: usize,
+    path: &Path,
+) -> Result<()> {
+    if let Ok(count) = part.metadata.get_u64("split.count")
+        && count != shard_count as u64
+    {
+        return Err(FellmError::other(format!(
+            "GGUF split.count={count} does not match discovered shard count {shard_count} for {}",
+            path.display()
+        )));
+    }
+    if let Ok(no) = part.metadata.get_u64("split.no")
+        && no != index as u64
+    {
+        return Err(FellmError::other(format!(
+            "GGUF split.no={no} does not match shard index {index} for {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_split_payload_location(
+    labeled_path: &Path,
+    tensor: &str,
+    absolute: u64,
+    relative: u64,
+    byte_size: usize,
+) -> Result<(std::path::PathBuf, u64)> {
+    let shard_len = file_len(labeled_path);
+    if payload_fits(labeled_path, absolute, byte_size) {
+        return Ok((labeled_path.to_path_buf(), absolute));
+    }
+    if payload_fits(labeled_path, relative, byte_size) {
+        tracing::debug!(
+            tensor,
+            path = %labeled_path.display(),
+            absolute,
+            relative,
+            "resolved GGUF payload with relative offset"
+        );
+        return Ok((labeled_path.to_path_buf(), relative));
+    }
+    let needed_end = absolute.saturating_add(byte_size as u64);
+    Err(truncated_shard_error(
+        tensor,
+        labeled_path,
+        absolute,
+        needed_end,
+        shard_len,
+    ))
 }
 
 fn align_up(x: u64, align: u64) -> u64 {
@@ -296,5 +523,21 @@ mod tests {
         assert_eq!(align_up(32, 32), 32);
         assert_eq!(align_up(33, 32), 64);
         assert_eq!(align_up(100, 1), 100);
+    }
+
+    #[test]
+    fn truncated_error_names_tensor_and_shard() {
+        let err = truncated_shard_error(
+            "blk.0.attn_q.weight",
+            Path::new("DeepSeek-V4-Flash-00003-of-00004.gguf"),
+            10,
+            100,
+            50,
+        );
+        let text = err.to_string();
+        assert!(text.contains("corrupt/truncated GGUF shard"));
+        assert!(text.contains("blk.0.attn_q.weight"));
+        assert!(text.contains("10..100"));
+        assert!(text.contains("only 50 bytes"));
     }
 }

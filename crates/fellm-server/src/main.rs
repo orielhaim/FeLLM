@@ -154,6 +154,7 @@ async fn main() {
         seed: args.seed,
         repetition_penalty: args.repetition_penalty,
         priority: 0,
+        ..GenParams::default()
     };
 
     let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()

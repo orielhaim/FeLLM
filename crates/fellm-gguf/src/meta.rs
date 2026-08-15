@@ -434,6 +434,22 @@ impl MetaMap {
         }
     }
 
+    /// Fetch a u32 array.
+    pub fn get_u32_array(&self, key: &str) -> Result<&[u32]> {
+        match self
+            .inner
+            .get(key)
+            .ok_or_else(|| FellmError::MetadataKeyNotFound(key.into()))?
+        {
+            MetaValue::Array(MetaArray::U32(v)) => Ok(v.as_slice()),
+            other => Err(FellmError::MetadataTypeMismatch {
+                key: key.into(),
+                expected: "array<u32>",
+                got: other.kind_name(),
+            }),
+        }
+    }
+
     /// Fetch an i32 array.
     pub fn get_i32_array(&self, key: &str) -> Result<&[i32]> {
         match self

@@ -51,7 +51,6 @@ pub struct StorageObject {
     pub id: StorageObjectId,
     pub extent: StorageExtent,
     pub members: Vec<StorageObjectMember>,
-    /// Sum of useful member bytes. `extent.len - useful_bytes` is read amplification.
     pub useful_bytes: u64,
 }
 

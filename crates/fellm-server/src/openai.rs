@@ -13,6 +13,7 @@ use async_openai::types::chat::{
 use fellm_runtime::{GenParams, GenStats, Message, ToolCall, ToolDef};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Map an `OpenAI` chat completion request into engine inputs.
@@ -22,12 +23,15 @@ pub fn map_request(
 ) -> Result<(Vec<Message>, Vec<ToolDef>, GenParams, bool), String> {
     let messages = map_messages(&req.messages)?;
     let tools = map_tools(req.tools.as_deref().unwrap_or(&[]))?;
-    let params = map_params(req, defaults);
+    let params = map_params(req, defaults)?;
     let stream = req.stream.unwrap_or(false);
     Ok((messages, tools, params, stream))
 }
 
-fn map_params(req: &CreateChatCompletionRequest, mut defaults: GenParams) -> GenParams {
+fn map_params(
+    req: &CreateChatCompletionRequest,
+    mut defaults: GenParams,
+) -> Result<GenParams, String> {
     #[allow(deprecated)]
     if let Some(n) = req.max_completion_tokens.or(req.max_tokens) {
         defaults.max_tokens = n;
@@ -38,11 +42,29 @@ fn map_params(req: &CreateChatCompletionRequest, mut defaults: GenParams) -> Gen
     if let Some(p) = req.top_p {
         defaults.top_p = p;
     }
+    if let Some(penalty) = req.frequency_penalty {
+        defaults.frequency_penalty = penalty;
+    }
+    if let Some(penalty) = req.presence_penalty {
+        defaults.presence_penalty = penalty;
+    }
+    if let Some(bias) = &req.logit_bias {
+        defaults.logit_bias = Arc::from(
+            bias.iter()
+                .map(|(token, bias)| {
+                    token
+                        .parse::<u32>()
+                        .map(|token| (token, f32::from(*bias)))
+                        .map_err(|error| format!("invalid logit_bias token id '{token}': {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
     #[allow(deprecated)]
     if let Some(seed) = req.seed {
         defaults.seed = u64::try_from(seed).unwrap_or(0);
     }
-    defaults
+    Ok(defaults)
 }
 
 fn map_tools(tools: &[ChatCompletionTools]) -> Result<Vec<ToolDef>, String> {

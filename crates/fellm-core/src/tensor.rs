@@ -5,6 +5,7 @@ use crate::error::{FellmError, Result};
 use crate::shape::{Layout, Shape};
 use crate::storage::{AlignedBuffer, Storage};
 use std::sync::Arc;
+use std::{hash::Hash, hash::Hasher};
 
 /// A tensor is a `Layout` plus a `Storage`.
 ///
@@ -90,6 +91,26 @@ impl Tensor {
         })
     }
 
+    /// Process-stable identity for backend residency caches. It includes the
+    /// backing source as well as the byte offset, so independently mapped
+    /// model/checkpoint files cannot alias merely because their tensor layouts
+    /// use the same offsets.
+    #[must_use]
+    pub fn logical_id(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some((path, offset, len)) = self.file_extent() {
+            0u8.hash(&mut hasher);
+            path.hash(&mut hasher);
+            offset.hash(&mut hasher);
+            len.hash(&mut hasher);
+        } else {
+            1u8.hash(&mut hasher);
+            self.as_bytes().as_ptr().hash(&mut hasher);
+            self.as_bytes().len().hash(&mut hasher);
+        }
+        hasher.finish().max(1)
+    }
+
     /// Interpret the payload as `&[T]` if the dtype matches size-wise and the
     /// tensor is contiguous.
     ///
@@ -146,5 +167,52 @@ impl Tensor {
         layout.offset_bytes =
             self.layout.offset_bytes + index * self.layout.dtype.byte_size(columns);
         Ok(Self::from_storage(layout, self.storage.clone()))
+    }
+
+    /// Create a zero-copy contiguous range of rows from a rank-2 tensor.
+    /// Quantized matrices are supported when each row ends on a complete block.
+    pub fn rows(&self, start: usize, count: usize) -> Result<Self> {
+        let dims = self.layout.shape.dims();
+        if dims.len() != 2 || !self.layout.is_contiguous() {
+            return Err(FellmError::other(
+                "rows requires a contiguous rank-2 tensor",
+            ));
+        }
+        let rows = dims[0] as usize;
+        let columns = dims[1] as usize;
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| FellmError::other("row range overflow"))?;
+        if end > rows {
+            return Err(FellmError::other(format!(
+                "row range {start}..{end} out of bounds for {rows} rows"
+            )));
+        }
+        if columns % self.layout.dtype.elements_per_block() != 0 {
+            return Err(FellmError::other(
+                "quantized matrix row is not block aligned",
+            ));
+        }
+        let row_bytes = self.layout.dtype.byte_size(columns);
+        let mut layout = Layout::contiguous(
+            self.layout.dtype,
+            Shape::new(&[count as u64, columns as u64])?,
+        );
+        layout.offset_bytes = self.layout.offset_bytes + start * row_bytes;
+        Ok(Self::from_storage(layout, self.storage.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_identity_distinguishes_independent_backings() {
+        let first = Tensor::zeros(DType::F32, Shape::new(&[4]).unwrap());
+        let clone = first.clone();
+        let second = Tensor::zeros(DType::F32, Shape::new(&[4]).unwrap());
+        assert_eq!(first.logical_id(), clone.logical_id());
+        assert_ne!(first.logical_id(), second.logical_id());
     }
 }

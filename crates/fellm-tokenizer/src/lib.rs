@@ -13,7 +13,10 @@ use fellm_core::error::{FellmError, Result};
 use fellm_gguf::GgufFile;
 use tokenizers::Tokenizer as HfTokenizer;
 
-pub use chat::{AssistantOutput, Message, ToolCall, ToolDef, render_chat_template};
+pub use chat::{
+    AssistantOutput, ChatRenderOptions, Message, ToolCall, ToolDef,
+    chat_template_supports_thinking, render_chat_template, render_chat_template_with_options,
+};
 
 /// A token id.
 pub type TokenId = u32;
@@ -48,6 +51,18 @@ pub trait Tokenizer: Send + Sync {
     /// Vocabulary size.
     fn vocab_size(&self) -> usize;
 
+    /// Exact vocabulary piece by id, including control-token surface forms.
+    fn vocabulary_piece(&self, id: TokenId) -> Option<&str>;
+
+    /// GGML token class by id (`1` normal, `2/3` control/unknown, etc.).
+    fn token_type(&self, id: TokenId) -> Option<i32>;
+
+    /// True for BOS/EOS (and equivalent control surfaces) that must not appear
+    /// in streamed completion text. Think delimiters stay visible.
+    fn hides_from_completion(&self, id: TokenId) -> bool {
+        self.bos() == Some(id) || self.eos() == Some(id)
+    }
+
     /// Chat template string (Jinja source), if any.
     fn chat_template(&self) -> Option<&str>;
 
@@ -77,17 +92,40 @@ pub trait Tokenizer: Send + Sync {
         tools: &[ToolDef],
         add_generation_prompt: bool,
     ) -> Result<Option<String>> {
+        self.apply_chat_template_with_options(
+            messages,
+            tools,
+            add_generation_prompt,
+            ChatRenderOptions::default(),
+        )
+    }
+
+    /// Apply the GGUF chat template with extra Jinja variables (e.g. thinking).
+    fn apply_chat_template_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        add_generation_prompt: bool,
+        options: ChatRenderOptions,
+    ) -> Result<Option<String>> {
         let Some(tmpl) = self.chat_template() else {
             return Ok(None);
         };
-        Ok(Some(render_chat_template(
+        Ok(Some(render_chat_template_with_options(
             tmpl,
             messages,
             tools,
             add_generation_prompt,
             self.bos_str(),
             self.eos_str(),
+            options,
         )?))
+    }
+
+    /// True when the GGUF chat template defines `enable_thinking`.
+    fn supports_thinking(&self) -> bool {
+        self.chat_template()
+            .is_some_and(chat_template_supports_thinking)
     }
 }
 
@@ -102,6 +140,7 @@ pub struct GgufTokenizer {
     eos: Option<TokenId>,
     bos_str: Option<String>,
     eos_str: Option<String>,
+    add_bos: bool,
     chat_template: Option<String>,
 }
 
@@ -123,6 +162,10 @@ impl GgufTokenizer {
         let eos = gguf.metadata.get_u32("tokenizer.ggml.eos_token_id").ok();
         let bos_str = bos.and_then(|id| tokens.get(id as usize).cloned());
         let eos_str = eos.and_then(|id| tokens.get(id as usize).cloned());
+        let add_bos = gguf
+            .metadata
+            .get_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(true);
         let chat_template = gguf
             .metadata
             .get_string("tokenizer.chat_template")
@@ -139,6 +182,7 @@ impl GgufTokenizer {
             eos,
             bos_str,
             eos_str,
+            add_bos,
             chat_template,
         })
     }
@@ -154,7 +198,7 @@ impl Tokenizer for GgufTokenizer {
             .map_err(|e| FellmError::Tokenization(format!("encode: {e}")))?;
         let mut ids: Vec<TokenId> = encoding.get_ids().to_vec();
 
-        if add_special && let Some(b) = self.bos {
+        if add_special && self.add_bos && let Some(b) = self.bos {
             let already = self
                 .bos_str
                 .as_ref()
@@ -167,18 +211,33 @@ impl Tokenizer for GgufTokenizer {
         Ok(ids)
     }
 
+    fn hides_from_completion(&self, id: TokenId) -> bool {
+        if self.bos == Some(id) || self.eos == Some(id) {
+            return true;
+        }
+        let Some(piece) = self.tokens.get(id as usize).map(String::as_str) else {
+            return false;
+        };
+        self.bos_str.as_deref() == Some(piece) || self.eos_str.as_deref() == Some(piece)
+    }
+
     fn decode_token(&self, id: TokenId) -> Result<Vec<u8>> {
-        let ttype = *self.token_types.get(id as usize).unwrap_or(&1);
-        // Control / unknown → empty (llama.cpp-style streaming decode).
-        if ttype == 2 || ttype == 3 {
+        if self.hides_from_completion(id) {
             return Ok(Vec::new());
         }
-
-        let decoded = self
-            .inner
-            .decode(&[id], false)
-            .map_err(|e| FellmError::Tokenization(format!("decode_token: {e}")))?;
-        Ok(decoded.into_bytes())
+        // llama.cpp `token_to_piece` returns the vocabulary surface, including
+        // specials such as `<think>`. Prefer HF byte-level decode, then the GGUF piece.
+        if let Ok(decoded) = self.inner.decode(&[id], false)
+            && !decoded.is_empty()
+        {
+            return Ok(decoded.into_bytes());
+        }
+        Ok(self
+            .tokens
+            .get(id as usize)
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| piece.as_bytes().to_vec())
+            .unwrap_or_default())
     }
 
     fn decode(&self, ids: &[TokenId]) -> Result<String> {
@@ -197,6 +256,14 @@ impl Tokenizer for GgufTokenizer {
 
     fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+
+    fn vocabulary_piece(&self, id: TokenId) -> Option<&str> {
+        self.tokens.get(id as usize).map(String::as_str)
+    }
+
+    fn token_type(&self, id: TokenId) -> Option<i32> {
+        self.token_types.get(id as usize).copied()
     }
 
     fn chat_template(&self) -> Option<&str> {

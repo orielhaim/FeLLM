@@ -193,13 +193,24 @@ impl KernelRegistry {
             input_dtypes: input_dtypes.iter().map(|d| *d as u32).collect(),
             output_dtype: output_dtype as u32,
         };
-        let kern = *self.entries.get(&key)?;
-        let handle = self
-            .by_handle
-            .iter()
-            .find(|(_, k)| *k == &key)
-            .map(|(h, _)| *h)?;
-        Some((handle, kern))
+        if let Some(kern) = self.entries.get(&key).copied() {
+            let handle = self
+                .by_handle
+                .iter()
+                .find(|(_, k)| *k == &key)
+                .map(|(h, _)| *h)?;
+            return Some((handle, kern));
+        }
+        // Weight dtypes are inspected at launch. Gated DeltaNet must not fall
+        // back to the CPU just because a particular Q4/Q5/Q6 mix was unseen.
+        if op == OpKind::GatedDeltaNet {
+            let (handle, key) = self
+                .by_handle
+                .iter()
+                .find(|(_, k)| k.op == op && k.output_dtype == output_dtype as u32)?;
+            return Some((*handle, *self.entries.get(key)?));
+        }
+        None
     }
 
     /// Launch by previously assigned handle.

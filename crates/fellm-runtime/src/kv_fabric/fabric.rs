@@ -7,8 +7,8 @@ use super::share::{PrefixCacheStats, SharedKvStore, ensure_cow};
 use super::storage::PageArena;
 use super::types::{
     FabricMetrics, KvAddressing, KvEncoding, KvExecutionMemory, KvFabricConfig, KvGroupDesc,
-    KvLocation, KvMemoryPlan, KvMode, KvPageId, KvSequence, KvTier, PhysicalSlot, ResidencySignals,
-    STANDARD_PAGE_TOKENS,
+    KvLocation, KvMemoryPlan, KvMode, KvPageId, KvSequence, KvTier, KvTransaction, PhysicalSlot,
+    ResidencySignals, STANDARD_PAGE_TOKENS,
 };
 use fellm_core::error::{FellmError, Result};
 use fellm_plugin_abi::DeviceMemoryInfo;
@@ -302,6 +302,92 @@ impl KvFabric {
             }
         }
         seq.clear_maps();
+    }
+
+    /// Begin a provisional suffix at the sequence's current visible length.
+    #[must_use]
+    pub fn begin_transaction(&self, sequence: &KvSequence) -> KvTransaction {
+        KvTransaction::begin(sequence)
+    }
+
+    /// Keep an accepted prefix of provisional KV and release its rejected suffix.
+    pub fn commit_transaction(
+        &mut self,
+        sequence: &mut KvSequence,
+        transaction: &mut KvTransaction,
+        accepted_tokens: usize,
+    ) -> Result<()> {
+        if !transaction.is_active() {
+            return Err(FellmError::other("KV transaction was already finalized"));
+        }
+        let retained_len = transaction
+            .start_len
+            .checked_add(accepted_tokens)
+            .ok_or_else(|| FellmError::other("accepted KV prefix length overflowed"))?;
+        if retained_len > sequence.len_tokens {
+            return Err(FellmError::other(
+                "accepted KV prefix exceeds the provisional suffix",
+            ));
+        }
+        self.truncate_sequence(sequence, retained_len)?;
+        sequence.absolute_pos = transaction
+            .start_absolute_pos
+            .saturating_add(accepted_tokens);
+        debug_assert!(transaction.finalize());
+        Ok(())
+    }
+
+    /// Release the complete provisional suffix and restore the absolute cursor.
+    pub fn rollback_transaction(
+        &mut self,
+        sequence: &mut KvSequence,
+        transaction: &mut KvTransaction,
+    ) -> Result<()> {
+        if !transaction.is_active() {
+            return Err(FellmError::other("KV transaction was already finalized"));
+        }
+        self.truncate_sequence(sequence, transaction.start_len)?;
+        sequence.absolute_pos = transaction.start_absolute_pos;
+        debug_assert!(transaction.finalize());
+        Ok(())
+    }
+
+    /// Truncate visible state and reclaim pages wholly beyond `new_len`.
+    pub fn truncate_sequence(&mut self, sequence: &mut KvSequence, new_len: usize) -> Result<()> {
+        if new_len > sequence.len_tokens {
+            return Err(FellmError::other("KV truncation cannot grow a sequence"));
+        }
+        if new_len < sequence.shared_prefix_len {
+            return Err(FellmError::other(
+                "KV truncation cannot remove an immutable shared prefix",
+            ));
+        }
+        let retained_pages = new_len.div_ceil(self.arena.page_tokens());
+        for layer in 0..sequence.n_layers() {
+            let pages = sequence.layer_map(layer).pages();
+            let removed = pages.get(retained_pages..).unwrap_or_default().to_vec();
+            let retained = pages
+                .get(..retained_pages.min(pages.len()))
+                .unwrap_or_default()
+                .to_vec();
+            for page in removed {
+                if let Some(slot) = self.map.resolve(page) {
+                    self.arena.dec_ref(slot);
+                    if self.arena.refcount(slot) == 0 {
+                        self.map.unbind(page);
+                    }
+                } else {
+                    self.arena.drop_host_stash(Self::host_key_for(page));
+                    self.map.set_location(page, KvLocation::NotResident);
+                }
+            }
+            sequence.layer_map_mut(layer).set_pages(retained);
+        }
+        sequence.len_tokens = new_len;
+        sequence.absolute_pos = sequence.absolute_pos.min(new_len);
+        sequence.original_positions.truncate(new_len);
+        sequence.segments.clear();
+        Ok(())
     }
 
     /// Ensure dense position `pos` is writable for every layer (alloc / CoW).
@@ -877,6 +963,34 @@ impl KvFabric {
                     .0
             })
             .collect()
+    }
+
+    /// Rectangular block table for ragged multi-sequence kernels. Padding
+    /// repeats the layer's final valid page; row lengths prevent attention
+    /// from reading it and every write position is made writable beforehand.
+    pub fn physical_block_table_padded(
+        &self,
+        seq: &KvSequence,
+        logical_width: usize,
+    ) -> Result<Vec<u32>> {
+        if logical_width == 0 {
+            return Err(FellmError::other("block-table width must be non-zero"));
+        }
+        let mut table = Vec::with_capacity(seq.n_layers() * logical_width);
+        for layer in 0..seq.n_layers() {
+            let physical = self.physical_block_table_layer(seq, layer);
+            let &padding = physical
+                .last()
+                .ok_or_else(|| FellmError::other("ragged block table contains an empty layer"))?;
+            if physical.len() > logical_width {
+                return Err(FellmError::other(
+                    "ragged block-table width is smaller than a sequence",
+                ));
+            }
+            table.extend_from_slice(&physical);
+            table.resize(table.len() + logical_width - physical.len(), padding);
+        }
+        Ok(table)
     }
 
     /// Refcount of the physical slot behind a logical page (tests / diagnostics).

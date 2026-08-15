@@ -79,6 +79,13 @@ pub fn set_weight_cache_budget(bytes: u64, buffer_count: u32) -> Result<(), i32>
     Ok(())
 }
 
+pub fn weight_group_capacity() -> u64 {
+    weight_cache()
+        .lock()
+        .map(|cache| cache.slot_bytes as u64)
+        .unwrap_or(0)
+}
+
 fn external_weights() -> &'static Mutex<HashMap<(usize, usize), (u64, usize)>> {
     static EXTERNAL: OnceLock<Mutex<HashMap<(usize, usize), (u64, usize)>>> = OnceLock::new();
     EXTERNAL.get_or_init(|| Mutex::new(HashMap::new()))
@@ -490,10 +497,8 @@ pub fn with_q8_activation<R>(
         entry.scales = DeviceBuffer::<f32>::zeroed(stream, len.div_ceil(32)).map_err(|_| -3)?;
         entry.source_version = 0;
     }
-    if entry.source_version != version {
-        quantize(&mut entry.quantized, &mut entry.scales)?;
-        entry.source_version = version;
-    }
+    quantize(&mut entry.quantized, &mut entry.scales)?;
+    entry.source_version = version;
     Ok(use_activation(&entry.quantized, &entry.scales))
 }
 
@@ -572,6 +577,34 @@ fn f32_scratch() -> &'static Mutex<HashMap<usize, Vec<DeviceBuffer<f32>>>> {
 fn u32_scratch() -> &'static Mutex<HashMap<usize, Vec<DeviceBuffer<u32>>>> {
     static POOL: OnceLock<Mutex<HashMap<usize, Vec<DeviceBuffer<u32>>>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn i8_scratch() -> &'static Mutex<HashMap<usize, Vec<DeviceBuffer<i8>>>> {
+    static POOL: OnceLock<Mutex<HashMap<usize, Vec<DeviceBuffer<i8>>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn take_scratch_i8(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<i8>, i32> {
+    if let Some(buffer) = i8_scratch()
+        .lock()
+        .map_err(|_| -30)?
+        .entry(len)
+        .or_default()
+        .pop()
+    {
+        return Ok(buffer);
+    }
+    DeviceBuffer::<i8>::zeroed(stream, len).map_err(|_| -3)
+}
+
+pub fn put_scratch_i8(buffer: DeviceBuffer<i8>) -> Result<(), i32> {
+    i8_scratch()
+        .lock()
+        .map_err(|_| -30)?
+        .entry(buffer.len())
+        .or_default()
+        .push(buffer);
+    Ok(())
 }
 
 pub fn take_scratch_f32(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<f32>, i32> {

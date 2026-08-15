@@ -3,9 +3,9 @@
 use crate::buffers;
 use crate::tensor::{bytes_slice, dims, f32_slice, f32_slice_mut, u32_slice};
 use crate::{
-    Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q5_0_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS,
-    Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS, host_paged_snapshot, oxide_ctx, oxide_module, oxide_stream,
-    with_step_params,
+    Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q5_0_BLOCK_ELEMS, Q5K_BLOCK_BYTES, Q5K_BLOCK_ELEMS,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
+    host_paged_snapshot, oxide_ctx, oxide_module, oxide_stream, with_step_params,
 };
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use fellm_core::dtype::DType;
@@ -46,8 +46,16 @@ fn cfg_fa_decode(n_heads: u32) -> LaunchConfig {
     }
 }
 
-fn cfg_mmvq_blocks(blocks: u32, _n_blocks: u32) -> LaunchConfig {
-    let warps = 4;
+fn cfg_head_warp(n_heads: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n_heads.max(1), 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn cfg_mmvq_blocks(blocks: u32, n_blocks: u32) -> LaunchConfig {
+    let warps = if n_blocks >= 32 { 8 } else { 4 };
     LaunchConfig {
         grid_dim: (blocks.max(1), 1, 1),
         block_dim: (warps * 32, 1, 1),
@@ -55,9 +63,29 @@ fn cfg_mmvq_blocks(blocks: u32, _n_blocks: u32) -> LaunchConfig {
     }
 }
 
+fn cfg_mmvq_row_groups(out_dim: u32, batch_rows: u32, _n_blocks: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (out_dim.div_ceil(4).saturating_mul(batch_rows.max(1)).max(1), 1, 1),
+        block_dim: (4 * 32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn mmvq_multirow(out_dim: u32, n_blocks: u32) -> bool {
+    n_blocks >= 16 && out_dim >= 4096
+}
+
 fn cfg_block_256() -> LaunchConfig {
     LaunchConfig {
         grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn cfg_grid_block256(blocks: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (blocks.max(1), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -205,6 +233,105 @@ pub unsafe extern "C" fn launch_silu_gate(
     })
 }
 
+pub unsafe extern "C" fn launch_sigmoid_gate(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs != 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let value = f32_slice(unsafe { &*inputs })?;
+        let gate = f32_slice(unsafe { &*inputs.add(1) })?;
+        let out = f32_slice_mut(unsafe { &mut *outputs })?;
+        if value.len() != gate.len() || value.len() != out.len() {
+            return Err(-2);
+        }
+        let stream = oxide_stream().clone();
+        let value_key = buffers::ensure_f32(&stream, value, false)?;
+        let gate_key = buffers::ensure_f32(&stream, gate, false)?;
+        let out_key = buffers::ensure_f32_out(&stream, out)?;
+        let (value_device, _) = buffers::take_f32(value_key)?;
+        let (gate_device, _) = buffers::take_f32(gate_key)?;
+        let (mut out_device, _) = buffers::take_f32(out_key)?;
+        let result = unsafe {
+            oxide_module()
+                .sigmoid_gate(
+                    &stream,
+                    cfg_1d(out.len() as u32),
+                    &value_device,
+                    &gate_device,
+                    &mut out_device,
+                )
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(value_key, value_device, true)?;
+        buffers::put_f32(gate_key, gate_device, true)?;
+        buffers::put_f32(out_key, out_device, false)?;
+        result?;
+        finish_out(&stream, out_key, out, false)
+    })
+}
+
+pub unsafe extern "C" fn launch_interleaved_head_select(
+    attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs != 1
+            || n_outputs != 1
+            || attrs.is_null()
+            || inputs.is_null()
+            || outputs.is_null()
+        {
+            return Err(-1);
+        }
+        let attrs = unsafe { &*attrs };
+        let input = f32_slice(unsafe { &*inputs })?;
+        let output = f32_slice_mut(unsafe { &mut *outputs })?;
+        let heads = attrs.n_heads as usize;
+        let width = attrs.head_dim as usize;
+        if heads == 0
+            || width == 0
+            || attrs.kv_slot > 1
+            || !input.len().is_multiple_of(heads * width * 2)
+            || output.len() * 2 != input.len()
+        {
+            return Err(-2);
+        }
+        let stream = oxide_stream().clone();
+        let input_key = buffers::ensure_f32(&stream, input, false)?;
+        let output_key = buffers::ensure_f32_out(&stream, output)?;
+        let (input_device, _) = buffers::take_f32(input_key)?;
+        let (mut output_device, _) = buffers::take_f32(output_key)?;
+        let result = unsafe {
+            oxide_module()
+                .interleaved_head_select(
+                    &stream,
+                    cfg_1d(output.len() as u32),
+                    &input_device,
+                    heads as u32,
+                    width as u32,
+                    attrs.kv_slot,
+                    &mut output_device,
+                )
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(input_key, input_device, true)?;
+        buffers::put_f32(output_key, output_device, false)?;
+        result?;
+        finish_out(&stream, output_key, output, false)
+    })
+}
+
 /// RMSNorm (row or grouped by head_dim).
 pub unsafe extern "C" fn launch_rmsnorm(
     attrs: *const OpAttrs,
@@ -341,6 +468,7 @@ pub unsafe extern "C" fn launch_rope(
                         attrs.n_heads,
                         attrs.head_dim,
                         attrs.rope_dim,
+                        attrs.rope_pairing,
                         n as u32,
                         &mut od,
                     )
@@ -360,6 +488,7 @@ pub unsafe extern "C" fn launch_rope(
                         attrs.n_heads,
                         attrs.head_dim,
                         attrs.rope_dim,
+                        attrs.rope_pairing,
                         n as u32,
                         &mut od,
                     )
@@ -520,6 +649,548 @@ pub unsafe extern "C" fn launch_embedding_f32(
     })
 }
 
+/// BF16 embedding table promoted to f32 output on device.
+pub unsafe extern "C" fn launch_embedding_bf16(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let ids = u32_slice(unsafe { &*inputs.add(1) })?;
+        let out = f32_slice_mut(unsafe { &mut *outputs })?;
+        let wdims = dims(w_t);
+        if w_t.dtype != DType::BF16 as u32 || wdims.len() < 2 || ids.is_empty() {
+            return Err(-2);
+        }
+        let dim = wdims[1] as usize;
+        if out.len() != ids.len() * dim {
+            return Err(-2);
+        }
+        let stream = oxide_stream().clone();
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, bytes_slice(w_t))?;
+        let i_key = buffers::ensure_u32(&stream, ids)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let id = buffers::take_u32(i_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let rc = buffers::with_weight(w_key, |wd| unsafe {
+            oxide_module()
+                .embedding_bf16_rows(
+                    &stream,
+                    cfg_1d(out.len() as u32),
+                    wd,
+                    &id,
+                    ids.len() as u32,
+                    dim as u32,
+                    &mut od,
+                )
+                .map_err(|_| -4)
+        });
+        buffers::put_u32(i_key, id)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, false)
+    })
+}
+
+/// BF16 dense matmul with f32 activations/output.
+pub unsafe extern "C" fn launch_bf16_matmul(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let x = f32_slice(unsafe { &*inputs.add(1) })?;
+        let out = f32_slice_mut(unsafe { &mut *outputs })?;
+        let wdims = dims(w_t);
+        if w_t.dtype != DType::BF16 as u32 || wdims.len() < 2 {
+            return Err(-2);
+        }
+        let out_dim = wdims[0] as usize;
+        let in_dim = wdims[1] as usize;
+        if !x.len().is_multiple_of(in_dim) {
+            return Err(-2);
+        }
+        let rows = x.len() / in_dim;
+        if out.len() != rows * out_dim {
+            return Err(-2);
+        }
+        let stream = oxide_stream().clone();
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, bytes_slice(w_t))?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let rc = buffers::with_weight(w_key, |wd| unsafe {
+            oxide_module()
+                .bf16_matmul_rows(
+                    &stream,
+                    cfg_1d(out.len() as u32),
+                    wd,
+                    &xd,
+                    out_dim as u32,
+                    in_dim as u32,
+                    rows as u32,
+                    &mut od,
+                )
+                .map_err(|_| -4)
+        });
+        buffers::put_f32(x_key, xd, true)?;
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, false)
+    })
+}
+
+pub unsafe extern "C" fn launch_concat_f32(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs != 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let left_t = unsafe { &*inputs };
+        let right_t = unsafe { &*inputs.add(1) };
+        let left = f32_slice(left_t)?;
+        let right = f32_slice(right_t)?;
+        let out = f32_slice_mut(unsafe { &mut *outputs })?;
+        let left_width = dims(left_t).last().copied().unwrap_or(1) as usize;
+        let right_width = dims(right_t).last().copied().unwrap_or(1) as usize;
+        if !left.len().is_multiple_of(left_width) {
+            return Err(-2);
+        }
+        let rows = left.len() / left_width;
+        if right.len() != rows * right_width || out.len() != rows * (left_width + right_width) {
+            return Err(-2);
+        }
+        let stream = oxide_stream().clone();
+        let left_key = buffers::ensure_f32(&stream, left, false)?;
+        let right_key = buffers::ensure_f32(&stream, right, false)?;
+        let out_key = buffers::ensure_f32_out(&stream, out)?;
+        let (left_device, _) = buffers::take_f32(left_key)?;
+        let (right_device, _) = buffers::take_f32(right_key)?;
+        let (mut out_device, _) = buffers::take_f32(out_key)?;
+        let rc = unsafe {
+            oxide_module()
+                .concat_last_f32(
+                    &stream,
+                    cfg_1d(out.len() as u32),
+                    &left_device,
+                    &right_device,
+                    rows as u32,
+                    left_width as u32,
+                    right_width as u32,
+                    &mut out_device,
+                )
+                .map_err(|_| -4)
+        };
+        buffers::put_f32(left_key, left_device, true)?;
+        buffers::put_f32(right_key, right_device, true)?;
+        buffers::put_f32(out_key, out_device, false)?;
+        rc?;
+        finish_out(&stream, out_key, out, false)
+    })
+}
+
+pub unsafe extern "C" fn launch_gated_delta_net(
+    attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs != 10
+            || n_outputs < 3
+            || attrs.is_null()
+            || inputs.is_null()
+            || outputs.is_null()
+        {
+            return Err(-1);
+        }
+        let attrs = unsafe { &*attrs };
+        let tensor = |index: usize| unsafe { &*inputs.add(index) };
+        let x = f32_slice(tensor(0))?;
+        let output = f32_slice_mut(unsafe { &mut *outputs })?;
+        let conv_state = f32_slice_mut(unsafe { &mut *outputs.add(1) })?;
+        let recurrent_state = f32_slice_mut(unsafe { &mut *outputs.add(2) })?;
+        let model = attrs.n_embd as usize;
+        let inner = attrs.gdn_inner_size as usize;
+        let key_heads = attrs.n_kv_heads as usize;
+        let value_heads = attrs.n_heads as usize;
+        let state_size = attrs.gdn_state_size as usize;
+        let convolution_kernel = attrs.gdn_conv_kernel as usize;
+        let mixed_width = inner + 2 * key_heads * state_size;
+        if model == 0
+            || inner != value_heads * state_size
+            || key_heads == 0
+            || !value_heads.is_multiple_of(key_heads)
+            || convolution_kernel == 0
+            || !x.len().is_multiple_of(model)
+        {
+            return Err(-2);
+        }
+        let rows = x.len() / model;
+        if output.len() != rows * model
+            || conv_state.len()
+                != rows * mixed_width * convolution_kernel.saturating_sub(1)
+            || recurrent_state.len() != rows * value_heads * state_size * state_size
+            || f32_slice(tensor(5))?.len() != value_heads
+            || f32_slice(tensor(6))?.len() != value_heads
+            || f32_slice(tensor(7))?.len() != mixed_width * convolution_kernel
+            || f32_slice(tensor(8))?.len() != state_size
+        {
+            return Err(-2);
+        }
+        let stream = oxide_stream().clone();
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let output_key = buffers::ensure_f32_out(&stream, output)?;
+        let conv_key = buffers::ensure_f32(&stream, conv_state, false)?;
+        let recurrent_key = buffers::ensure_f32(&stream, recurrent_state, false)?;
+        let (x_device, _) = buffers::take_f32(x_key)?;
+        let (mut output_device, _) = buffers::take_f32(output_key)?;
+        let (mut conv_device, _) = buffers::take_f32(conv_key)?;
+        let (mut state_device, _) = buffers::take_f32(recurrent_key)?;
+        let mut mixed = buffers::take_scratch_f32(&stream, rows * mixed_width)?;
+        let mut z = buffers::take_scratch_f32(&stream, rows * inner)?;
+        let mut beta = buffers::take_scratch_f32(&stream, rows * value_heads)?;
+        let mut alpha = buffers::take_scratch_f32(&stream, rows * value_heads)?;
+        let mut recurrent = buffers::take_scratch_f32(&stream, rows * inner)?;
+
+        let qkv_key = buffers::ensure_weight(&stream, tensor(1).logical_id, bytes_slice(tensor(1)))?;
+        let z_key = buffers::ensure_weight(&stream, tensor(2).logical_id, bytes_slice(tensor(2)))?;
+        let out_weight_key =
+            buffers::ensure_weight(&stream, tensor(9).logical_id, bytes_slice(tensor(9)))?;
+        let module = oxide_module();
+        let project_quantized = |weight: &TensorRef,
+                                 key: u64,
+                                 in_dim: usize,
+                                 out_dim: usize,
+                                 activations: &DeviceBuffer<i8>,
+                                 scales: &DeviceBuffer<f32>,
+                                 dummy: &DeviceBuffer<f32>,
+                                 destination: &mut DeviceBuffer<f32>|
+         -> Result<(), i32> {
+            let dimensions = dims(weight);
+            if dimensions.len() < 2
+                || dimensions[0] as usize != out_dim
+                || dimensions[1] as usize != in_dim
+            {
+                return Err(-2);
+            }
+            if weight.dtype == DType::F32 as u32 {
+                let host = f32_slice(weight)?;
+                let f32_key = buffers::ensure_f32(&stream, host, false)?;
+                let (device, valid) = buffers::take_f32(f32_key)?;
+                let result = unsafe {
+                    module
+                        .f32_gemv_warp(
+                            &stream,
+                            cfg_head_warp((rows * out_dim) as u32),
+                            &device,
+                            dummy,
+                            out_dim as u32,
+                            in_dim as u32,
+                            rows as u32,
+                            destination,
+                        )
+                        .map_err(|_| -4)
+                };
+                buffers::put_f32(f32_key, device, valid)?;
+                result?;
+                return Ok(());
+            }
+            if in_dim % Q4K_BLOCK_ELEMS as usize != 0 {
+                return Err(-2);
+            }
+            let n_blocks = (in_dim / Q4K_BLOCK_ELEMS as usize) as u32;
+            let multirow = mmvq_multirow(out_dim as u32, n_blocks);
+            let cfg = if multirow {
+                cfg_mmvq_row_groups(out_dim as u32, rows as u32, n_blocks)
+            } else {
+                cfg_mmvq_blocks((rows * out_dim) as u32, n_blocks)
+            };
+            buffers::with_weight(key, |device| unsafe {
+                if weight.dtype == DType::Q4K as u32 {
+                    if multirow {
+                        module
+                            .q4k_q8_gemv_multiwarp(
+                                &stream,
+                                cfg,
+                                device,
+                                activations,
+                                scales,
+                                dummy,
+                                0,
+                                out_dim as u32,
+                                n_blocks,
+                                rows as u32,
+                                destination,
+                            )
+                            .map_err(|_| -4)
+                    } else {
+                        module
+                            .q4k_q8_gemv_warp(
+                                &stream,
+                                cfg,
+                                device,
+                                activations,
+                                scales,
+                                dummy,
+                                0,
+                                out_dim as u32,
+                                n_blocks,
+                                rows as u32,
+                                destination,
+                            )
+                            .map_err(|_| -4)
+                    }
+                } else if weight.dtype == DType::Q5K as u32 {
+                    if multirow {
+                        module
+                            .q5k_q8_gemv_multiwarp(
+                                &stream,
+                                cfg,
+                                device,
+                                activations,
+                                scales,
+                                dummy,
+                                0,
+                                out_dim as u32,
+                                n_blocks,
+                                rows as u32,
+                                destination,
+                            )
+                            .map_err(|_| -4)
+                    } else {
+                        module
+                            .q5k_q8_gemv_warp(
+                                &stream,
+                                cfg,
+                                device,
+                                activations,
+                                scales,
+                                dummy,
+                                0,
+                                out_dim as u32,
+                                n_blocks,
+                                rows as u32,
+                                destination,
+                            )
+                            .map_err(|_| -4)
+                    }
+                } else if weight.dtype == DType::Q6K as u32 {
+                    module
+                        .q6k_gemv_row(
+                            &stream,
+                            cfg_1d((rows * out_dim) as u32),
+                            device,
+                            dummy,
+                            out_dim as u32,
+                            n_blocks,
+                            rows as u32,
+                            destination,
+                        )
+                        .map_err(|_| -4)
+                } else {
+                    Err(-2)
+                }
+            })??;
+            Ok(())
+        };
+        buffers::with_q8_activation(
+            &stream,
+            x_key,
+            x.len(),
+            |qx, x_scales| unsafe {
+                module
+                    .quantize_q8_32(
+                        &stream,
+                        cfg_warp_blocks(x.len().div_ceil(32) as u32),
+                        &x_device,
+                        qx,
+                        x_scales,
+                    )
+                    .map_err(|_| -4)
+            },
+            |qx, x_scales| {
+                project_quantized(
+                    tensor(1),
+                    qkv_key,
+                    model,
+                    mixed_width,
+                    qx,
+                    x_scales,
+                    &x_device,
+                    &mut mixed,
+                )?;
+                project_quantized(tensor(2), z_key, model, inner, qx, x_scales, &x_device, &mut z)
+            },
+        )??;
+
+        let beta_weight = f32_slice(tensor(3))?;
+        let alpha_weight = f32_slice(tensor(4))?;
+        if beta_weight.len() != value_heads * model || alpha_weight.len() != value_heads * model {
+            return Err(-2);
+        }
+        let beta_key = buffers::ensure_f32(&stream, beta_weight, false)?;
+        let alpha_key = buffers::ensure_f32(&stream, alpha_weight, false)?;
+        let (beta_weight_device, _) = buffers::take_f32(beta_key)?;
+        let (alpha_weight_device, _) = buffers::take_f32(alpha_key)?;
+        unsafe {
+            oxide_module()
+                .f32_gemv_warp(
+                    &stream,
+                    cfg_head_warp((rows * value_heads) as u32),
+                    &beta_weight_device,
+                    &x_device,
+                    value_heads as u32,
+                    model as u32,
+                    rows as u32,
+                    &mut beta,
+                )
+                .map_err(|_| -4)?;
+            oxide_module()
+                .f32_gemv_warp(
+                    &stream,
+                    cfg_head_warp((rows * value_heads) as u32),
+                    &alpha_weight_device,
+                    &x_device,
+                    value_heads as u32,
+                    model as u32,
+                    rows as u32,
+                    &mut alpha,
+                )
+                .map_err(|_| -4)?;
+        }
+        let dt = f32_slice(tensor(5))?;
+        let decay = f32_slice(tensor(6))?;
+        let convolution = f32_slice(tensor(7))?;
+        let norm = f32_slice(tensor(8))?;
+        let dt_key = buffers::ensure_f32(&stream, dt, false)?;
+        let decay_key = buffers::ensure_f32(&stream, decay, false)?;
+        let convolution_key = buffers::ensure_f32(&stream, convolution, false)?;
+        let norm_key = buffers::ensure_f32(&stream, norm, false)?;
+        let (dt_device, _) = buffers::take_f32(dt_key)?;
+        let (decay_device, _) = buffers::take_f32(decay_key)?;
+        let (convolution_device, _) = buffers::take_f32(convolution_key)?;
+        let (norm_device, _) = buffers::take_f32(norm_key)?;
+        unsafe {
+            oxide_module()
+                .gdn_convolve(
+                    &stream,
+                    cfg_1d((rows * mixed_width) as u32),
+                    &mut mixed,
+                    &convolution_device,
+                    &mut conv_device,
+                    mixed_width as u32,
+                    convolution_kernel as u32,
+                    rows as u32,
+                )
+                .map_err(|_| -4)?;
+            oxide_module()
+                .gdn_recurrence(
+                    &stream,
+                    cfg_grid_block256((rows * value_heads) as u32),
+                    &mixed,
+                    &beta,
+                    &alpha,
+                    &dt_device,
+                    &decay_device,
+                    &mut state_device,
+                    key_heads as u32,
+                    value_heads as u32,
+                    state_size as u32,
+                    mixed_width as u32,
+                    attrs.eps,
+                    rows as u32,
+                    &mut recurrent,
+                )
+                .map_err(|_| -4)?;
+            oxide_module()
+                .gdn_norm_gate(
+                    &stream,
+                    cfg_grid_block256((rows * value_heads) as u32),
+                    &mut recurrent,
+                    &z,
+                    &norm_device,
+                    value_heads as u32,
+                    state_size as u32,
+                    attrs.eps,
+                    rows as u32,
+                )
+                .map_err(|_| -4)?;
+        }
+        let mut recurrent_q8 = buffers::take_scratch_i8(&stream, rows * inner)?;
+        let mut recurrent_scales = buffers::take_scratch_f32(&stream, (rows * inner).div_ceil(32))?;
+        unsafe {
+            module
+                .quantize_q8_32(
+                    &stream,
+                    cfg_warp_blocks((rows * inner).div_ceil(32) as u32),
+                    &recurrent,
+                    &mut recurrent_q8,
+                    &mut recurrent_scales,
+                )
+                .map_err(|_| -4)?;
+        }
+        project_quantized(
+            tensor(9),
+            out_weight_key,
+            inner,
+            model,
+            &recurrent_q8,
+            &recurrent_scales,
+            &recurrent,
+            &mut output_device,
+        )?;
+        buffers::put_scratch_i8(recurrent_q8)?;
+        buffers::put_scratch_f32(recurrent_scales)?;
+
+        buffers::put_f32(beta_key, beta_weight_device, true)?;
+        buffers::put_f32(alpha_key, alpha_weight_device, true)?;
+        for (key, buffer) in [
+            (dt_key, dt_device),
+            (decay_key, decay_device),
+            (convolution_key, convolution_device),
+            (norm_key, norm_device),
+        ] {
+            buffers::put_f32(key, buffer, true)?;
+        }
+        buffers::put_f32(x_key, x_device, true)?;
+        buffers::put_f32(output_key, output_device, false)?;
+        buffers::put_f32(conv_key, conv_device, false)?;
+        buffers::put_f32(recurrent_key, state_device, false)?;
+        buffers::put_scratch_f32(mixed)?;
+        buffers::put_scratch_f32(z)?;
+        buffers::put_scratch_f32(beta)?;
+        buffers::put_scratch_f32(alpha)?;
+        buffers::put_scratch_f32(recurrent)?;
+        finish_out(&stream, conv_key, conv_state, false)?;
+        finish_out(&stream, recurrent_key, recurrent_state, false)?;
+        finish_out(&stream, output_key, output, false)
+    })
+}
+
 /// Q4_K embedding: dequantize one weight row on device.
 pub unsafe extern "C" fn launch_embedding_q4k(
     _attrs: *const OpAttrs,
@@ -591,6 +1262,100 @@ pub unsafe extern "C" fn launch_embedding_q4k(
                 let result = unsafe {
                     module
                         .embedding_q4k_rows(
+                            &stream,
+                            cfg_1d(out.len() as u32),
+                            wd,
+                            &device,
+                            ids.len() as u32,
+                            dim as u32,
+                            n_blocks,
+                            &mut od,
+                        )
+                        .map_err(|_| -4)
+                };
+                batch_ids = Some((key, device));
+                result
+            }
+        });
+        if let Some((key, device)) = batch_ids {
+            buffers::put_u32(key, device)?;
+        }
+        buffers::put_f32(o_key, od, false)?;
+        rc??;
+        finish_out(&stream, o_key, out, false)
+    })
+}
+
+pub unsafe extern "C" fn launch_embedding_q5k(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let w_t = unsafe { &*inputs };
+        let tok_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        if w_t.dtype != DType::Q5K as u32 {
+            return Err(-10);
+        }
+        let wdims = dims(w_t);
+        if wdims.len() < 2 {
+            return Err(-2);
+        }
+        let dim = wdims[1] as usize;
+        if dim % (Q5K_BLOCK_ELEMS as usize) != 0 {
+            return Err(-2);
+        }
+        let n_blocks = (dim / Q5K_BLOCK_ELEMS as usize) as u32;
+        let wb = bytes_slice(w_t);
+        let ids = u32_slice(tok_t)?;
+        if ids.is_empty() {
+            return Err(-2);
+        }
+        let out = f32_slice_mut(out_t)?;
+        if out.len() != ids.len() * dim {
+            return Err(-2);
+        }
+        let row_bytes = n_blocks as usize * Q5K_BLOCK_BYTES as usize;
+        let need = (ids.iter().copied().max().unwrap_or(0) as usize + 1) * row_bytes;
+        if wb.len() < need {
+            return Err(-2);
+        }
+
+        let _ctx = oxide_ctx();
+        let stream = oxide_stream().clone();
+        let w_key = buffers::ensure_weight(&stream, w_t.logical_id, wb)?;
+        let o_key = buffers::ensure_f32_out(&stream, out)?;
+        let (mut od, _) = buffers::take_f32(o_key)?;
+        let module = oxide_module();
+        let mut batch_ids = None;
+        let rc = buffers::with_weight(w_key, |wd| {
+            if ids.len() == 1 {
+                with_step_params(|params| unsafe {
+                    module
+                        .embedding_q5k_row(
+                            &stream,
+                            cfg_1d(dim as u32),
+                            wd,
+                            params,
+                            dim as u32,
+                            n_blocks,
+                            &mut od,
+                        )
+                        .map_err(|_| -4)
+                })
+            } else {
+                let key = buffers::ensure_u32(&stream, ids)?;
+                let device = buffers::take_u32(key)?;
+                let result = unsafe {
+                    module
+                        .embedding_q5k_rows(
                             &stream,
                             cfg_1d(out.len() as u32),
                             wd,
@@ -697,21 +1462,39 @@ pub unsafe extern "C" fn launch_q4k_matmul(
             |qx, x_scales| {
                 buffers::with_weight(w_key, |wd| unsafe {
                     if rows > 0 {
-                        module
-                            .q4k_q8_gemv_multiwarp(
-                                &stream,
-                                cfg_mmvq_blocks(out_dim * rows as u32, n_blocks),
-                                wd,
-                                qx,
-                                x_scales,
-                                residual_device.as_ref().map_or(&xd, |(buffer, _)| buffer),
-                                u32::from(residual_device.is_some()),
-                                out_dim,
-                                n_blocks,
-                                rows as u32,
-                                &mut od,
-                            )
-                            .map_err(|_| -4)
+                        if mmvq_multirow(out_dim, n_blocks) {
+                            module
+                                .q4k_q8_gemv_multiwarp(
+                                    &stream,
+                                    cfg_mmvq_row_groups(out_dim, rows as u32, n_blocks),
+                                    wd,
+                                    qx,
+                                    x_scales,
+                                    residual_device.as_ref().map_or(&xd, |(buffer, _)| buffer),
+                                    u32::from(residual_device.is_some()),
+                                    out_dim,
+                                    n_blocks,
+                                    rows as u32,
+                                    &mut od,
+                                )
+                                .map_err(|_| -4)
+                        } else {
+                            module
+                                .q4k_q8_gemv_warp(
+                                    &stream,
+                                    cfg_mmvq_blocks(out_dim * rows as u32, n_blocks),
+                                    wd,
+                                    qx,
+                                    x_scales,
+                                    residual_device.as_ref().map_or(&xd, |(buffer, _)| buffer),
+                                    u32::from(residual_device.is_some()),
+                                    out_dim,
+                                    n_blocks,
+                                    rows as u32,
+                                    &mut od,
+                                )
+                                .map_err(|_| -4)
+                        }
                     } else {
                         module
                             .q4k_gemv_row(
@@ -738,6 +1521,132 @@ pub unsafe extern "C" fn launch_q4k_matmul(
         // Logits stay resident. Sampling downloads one token id; non-device
         // sampling invokes an explicit materialization boundary.
         finish_out(&stream, o_key, out, false)
+    })
+}
+
+/// Q5_K matmul with optional fused residual, using Q8 activations.
+pub unsafe extern "C" fn launch_q5k_matmul(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs < 2 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let weight_t = unsafe { &*inputs };
+        let x_t = unsafe { &*inputs.add(1) };
+        let out_t = unsafe { &mut *outputs };
+        if weight_t.dtype != DType::Q5K as u32 {
+            return Err(-10);
+        }
+        let dimensions = dims(weight_t);
+        if dimensions.len() < 2 {
+            return Err(-2);
+        }
+        let out_dim = dimensions[0] as u32;
+        let in_dim = dimensions[1] as usize;
+        if in_dim % Q5K_BLOCK_ELEMS as usize != 0 {
+            return Err(-2);
+        }
+        let n_blocks = (in_dim / Q5K_BLOCK_ELEMS as usize) as u32;
+        let weight = bytes_slice(weight_t);
+        let expect = out_dim as usize * n_blocks as usize * Q5K_BLOCK_BYTES as usize;
+        if weight.len() < expect {
+            return Err(-2);
+        }
+        let x = f32_slice(x_t)?;
+        let out = f32_slice_mut(out_t)?;
+        if !x.len().is_multiple_of(in_dim) {
+            return Err(-2);
+        }
+        let rows = x.len() / in_dim;
+        if out.len() != rows * out_dim as usize {
+            return Err(-2);
+        }
+        let residual = if n_inputs >= 3 {
+            let residual = f32_slice(unsafe { &*inputs.add(2) })?;
+            if residual.len() != out.len() {
+                return Err(-2);
+            }
+            Some(residual)
+        } else {
+            None
+        };
+        let stream = oxide_stream().clone();
+        let weight_key = buffers::ensure_weight(&stream, weight_t.logical_id, weight)?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let out_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (mut od, _) = buffers::take_f32(out_key)?;
+        let residual_key = residual
+            .map(|values| buffers::ensure_f32(&stream, values, false))
+            .transpose()?;
+        let mut residual_device = residual_key.map(buffers::take_f32).transpose()?;
+        let module = oxide_module();
+        let rc = buffers::with_q8_activation(
+            &stream,
+            x_key,
+            x.len(),
+            |qx, x_scales| unsafe {
+                module
+                    .quantize_q8_32(
+                        &stream,
+                        cfg_warp_blocks(x.len().div_ceil(32) as u32),
+                        &xd,
+                        qx,
+                        x_scales,
+                    )
+                    .map_err(|_| -4)
+            },
+            |qx, x_scales| {
+                buffers::with_weight(weight_key, |wd| unsafe {
+                    if mmvq_multirow(out_dim, n_blocks) {
+                        module
+                            .q5k_q8_gemv_multiwarp(
+                                &stream,
+                                cfg_mmvq_row_groups(out_dim, rows as u32, n_blocks),
+                                wd,
+                                qx,
+                                x_scales,
+                                residual_device.as_ref().map_or(&xd, |(buffer, _)| buffer),
+                                u32::from(residual_device.is_some()),
+                                out_dim,
+                                n_blocks,
+                                rows as u32,
+                                &mut od,
+                            )
+                            .map_err(|_| -4)
+                    } else {
+                        module
+                            .q5k_q8_gemv_warp(
+                                &stream,
+                                cfg_mmvq_blocks(out_dim * rows as u32, n_blocks),
+                                wd,
+                                qx,
+                                x_scales,
+                                residual_device.as_ref().map_or(&xd, |(buffer, _)| buffer),
+                                u32::from(residual_device.is_some()),
+                                out_dim,
+                                n_blocks,
+                                rows as u32,
+                                &mut od,
+                            )
+                            .map_err(|_| -4)
+                    }
+                })
+            },
+        );
+        buffers::put_f32(x_key, xd, true)?;
+        if let (Some(key), Some((buffer, valid))) = (residual_key, residual_device.take()) {
+            buffers::put_f32(key, buffer, valid)?;
+        }
+        buffers::put_f32(out_key, od, false)?;
+        rc???;
+        finish_out(&stream, out_key, out, false)
     })
 }
 
@@ -807,7 +1716,102 @@ pub unsafe extern "C" fn launch_q4k_gate_up_swiglu(
                         module
                             .q4k_gate_up_swiglu_multiwarp(
                                 &stream,
-                                cfg_mmvq_blocks(out_dim, n_blocks),
+                                LaunchConfig {
+                                    grid_dim: (out_dim.max(1), 1, 1),
+                                    block_dim: (128, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                gate,
+                                up,
+                                qx,
+                                scales,
+                                out_dim,
+                                n_blocks,
+                                &mut od,
+                            )
+                            .map_err(|_| -4)
+                    })
+                })
+            },
+        );
+        buffers::put_f32(x_key, xd, true)?;
+        buffers::put_f32(out_key, od, false)?;
+        rc????;
+        finish_out(&stream, out_key, out, false)
+    })
+}
+
+/// Packed Q5_K gate/up projection with a fused SwiGLU epilogue.
+pub unsafe extern "C" fn launch_q5k_gate_up_swiglu(
+    _attrs: *const OpAttrs,
+    inputs: *const TensorRef,
+    n_inputs: u32,
+    outputs: *mut TensorMut,
+    n_outputs: u32,
+    _stream: StreamHandle,
+) -> i32 {
+    run(|| {
+        if n_inputs != 3 || n_outputs < 1 || inputs.is_null() || outputs.is_null() {
+            return Err(-1);
+        }
+        let gate_t = unsafe { &*inputs };
+        let up_t = unsafe { &*inputs.add(1) };
+        let x_t = unsafe { &*inputs.add(2) };
+        let out_t = unsafe { &mut *outputs };
+        if gate_t.dtype != DType::Q5K as u32 || up_t.dtype != DType::Q5K as u32 {
+            return Err(-10);
+        }
+        let gate_dims = dims(gate_t);
+        if gate_dims.len() != 2 || dims(up_t) != gate_dims {
+            return Err(-2);
+        }
+        let out_dim = gate_dims[0] as u32;
+        let in_dim = gate_dims[1] as usize;
+        if in_dim % Q5K_BLOCK_ELEMS as usize != 0 {
+            return Err(-2);
+        }
+        let x = f32_slice(x_t)?;
+        let out = f32_slice_mut(out_t)?;
+        if x.len() != in_dim || out.len() != out_dim as usize {
+            return Err(-2);
+        }
+        let n_blocks = (in_dim / Q5K_BLOCK_ELEMS as usize) as u32;
+        let gate_bytes = bytes_slice(gate_t);
+        let up_bytes = bytes_slice(up_t);
+        let stream = oxide_stream().clone();
+        let gate_key = buffers::ensure_weight(&stream, gate_t.logical_id, gate_bytes)?;
+        let up_key = buffers::ensure_weight(&stream, up_t.logical_id, up_bytes)?;
+        let x_key = buffers::ensure_f32(&stream, x, false)?;
+        let out_key = buffers::ensure_f32_out(&stream, out)?;
+        let (xd, _) = buffers::take_f32(x_key)?;
+        let (mut od, _) = buffers::take_f32(out_key)?;
+        let module = oxide_module();
+        let rc = buffers::with_q8_activation(
+            &stream,
+            x_key,
+            x.len(),
+            |qx, scales| unsafe {
+                module
+                    .quantize_q8_32(
+                        &stream,
+                        cfg_warp_blocks(x.len().div_ceil(32) as u32),
+                        &xd,
+                        qx,
+                        scales,
+                    )
+                    .map_err(|_| -4)
+            },
+            |qx, scales| {
+                buffers::with_weight(gate_key, |gate| {
+                    buffers::with_weight(up_key, |up| unsafe {
+                        module
+                            .q5k_gate_up_swiglu_multiwarp(
+                                &stream,
+                                LaunchConfig {
+                                    grid_dim: (out_dim.max(1), 1, 1),
+                                    block_dim: (128, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
                                 gate,
                                 up,
                                 qx,
@@ -2277,7 +3281,54 @@ pub unsafe extern "C" fn launch_attention(
             let ctx = oxide_ctx();
             let stream = oxide_stream().clone();
             let module = oxide_module();
-            let snap = host_paged_snapshot().ok_or(-20)?;
+            let Some(snap) = host_paged_snapshot() else {
+                let prefix_k = f32_slice(unsafe { &*inputs.add(1) })?;
+                let prefix_v = f32_slice(unsafe { &*inputs.add(2) })?;
+                let prefix_elems = past * n_kv * head_dim;
+                if prefix_k.len() < prefix_elems || prefix_v.len() < prefix_elems {
+                    return Err(-2);
+                }
+                let qk = buffers::ensure_f32(&stream, q, false)?;
+                let pkk = buffers::ensure_f32(&stream, prefix_k, false)?;
+                let pvk = buffers::ensure_f32(&stream, prefix_v, false)?;
+                let kk = buffers::ensure_f32(&stream, kc, false)?;
+                let vk = buffers::ensure_f32(&stream, vc, false)?;
+                let ok = buffers::ensure_f32_out(&stream, out)?;
+                let (qd, _) = buffers::take_f32(qk)?;
+                let (pkd, _) = buffers::take_f32(pkk)?;
+                let (pvd, _) = buffers::take_f32(pvk)?;
+                let (kd, _) = buffers::take_f32(kk)?;
+                let (vd, _) = buffers::take_f32(vk)?;
+                let (mut od, _) = buffers::take_f32(ok)?;
+                let rc = unsafe {
+                    module
+                        .attention_canvas_heads(
+                            &stream,
+                            cfg_1d((rows * n_heads) as u32),
+                            &qd,
+                            &pkd,
+                            &pvd,
+                            &kd,
+                            &vd,
+                            rows as u32,
+                            past as u32,
+                            n_heads as u32,
+                            n_kv as u32,
+                            head_dim as u32,
+                            scale,
+                            &mut od,
+                        )
+                        .map_err(|_| -4)
+                };
+                buffers::put_f32(qk, qd, true)?;
+                buffers::put_f32(pkk, pkd, true)?;
+                buffers::put_f32(pvk, pvd, true)?;
+                buffers::put_f32(kk, kd, true)?;
+                buffers::put_f32(vk, vd, true)?;
+                buffers::put_f32(ok, od, false)?;
+                rc?;
+                return finish_out(&stream, ok, out, false);
+            };
             if snap.device_arena.is_null() || snap.device_arena_len == 0 {
                 return Err(-21);
             }
@@ -2455,7 +3506,86 @@ pub unsafe extern "C" fn launch_attention(
                 let q_len = attrs.query_len.max(1);
                 let path = fellm_plugin_abi::resolve_path(q_len, attrs.custom_op_id);
                 let dispatch = fellm_plugin_abi::attention_dispatch();
-                let launch_rc = match path {
+                // FA2/FA3 decode kernels keep head_dim×warp tiles in registers
+                // (max 128). Wider heads (Qwen3.5, etc.) must use the generic
+                // paged loop; returning early left attention as zeros.
+                let launch_rc = if head_dim > 128 && head_dim <= 256 && q_len == 1 {
+                    with_step_params(|params| unsafe {
+                        module
+                            .attention_paged_warp(
+                                &stream,
+                                cfg_head_warp(n_heads as u32),
+                                &qd,
+                                &arena,
+                                &td,
+                                params,
+                                n_heads as u32,
+                                n_kv as u32,
+                                head_dim as u32,
+                                scale,
+                                attrs.layer_ord,
+                                device_n_logical,
+                                snap.block_size as u32,
+                                snap.block_bytes as u32,
+                                snap.tokens_stride as u32,
+                                &mut od,
+                            )
+                            .map_err(|_| -4)
+                    })
+                } else if head_dim > 128 {
+                    if q_len == 1 {
+                        unsafe {
+                            module
+                                .attention_paged_heads(
+                                    &stream,
+                                    cfg_1d(n_heads as u32),
+                                    &qd,
+                                    &arena,
+                                    &td,
+                                    n_heads as u32,
+                                    n_kv as u32,
+                                    head_dim as u32,
+                                    seq as u32,
+                                    scale,
+                                    attrs.layer_ord,
+                                    device_n_logical,
+                                    snap.block_size as u32,
+                                    snap.block_bytes as u32,
+                                    snap.tokens_stride as u32,
+                                    &mut od,
+                                )
+                                .map_err(|_| -4)
+                        }
+                    } else {
+                        unsafe {
+                            module
+                                .attention_fa2_prefill_paged(
+                                    &stream,
+                                    cfg_fa2_prefill(q_len.div_ceil(4), n_heads as u32),
+                                    &qd,
+                                    &arena,
+                                    &td,
+                                    n_heads as u32,
+                                    n_kv as u32,
+                                    head_dim as u32,
+                                    q_len,
+                                    seq as u32,
+                                    scale,
+                                    attrs.layer_ord,
+                                    device_n_logical,
+                                    snap.block_size as u32,
+                                    snap.block_bytes as u32,
+                                    snap.tokens_stride as u32,
+                                    if attrs.attention_mode == 0 { 1 } else { 0 },
+                                    attrs.attention_window,
+                                    4,
+                                    &mut od,
+                                )
+                                .map_err(|_| -4)
+                        }
+                    }
+                } else {
+                    match path {
                         fellm_plugin_abi::AttentionKernelPath::Fa3Decode
                         | fellm_plugin_abi::AttentionKernelPath::Fa3Prefill => with_step_params(|params| unsafe {
                             module.attention_fa3_decode_paged(
@@ -2527,6 +3657,7 @@ pub unsafe extern "C" fn launch_attention(
                                 &mut od,
                             ).map_err(|_| -4) })
                         }
+                    }
                 };
                 buffers::release_wrap(arena);
                 buffers::put_f32(q_key, qd, true)?;
@@ -2656,7 +3787,39 @@ pub unsafe extern "C" fn launch_kv_write(
         let is_v = attrs.kv_slot != 0;
 
         if attrs.block_size == 0 {
-            return Err(-21);
+            if n_inputs < 2 {
+                return Err(-21);
+            }
+            let cache_t = unsafe { &*inputs.add(1) };
+            let cache = f32_slice(cache_t)?;
+            let out = f32_slice_mut(unsafe { &mut *outputs })?;
+            if cache.len() != out.len() || row.is_empty() {
+                return Err(-2);
+            }
+            let offset = pos.checked_mul(row.len()).ok_or(-2)?;
+            if offset.saturating_add(row.len()) > cache.len() {
+                return Err(-2);
+            }
+            let stream = oxide_stream().clone();
+            let row_key = buffers::ensure_f32(&stream, row, false)?;
+            let cache_key = buffers::ensure_f32(&stream, cache, false)?;
+            let (row_device, _) = buffers::take_f32(row_key)?;
+            let (mut cache_device, _) = buffers::take_f32(cache_key)?;
+            let result = unsafe {
+                oxide_module()
+                    .kv_write_contiguous_f32(
+                        &stream,
+                        cfg_1d(row.len() as u32),
+                        &row_device,
+                        &mut cache_device,
+                        offset as u32,
+                    )
+                    .map_err(|_| -4)
+            };
+            buffers::put_f32(row_key, row_device, true)?;
+            buffers::put_f32(cache_key, cache_device, false)?;
+            result?;
+            return finish_out(&stream, cache_key, out, false);
         }
         let snap = host_paged_snapshot().ok_or(-20)?;
         if snap.batch_size > 1 {
